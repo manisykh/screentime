@@ -1,6 +1,7 @@
 package com.example.screentimemanager.safety
 
 import com.example.screentimemanager.data.UsagePolicySettings
+import com.example.screentimemanager.data.TemporaryUnlockState
 import com.example.screentimemanager.data.normalizedAppGroups
 import com.example.screentimemanager.ui.safety.appLimitMap
 import com.example.screentimemanager.ui.safety.todayLimitMinutes
@@ -34,28 +35,55 @@ object BlockDecisionEngine {
         appUsedMinutes: Int,
         totalUsedMinutes: Int,
         exceededGroupPackages: Set<String>,
+        targetGroupUsedMinutes: Int? = null,
+        targetGroupLimitMinutes: Int? = null,
+        temporaryUnlockState: TemporaryUnlockState = TemporaryUnlockState(),
+        userAllowedPackages: Set<String> = emptySet(),
     ): BlockDecisionResult {
         val safetyGateResult = SafetyGate.evaluateBlocking(
             safeModeEnabled = safeModeEnabled,
             policyEnforcementEnabled = policyEnforcementEnabled,
             targetPackageName = packageName,
+            userAllowedPackages = userAllowedPackages,
         )
         val appLimitMinutes = settings.appLimitMap()[packageName] ?: 0
         val totalLimitMinutes = settings.todayLimitMinutes()
+        val todayTemporaryUnlockState = temporaryUnlockState.forToday()
+        val packageAllowance = todayTemporaryUnlockState.packageAllowances[packageName]
+        val packageExtraMinutes = packageAllowance?.extraMinutes ?: 0
+        val packageUnlockedForToday = packageAllowance?.unlockedForToday == true
+        val effectiveTotalLimitMinutes = (totalLimitMinutes + todayTemporaryUnlockState.totalExtraMinutes)
+            .coerceAtLeast(totalLimitMinutes)
+        val effectiveAppLimitMinutes = (appLimitMinutes + packageExtraMinutes)
+            .coerceAtLeast(appLimitMinutes)
         val exceededGroupLimitMinutes = settings.normalizedAppGroups()
             .firstOrNull { group -> packageName in group.packageNames && group.budgetMinutes > 0 }
             ?.budgetMinutes
+        val effectiveGroupLimitMinutes = targetGroupLimitMinutes
+            ?.let { limit -> (limit + packageExtraMinutes).coerceAtLeast(limit) }
+            ?: exceededGroupLimitMinutes?.let { limit -> (limit + packageExtraMinutes).coerceAtLeast(limit) }
+        val groupLimitExceeded = if (
+            targetGroupUsedMinutes != null &&
+            effectiveGroupLimitMinutes != null &&
+            effectiveGroupLimitMinutes > 0
+        ) {
+            targetGroupUsedMinutes >= effectiveGroupLimitMinutes
+        } else {
+            packageName in exceededGroupPackages && packageExtraMinutes <= 0
+        }
         val decision = when {
             safetyGateResult.reason == SafetyGateReason.SafeModeEnabled -> BlockDecision.AllowedSafeMode
             safetyGateResult.reason == SafetyGateReason.PolicyEnforcementDisabled -> BlockDecision.AllowedPolicyDisabled
             safetyGateResult.reason == SafetyGateReason.WhitelistedPackage -> BlockDecision.AllowedWhitelist
-            totalLimitMinutes > 0 && totalUsedMinutes >= totalLimitMinutes -> {
+            !todayTemporaryUnlockState.totalUnlockedForToday &&
+                totalLimitMinutes > 0 &&
+                totalUsedMinutes >= effectiveTotalLimitMinutes -> {
                 BlockDecision.WouldBlockTotalLimit
             }
-            packageName in exceededGroupPackages -> {
+            !packageUnlockedForToday && groupLimitExceeded -> {
                 BlockDecision.WouldBlockGroupLimit
             }
-            appLimitMinutes > 0 && appUsedMinutes >= appLimitMinutes -> {
+            !packageUnlockedForToday && appLimitMinutes > 0 && appUsedMinutes >= effectiveAppLimitMinutes -> {
                 BlockDecision.WouldBlockAppLimit
             }
             hasAnyLimit(packageName, settings) -> BlockDecision.AllowedUnderLimit
@@ -65,11 +93,15 @@ object BlockDecisionEngine {
         return BlockDecisionResult(
             packageName = packageName,
             appName = appName,
-            usedMinutes = appUsedMinutes,
+            usedMinutes = if (decision == BlockDecision.WouldBlockTotalLimit) {
+                totalUsedMinutes
+            } else {
+                appUsedMinutes
+            },
             limitMinutes = when (decision) {
-                BlockDecision.WouldBlockTotalLimit -> totalLimitMinutes
-                BlockDecision.WouldBlockGroupLimit -> exceededGroupLimitMinutes
-                BlockDecision.WouldBlockAppLimit -> appLimitMinutes
+                BlockDecision.WouldBlockTotalLimit -> effectiveTotalLimitMinutes
+                BlockDecision.WouldBlockGroupLimit -> effectiveGroupLimitMinutes
+                BlockDecision.WouldBlockAppLimit -> effectiveAppLimitMinutes
                 else -> null
             },
             decision = decision,

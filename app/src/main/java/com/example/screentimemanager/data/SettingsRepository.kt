@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import java.io.IOException
+import java.time.LocalDate
 
 data class EventLogEntry(
     val timestampMillis: Long,
@@ -49,6 +50,26 @@ data class UsagePolicySettings(
     val appGroups: String = "",
     val appLimitRules: String = "",
 )
+
+data class TemporaryPackageAllowance(
+    val extraMinutes: Int = 0,
+    val unlockedForToday: Boolean = false,
+)
+
+data class TemporaryUnlockState(
+    val dateKey: String = "",
+    val totalExtraMinutes: Int = 0,
+    val totalUnlockedForToday: Boolean = false,
+    val packageAllowances: Map<String, TemporaryPackageAllowance> = emptyMap(),
+) {
+    fun forToday(todayKey: String = currentTemporaryUnlockDateKey()): TemporaryUnlockState {
+        return if (dateKey == todayKey) {
+            this
+        } else {
+            TemporaryUnlockState(dateKey = todayKey)
+        }
+    }
+}
 
 data class AppGroupPolicy(
     val name: String,
@@ -135,6 +156,18 @@ class SettingsRepository(
             preferences[FOREGROUND_DETECTION_STATUS]?.toForegroundDetectionStatusOrNull()
         }
 
+    val temporaryUnlockState: Flow<TemporaryUnlockState> = preferences
+        .map { preferences ->
+            preferences[TEMPORARY_UNLOCKS].orEmpty()
+                .toTemporaryUnlockState()
+                .forToday()
+        }
+
+    val allowedAppPackages: Flow<Set<String>> = preferences
+        .map { preferences ->
+            preferences[ALLOWED_APP_PACKAGES].orEmpty().toPackageSet()
+        }
+
     suspend fun setSafeModeEnabled(enabled: Boolean) {
         dataStore.edit { preferences ->
             preferences[SAFE_MODE_ENABLED] = enabled
@@ -171,6 +204,21 @@ class SettingsRepository(
     suspend fun setAppLanguage(language: AppLanguage) {
         dataStore.edit { preferences ->
             preferences[APP_LANGUAGE] = language.name
+        }
+    }
+
+    suspend fun setAllowedAppPackages(packageNames: Set<String>) {
+        dataStore.edit { preferences ->
+            val cleanPackageNames = packageNames
+                .map { packageName -> packageName.trim() }
+                .filter { packageName -> packageName.isNotBlank() }
+                .toSet()
+            preferences[ALLOWED_APP_PACKAGES] = cleanPackageNames.sorted().joinToString(",")
+            appendEvent(
+                preferences = preferences,
+                type = EventLogType.Safety,
+                message = "Allowed apps updated: ${cleanPackageNames.size}",
+            )
         }
     }
 
@@ -231,7 +279,7 @@ class SettingsRepository(
             appendEvent(
                 preferences = preferences,
                 type = EventLogType.Safety,
-                message = "Kill Switch activated",
+                message = "Kill Switch activated: Safe Mode ON, policy OFF, temporary allowances cleared",
             )
         }
     }
@@ -281,6 +329,61 @@ class SettingsRepository(
             }
         }
         return unlocked
+    }
+
+    suspend fun addTemporaryAppTime(
+        packageName: String,
+        appName: String,
+        extraMinutes: Int,
+        adminPin: String,
+    ): Boolean {
+        if (packageName.isBlank() || extraMinutes <= 0) {
+            return false
+        }
+        return updateTemporaryUnlocks(adminPin) { current ->
+            val currentAllowance = current.packageAllowances[packageName] ?: TemporaryPackageAllowance()
+            val nextAllowance = currentAllowance.copy(
+                extraMinutes = (currentAllowance.extraMinutes + extraMinutes).coerceAtMost(MAX_TEMPORARY_EXTRA_MINUTES),
+            )
+            current.copy(
+                packageAllowances = current.packageAllowances + (packageName to nextAllowance),
+            ) to "Parent added ${extraMinutes.toTimeLabel()} for ${appName.ifBlank { packageName }} (today extra ${nextAllowance.extraMinutes.toTimeLabel()})"
+        }
+    }
+
+    suspend fun unlockAppForToday(
+        packageName: String,
+        appName: String,
+        adminPin: String,
+    ): Boolean {
+        if (packageName.isBlank()) {
+            return false
+        }
+        return updateTemporaryUnlocks(adminPin) { current ->
+            val currentAllowance = current.packageAllowances[packageName] ?: TemporaryPackageAllowance()
+            current.copy(
+                packageAllowances = current.packageAllowances + (
+                    packageName to currentAllowance.copy(unlockedForToday = true)
+                ),
+            ) to "Parent unlocked ${appName.ifBlank { packageName }} for today"
+        }
+    }
+
+    suspend fun addTemporaryTotalTime(extraMinutes: Int, adminPin: String): Boolean {
+        if (extraMinutes <= 0) {
+            return false
+        }
+        return updateTemporaryUnlocks(adminPin) { current ->
+            current.copy(
+                totalExtraMinutes = (current.totalExtraMinutes + extraMinutes).coerceAtMost(MAX_TEMPORARY_EXTRA_MINUTES),
+            ) to "Parent added ${extraMinutes.toTimeLabel()} to daily limit (today extra ${current.totalExtraMinutes.plus(extraMinutes).coerceAtMost(MAX_TEMPORARY_EXTRA_MINUTES).toTimeLabel()})"
+        }
+    }
+
+    suspend fun unlockTotalForToday(adminPin: String): Boolean {
+        return updateTemporaryUnlocks(adminPin) { current ->
+            current.copy(totalUnlockedForToday = true) to "Parent unlocked total limit for today"
+        }
     }
 
     suspend fun addEvent(type: EventLogType, message: String) {
@@ -359,9 +462,47 @@ class SettingsRepository(
         return updated
     }
 
+    private suspend fun updateTemporaryUnlocks(
+        adminPin: String,
+        transform: (TemporaryUnlockState) -> Pair<TemporaryUnlockState, String>,
+    ): Boolean {
+        var updated = false
+        dataStore.edit { preferences ->
+            if (!isAdminPinValid(preferences, adminPin)) {
+                appendEvent(
+                    preferences = preferences,
+                    type = EventLogType.Warning,
+                    message = "Parent override failed: invalid admin PIN",
+                )
+                return@edit
+            }
+
+            val current = preferences[TEMPORARY_UNLOCKS].orEmpty()
+                .toTemporaryUnlockState()
+                .forToday()
+            val (nextState, message) = transform(current)
+            preferences[TEMPORARY_UNLOCKS] = nextState.toTemporaryUnlocksEncoded()
+            appendEvent(
+                preferences = preferences,
+                type = EventLogType.Info,
+                message = message,
+            )
+            updated = true
+        }
+        return updated
+    }
+
+    private fun isAdminPinValid(preferences: Preferences, adminPin: String): Boolean {
+        val savedPin = preferences[ADMIN_PIN] ?: DEFAULT_ADMIN_PIN
+        return adminPin == savedPin
+    }
+
     private fun applySafeRecovery(preferences: MutablePreferences) {
         preferences[SAFE_MODE_ENABLED] = true
         preferences[POLICY_ENFORCEMENT_ENABLED] = false
+        preferences[TEMPORARY_UNLOCKS] = ""
+        preferences[FOREGROUND_DETECTION_STATUS] = ""
+        preferences[POLICY_ALERT_KEYS] = ""
     }
 
     private fun appendEvent(
@@ -438,6 +579,8 @@ class SettingsRepository(
         private val EVENT_LOG = stringPreferencesKey("event_log")
         private val POLICY_ALERT_KEYS = stringPreferencesKey("policy_alert_keys")
         private val FOREGROUND_DETECTION_STATUS = stringPreferencesKey("foreground_detection_status")
+        private val TEMPORARY_UNLOCKS = stringPreferencesKey("temporary_unlocks")
+        private val ALLOWED_APP_PACKAGES = stringPreferencesKey("allowed_app_packages")
         private val LAST_RUN_CLEAN = booleanPreferencesKey("last_run_clean")
         private val WEEKDAY_LIMIT_MINUTES = intPreferencesKey("weekday_limit_minutes")
         private val WEEKEND_LIMIT_MINUTES = intPreferencesKey("weekend_limit_minutes")
@@ -457,7 +600,12 @@ class SettingsRepository(
         private const val FIELD_SEPARATOR = "|"
         private const val MAX_EVENT_LOG_ENTRIES = 50
         private const val MAX_POLICY_ALERT_KEYS = 120
+        private const val MAX_TEMPORARY_EXTRA_MINUTES = 720
     }
+}
+
+fun currentTemporaryUnlockDateKey(): String {
+    return LocalDate.now().toString()
 }
 
 fun UsagePolicySettings.normalizedAppGroups(): List<AppGroupPolicy> {
@@ -530,5 +678,74 @@ private fun String.decodePolicyField(): String {
         .replace("%25", "%")
 }
 
+private fun TemporaryUnlockState.toTemporaryUnlocksEncoded(): String {
+    val packageText = packageAllowances
+        .toSortedMap()
+        .map { (packageName, allowance) ->
+            listOf(
+                packageName.encodePolicyField(),
+                allowance.extraMinutes.coerceAtLeast(0).toString(),
+                allowance.unlockedForToday.toString(),
+            ).joinToString(TEMP_PACKAGE_FIELD_SEPARATOR)
+        }
+        .joinToString(TEMP_PACKAGE_SEPARATOR)
+
+    return listOf(
+        dateKey.encodePolicyField(),
+        totalExtraMinutes.coerceAtLeast(0).toString(),
+        totalUnlockedForToday.toString(),
+        packageText.encodePolicyField(),
+    ).joinToString(TEMP_FIELD_SEPARATOR)
+}
+
+private fun String.toTemporaryUnlockState(): TemporaryUnlockState {
+    if (isBlank()) {
+        return TemporaryUnlockState(dateKey = currentTemporaryUnlockDateKey())
+    }
+
+    val parts = split(TEMP_FIELD_SEPARATOR)
+    if (parts.size != 4) {
+        return TemporaryUnlockState(dateKey = currentTemporaryUnlockDateKey())
+    }
+
+    val packages = parts[3].decodePolicyField()
+        .split(TEMP_PACKAGE_SEPARATOR)
+        .mapNotNull { encodedPackage ->
+            val packageParts = encodedPackage.split(TEMP_PACKAGE_FIELD_SEPARATOR)
+            if (packageParts.size != 3) {
+                null
+            } else {
+                val packageName = packageParts[0].decodePolicyField()
+                val extraMinutes = packageParts[1].toIntOrNull()?.coerceAtLeast(0) ?: 0
+                val unlockedForToday = packageParts[2].toBooleanStrictOrNull() ?: false
+                packageName.takeIf { name -> name.isNotBlank() }?.let { name ->
+                    name to TemporaryPackageAllowance(extraMinutes, unlockedForToday)
+                }
+            }
+        }
+        .toMap()
+
+    return TemporaryUnlockState(
+        dateKey = parts[0].decodePolicyField(),
+        totalExtraMinutes = parts[1].toIntOrNull()?.coerceAtLeast(0) ?: 0,
+        totalUnlockedForToday = parts[2].toBooleanStrictOrNull() ?: false,
+        packageAllowances = packages,
+    )
+}
+
 private const val GROUP_SEPARATOR = ";"
 private const val GROUP_FIELD_SEPARATOR = "^"
+private const val TEMP_FIELD_SEPARATOR = "^"
+private const val TEMP_PACKAGE_SEPARATOR = ";"
+private const val TEMP_PACKAGE_FIELD_SEPARATOR = ":"
+
+private fun Int.toTimeLabel(): String {
+    val safeMinutes = coerceAtLeast(0)
+    val hours = safeMinutes / 60
+    val minutes = safeMinutes % 60
+    return when {
+        hours > 0 && minutes > 0 -> "${hours}h ${minutes}m"
+        hours > 0 -> "${hours}h"
+        else -> "${minutes}m"
+    }
+}

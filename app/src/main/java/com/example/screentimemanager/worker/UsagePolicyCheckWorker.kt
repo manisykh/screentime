@@ -6,6 +6,7 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.example.screentimemanager.formatLimitMinutesLabel
 import com.example.screentimemanager.data.EventLogType
 import com.example.screentimemanager.data.SettingsRepository
 import com.example.screentimemanager.data.normalizedAppGroups
@@ -62,31 +63,40 @@ object UsagePolicyAlertRunner {
         val limitNotificationsEnabled = settingsRepository.limitNotificationsEnabled.first()
 
         val settings = settingsRepository.usagePolicySettings.first()
+        val temporaryUnlockState = settingsRepository.temporaryUnlockState.first().forToday()
         val usage = usageRepository.getTodayUsage(maxItems = 500)
         val usageByPackage = usage.associateBy { appUsage -> appUsage.packageName }
         val totalUsedMinutes = usage.sumOf { appUsage -> appUsage.totalTimeMillis }.toMinutesCeil()
 
-        logIfNeeded(
-            alertId = "total",
-            usedMinutes = totalUsedMinutes,
-            limitMinutes = settings.todayLimitMinutes(),
-            warningMessage = "Total usage reached 80%",
-            exceededMessage = "Total usage exceeded",
-            settingsRepository = settingsRepository,
-            notificationHelper = notificationHelper,
-            sendNotifications = sendNotifications,
-            warningNotificationsEnabled = warningNotificationsEnabled,
-            limitNotificationsEnabled = limitNotificationsEnabled,
-        )
+        val totalLimitMinutes = settings.todayLimitMinutes()
+        if (!temporaryUnlockState.totalUnlockedForToday && totalLimitMinutes > 0) {
+            logIfNeeded(
+                alertId = "total",
+                usedMinutes = totalUsedMinutes,
+                limitMinutes = totalLimitMinutes + temporaryUnlockState.totalExtraMinutes,
+                warningMessage = "Total usage reached 80%",
+                exceededMessage = "Total usage exceeded",
+                settingsRepository = settingsRepository,
+                notificationHelper = notificationHelper,
+                sendNotifications = sendNotifications,
+                warningNotificationsEnabled = warningNotificationsEnabled,
+                limitNotificationsEnabled = limitNotificationsEnabled,
+            )
+        }
 
         settings.normalizedAppGroups().forEachIndexed { index, group ->
+            if (group.budgetMinutes <= 0) {
+                return@forEachIndexed
+            }
             val groupUsedMinutes = group.packageNames
                 .sumOf { packageName -> usageByPackage[packageName]?.totalTimeMillis ?: 0L }
                 .toMinutesCeil()
+            val groupExtraMinutes = group.packageNames
+                .sumOf { packageName -> temporaryUnlockState.packageAllowances[packageName]?.extraMinutes ?: 0 }
             logIfNeeded(
                 alertId = "group:$index:${group.name.hashCode()}",
                 usedMinutes = groupUsedMinutes,
-                limitMinutes = group.budgetMinutes,
+                limitMinutes = group.budgetMinutes + groupExtraMinutes,
                 warningMessage = "${group.name} group reached 80%",
                 exceededMessage = "${group.name} group exceeded",
                 settingsRepository = settingsRepository,
@@ -98,13 +108,20 @@ object UsagePolicyAlertRunner {
         }
 
         settings.appLimitMap().forEach { (packageName, limitMinutes) ->
+            if (limitMinutes <= 0) {
+                return@forEach
+            }
+            val appAllowance = temporaryUnlockState.packageAllowances[packageName]
+            if (appAllowance?.unlockedForToday == true) {
+                return@forEach
+            }
             val appUsage = usageByPackage[packageName]
             val usedMinutes = (appUsage?.totalTimeMillis ?: 0L).toMinutesCeil()
             val appName = appUsage?.appName ?: packageName
             logIfNeeded(
                 alertId = "app:$packageName",
                 usedMinutes = usedMinutes,
-                limitMinutes = limitMinutes,
+                limitMinutes = limitMinutes + (appAllowance?.extraMinutes ?: 0),
                 warningMessage = "$appName reached 80%",
                 exceededMessage = "$appName exceeded",
                 settingsRepository = settingsRepository,
@@ -144,7 +161,7 @@ object UsagePolicyAlertRunner {
             else -> null
         } ?: return
 
-        val message = "${alert.message} ($usedMinutes/$limitMinutes min)"
+        val message = "${alert.message} (${formatLimitMinutesLabel(usedMinutes)} / ${formatLimitMinutesLabel(limitMinutes)})"
         val recorded = settingsRepository.recordPolicyAlertOnce(
             alertKey = "${todayKey()}:${alert.level}:$alertId",
             type = alert.type,

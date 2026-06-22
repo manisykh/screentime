@@ -54,6 +54,7 @@ object SafetyGate {
         safeModeEnabled: Boolean,
         policyEnforcementEnabled: Boolean,
         targetPackageName: String,
+        userAllowedPackages: Set<String> = emptySet(),
     ): SafetyGateResult {
         return when {
             safeModeEnabled -> SafetyGateResult(
@@ -66,7 +67,7 @@ object SafetyGate {
                 reason = SafetyGateReason.PolicyEnforcementDisabled,
             )
 
-            targetPackageName in neverBlockPackages -> SafetyGateResult(
+            targetPackageName in neverBlockPackages || targetPackageName in userAllowedPackages -> SafetyGateResult(
                 canEvaluateBlocking = false,
                 reason = SafetyGateReason.WhitelistedPackage,
             )
@@ -82,11 +83,13 @@ object SafetyGate {
         safeModeEnabled: Boolean,
         policyEnforcementEnabled: Boolean,
         targetPackageName: String,
+        userAllowedPackages: Set<String> = emptySet(),
     ): Boolean {
         return evaluateBlocking(
             safeModeEnabled = safeModeEnabled,
             policyEnforcementEnabled = policyEnforcementEnabled,
             targetPackageName = targetPackageName,
+            userAllowedPackages = userAllowedPackages,
         ).canEvaluateBlocking
     }
 

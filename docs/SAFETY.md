@@ -84,7 +84,8 @@ These packages must never be blocked:
 - Package Installer
 - Screen Time Manager
 
-During early development, no other apps should be blocked.
+User-selected always-allowed apps are also treated as never-block targets at
+runtime. Required system safety apps cannot be removed from the whitelist.
 
 ## Development Rules
 
@@ -132,29 +133,72 @@ block:
 - A policy must be exceeded.
 
 The gate is implemented as `SafetyGate.evaluateBlocking(...)`, which returns a
-reason when blocking evaluation is denied. The current code still does not
-implement blocking.
+reason when blocking evaluation is denied. Real blocking may proceed only after
+this gate allows policy evaluation and the policy decision says a limit is
+exceeded.
 
-## No-op AccessibilityService
+## Foreground Usage Monitor Enforcement
 
-The current AccessibilityService implementation is detection-only.
+The foreground usage monitor service is the primary enforcement path.
+The target product behavior is AppBlock-style enforcement: monitor the current
+foreground app at short intervals, show an ongoing usage notification, move the
+user away from an exceeded app, keep a local block surface visible, and block
+re-entry while the policy remains exceeded.
+
+It may:
+
+- Run only when Safe Mode is OFF and Policy Enforcement is ON.
+- Use UsageStats to check the current foreground app at short intervals.
+- Show an ongoing monitor notification with second-level usage.
+- Send the user to the launcher when a blocked app reaches its limit.
+- Show a local blocking overlay when overlay permission is granted.
+- Fall back to the local blocked screen when overlay permission is unavailable.
+
+It must:
+
+- Stop and remove blocking overlays when Safe Mode or Kill Switch is activated.
+- Respect the required whitelist and user-selected always-allowed apps.
+- Keep Emergency Unlock and Kill Switch available on block surfaces.
+
+## AccessibilityService Enforcement
+
+The current AccessibilityService implementation is a secondary detection path.
+Real enforcement is handled by the foreground usage monitor service so blocking
+does not require Accessibility permission.
 
 It may:
 
 - Appear in Android Accessibility settings.
 - Observe foreground app package changes.
+- Retrieve interactive window packages for PIP or multi-window detection.
 - Display the latest foreground detection status in the Safety tab.
 - Record event-log entries.
 - Run `SafetyGate.evaluateBlocking(...)`.
-- Record `would be blocked` simulation events.
+- Record would-block detections when a limit is exceeded.
 
 It must not:
 
-- Launch a blocking screen.
-- Redirect the user.
 - Close or stop another app.
-- Call global accessibility actions for enforcement.
+- Kill another app process.
+- Launch a blocking screen while the foreground monitor service is responsible
+  for enforcement.
 - Enforce policy while Safe Mode is ON.
+- Enforce policy while Policy Enforcement is OFF.
+
+## Blocking Reliability Boundary
+
+Normal app permissions can combine UsageStats, AccessibilityService, media
+pause, and overlay windows, but Android does not guarantee that a third-party
+app can permanently cover or control every immersive game, secure surface, PIP
+window, or vendor-customized foreground surface.
+
+Strict commercial-grade enforcement for a managed child device should be
+designed as an optional Device Owner / managed-device mode. That mode can use
+Android management APIs in addition to the current safety gate. It must still
+keep Emergency Unlock, Kill Switch, required whitelist apps, and Safe Mode
+recovery paths available before stronger enforcement is enabled.
+- Block required whitelist or user always-allowed packages.
+- Store screen text from accessibility windows.
 
 Kill Switch remains the highest-priority recovery path because it enables Safe
 Mode. With Safe Mode ON, the service must return before any detection logic that
@@ -164,20 +208,26 @@ With Policy Enforcement OFF, the service must also return before whitelist or
 policy checks. This keeps accessibility permission separate from policy
 activation.
 
-## Pre-Blocking Screen State
+## Blocking Screen State
 
-The project may contain a blocked-screen Activity before real blocking is
-enabled.
+The blocked-screen Activity remains `exported=false` and may be opened from:
 
-In this state:
+- An explicit in-app preview action.
+- AccessibilityService after the safety gate and policy decision both allow
+  enforcement.
 
-- The blocked-screen Activity may be opened only from an explicit in-app preview
-  action.
-- AccessibilityService must not launch the blocked-screen Activity.
-- AccessibilityService must only record detection and `would be blocked` events.
-- Emergency Unlock and Kill Switch must remain available from the preview screen.
-- The blocked-screen Activity must remain `exported=false`.
+In real blocking mode:
 
-Real blocking requires a separate implementation step and must not be connected
-until the user explicitly approves it after validating Safe Mode, Kill Switch,
-Emergency Unlock, whitelist behavior, and policy decision logging.
+- Emergency Unlock and Kill Switch must remain visible.
+- Parent/Admin PIN time override may grant temporary access for today.
+- A full-screen accessibility overlay may cover games or immersive apps after
+  AccessibilityService safety checks pass. Android "draw over other apps"
+  permission is used only as a fallback overlay path.
+- The blocking overlay must expose Emergency Unlock and Kill Switch.
+- The service may send Home before opening the blocking screen so full-screen
+  apps do not remain usable behind the block.
+- Back must not return the user directly to the blocked app.
+- Leaving the blocking screen without an override should send the user Home.
+- Media playback may be paused for a short guarded period when the blocking
+  screen opens, but the app must not attempt to kill another app or forcibly
+  close its PIP window.

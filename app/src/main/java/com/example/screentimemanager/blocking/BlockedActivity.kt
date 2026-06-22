@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
@@ -17,9 +18,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -44,9 +47,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.example.screentimemanager.AppIcon
+import com.example.screentimemanager.SmoothMinuteSlider
 import com.example.screentimemanager.data.AppLanguage
 import com.example.screentimemanager.data.SettingsRepository
 import com.example.screentimemanager.data.settingsDataStore
+import com.example.screentimemanager.formatLimitMinutesLabel
 import com.example.screentimemanager.ui.theme.AppOver
 import com.example.screentimemanager.ui.theme.AppSafe
 import com.example.screentimemanager.ui.theme.ScreenTimeManagerTheme
@@ -65,6 +70,19 @@ class BlockedActivity : ComponentActivity() {
         val limitMinutes = intent.getIntExtra(EXTRA_LIMIT_MINUTES, -1).takeIf { minutes -> minutes >= 0 }
         val showAppDetails = intent.getBooleanExtra(EXTRA_SHOW_APP_DETAILS, true)
         val previewOnly = intent.getBooleanExtra(EXTRA_PREVIEW_ONLY, true)
+
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (previewOnly) {
+                        finish()
+                    } else {
+                        sendHomeAndFinish()
+                    }
+                }
+            },
+        )
 
         setContent {
             ScreenTimeManagerTheme {
@@ -93,10 +111,64 @@ class BlockedActivity : ComponentActivity() {
                             finish()
                         }
                     },
-                    onClosePreview = { finish() },
+                    onParentAddTime = { pin, minutes, onResult ->
+                        lifecycleScope.launch {
+                            val granted = if (showAppDetails) {
+                                repository.addTemporaryAppTime(
+                                    packageName = packageName,
+                                    appName = appName,
+                                    extraMinutes = minutes,
+                                    adminPin = pin,
+                                )
+                            } else {
+                                repository.addTemporaryTotalTime(
+                                    extraMinutes = minutes,
+                                    adminPin = pin,
+                                )
+                            }
+                            onResult(granted)
+                            if (granted) {
+                                finish()
+                            }
+                        }
+                    },
+                    onParentUnlockToday = { pin, onResult ->
+                        lifecycleScope.launch {
+                            val granted = if (showAppDetails) {
+                                repository.unlockAppForToday(
+                                    packageName = packageName,
+                                    appName = appName,
+                                    adminPin = pin,
+                                )
+                            } else {
+                                repository.unlockTotalForToday(adminPin = pin)
+                            }
+                            onResult(granted)
+                            if (granted) {
+                                finish()
+                            }
+                        }
+                    },
+                    onClosePreview = {
+                        if (previewOnly) {
+                            finish()
+                        } else {
+                            sendHomeAndFinish()
+                        }
+                    },
                 )
             }
         }
+    }
+
+    private fun sendHomeAndFinish() {
+        startActivity(
+            Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            },
+        )
+        finish()
     }
 
     companion object {
@@ -129,6 +201,31 @@ class BlockedActivity : ComponentActivity() {
                 putExtra(EXTRA_PREVIEW_ONLY, true)
             }
         }
+
+        fun blockIntent(
+            context: Context,
+            appName: String,
+            packageName: String,
+            reason: String,
+            usedMinutes: Int,
+            limitMinutes: Int?,
+            showAppDetails: Boolean,
+        ): Intent {
+            return Intent(context, BlockedActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(EXTRA_APP_NAME, appName)
+                putExtra(EXTRA_PACKAGE_NAME, packageName)
+                putExtra(EXTRA_REASON, reason)
+                putExtra(EXTRA_USED_MINUTES, usedMinutes)
+                if (limitMinutes != null) {
+                    putExtra(EXTRA_LIMIT_MINUTES, limitMinutes)
+                }
+                putExtra(EXTRA_SHOW_APP_DETAILS, showAppDetails)
+                putExtra(EXTRA_PREVIEW_ONLY, false)
+            }
+        }
     }
 }
 
@@ -144,8 +241,13 @@ private fun BlockedScreen(
     text: BlockedScreenStrings,
     onEmergencyUnlock: (String, (Boolean) -> Unit) -> Unit,
     onKillSwitch: () -> Unit,
+    onParentAddTime: (String, Int, (Boolean) -> Unit) -> Unit,
+    onParentUnlockToday: (String, (Boolean) -> Unit) -> Unit,
     onClosePreview: () -> Unit,
 ) {
+    var parentPin by remember { mutableStateOf("") }
+    var extraMinutes by remember { mutableStateOf(30) }
+    var parentFailed by remember { mutableStateOf(false) }
     var pin by remember { mutableStateOf("") }
     var unlockFailed by remember { mutableStateOf(false) }
 
@@ -166,7 +268,9 @@ private fun BlockedScreen(
             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
         ) {
             Column(
-                modifier = Modifier.padding(24.dp),
+                modifier = Modifier
+                    .padding(24.dp)
+                    .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(18.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
@@ -221,6 +325,72 @@ private fun BlockedScreen(
                     color = AppOver,
                     fontWeight = FontWeight.Bold,
                 )
+
+                if (!previewOnly) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(
+                            text = text.parentControls,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        OutlinedTextField(
+                            value = parentPin,
+                            onValueChange = {
+                                parentPin = it
+                                parentFailed = false
+                            },
+                            label = { Text(text.parentPin) },
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        BlockedExtraTimeControl(
+                            valueMinutes = extraMinutes,
+                            text = text,
+                            onValueMinutesChange = { minutes ->
+                                extraMinutes = minutes
+                                parentFailed = false
+                            },
+                        )
+                        OutlinedButton(
+                            onClick = {
+                                if (extraMinutes > 0) {
+                                    onParentAddTime(parentPin, extraMinutes) { granted ->
+                                        parentFailed = !granted
+                                    }
+                                }
+                            },
+                            enabled = parentPin.isNotBlank() && extraMinutes > 0,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(18.dp),
+                        ) {
+                            Text(text.addTime)
+                        }
+                        Button(
+                            onClick = {
+                                onParentUnlockToday(parentPin) { granted ->
+                                    parentFailed = !granted
+                                }
+                            },
+                            enabled = parentPin.isNotBlank(),
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(18.dp),
+                        ) {
+                            Text(text.unlockToday)
+                        }
+                        if (parentFailed) {
+                            Text(
+                                text = text.invalidParentPin,
+                                color = AppOver,
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                    }
+                }
 
                 OutlinedTextField(
                     value = pin,
@@ -284,6 +454,65 @@ private fun BlockedScreen(
     }
 }
 
+@Composable
+private fun BlockedExtraTimeControl(
+    valueMinutes: Int,
+    text: BlockedScreenStrings,
+    onValueMinutesChange: (Int) -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = text.extraTime,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                ) {
+                    Text(
+                        text = formatLimitMinutesLabel(valueMinutes),
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                    )
+                }
+            }
+            SmoothMinuteSlider(
+                valueMinutes = valueMinutes,
+                onValueMinutesChange = onValueMinutesChange,
+                minMinutes = 5,
+                maxMinutes = 240,
+                stepMinutes = 5,
+            )
+            Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                listOf(5, 60, 120, 240).forEach { minutes ->
+                    Text(
+                        text = formatLimitMinutesLabel(minutes),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+    }
+}
+
 private data class BlockedScreenStrings(
     val preview: String,
     val blocked: String,
@@ -292,6 +521,13 @@ private data class BlockedScreenStrings(
     val usedReason: (Int, Int?, String) -> String,
     val dailyReason: (Int, Int?) -> String,
     val remaining: String,
+    val parentControls: String,
+    val parentPin: String,
+    val extraTime: String,
+    val extraTimeHint: String,
+    val addTime: String,
+    val unlockToday: String,
+    val invalidParentPin: String,
     val emergencyPin: String,
     val invalidPin: String,
     val emergencyUnlock: String,
@@ -309,20 +545,27 @@ private fun blockedScreenStrings(language: AppLanguage): BlockedScreenStrings {
             dailyTitle = "\uC624\uB298 \uC0AC\uC6A9 \uC2DC\uAC04\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
             appTitle = "\uC774 \uC571\uC758 \uC0AC\uC6A9 \uC2DC\uAC04\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
             usedReason = { usedMinutes, limitMinutes, reason ->
-                val limitText = limitMinutes?.let { minutes -> " / ${minutes}\uBD84" }.orEmpty()
-                "${usedMinutes}\uBD84$limitText \uC0AC\uC6A9 - $reason"
+                val limitText = limitMinutes?.let { minutes -> " / ${formatLimitMinutesLabel(minutes)}" }.orEmpty()
+                "${formatLimitMinutesLabel(usedMinutes)}$limitText \uC0AC\uC6A9 - $reason"
             },
             dailyReason = { usedMinutes, limitMinutes ->
-                val limitText = limitMinutes?.let { minutes -> " / ${minutes}\uBD84" }.orEmpty()
-                "\uC804\uCCB4 \uC0AC\uC6A9 ${usedMinutes}\uBD84$limitText"
+                val limitText = limitMinutes?.let { minutes -> " / ${formatLimitMinutesLabel(minutes)}" }.orEmpty()
+                "\uC804\uCCB4 \uC0AC\uC6A9 ${formatLimitMinutesLabel(usedMinutes)}$limitText"
             },
-            remaining = "\uB0A8\uC740 \uC2DC\uAC04: 0\uBD84",
+            remaining = "\uB0A8\uC740 \uC2DC\uAC04: ${formatLimitMinutesLabel(0)}",
+            parentControls = "\uBCF4\uD638\uC790 \uC2DC\uAC04 \uCD94\uAC00",
+            parentPin = "\uAD00\uB9AC PIN",
+            extraTime = "\uCD94\uAC00 \uC2DC\uAC04",
+            extraTimeHint = "30m, 1h, 1h 30m",
+            addTime = "\uC2DC\uAC04 \uCD94\uAC00",
+            unlockToday = "\uC624\uB298\uB9CC \uD574\uC81C",
+            invalidParentPin = "\uAD00\uB9AC PIN\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4",
             emergencyPin = "\uAE34\uAE09 PIN",
             invalidPin = "PIN\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4",
             emergencyUnlock = "\uAE34\uAE09 \uD574\uC81C",
             killSwitch = "\uD0AC \uC2A4\uC704\uCE58",
             close = "\uB2EB\uAE30",
-            back = "\uB4A4\uB85C",
+            back = "\uD648\uC73C\uB85C",
             safetyNote = "Safe Mode\uC640 Kill Switch\uB294 \uD56D\uC0C1 \uC0AC\uC6A9\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.",
         )
 
@@ -332,20 +575,27 @@ private fun blockedScreenStrings(language: AppLanguage): BlockedScreenStrings {
             dailyTitle = "Today's screen time is over",
             appTitle = "This app's time is over",
             usedReason = { usedMinutes, limitMinutes, reason ->
-                val limitText = limitMinutes?.let { minutes -> " / ${minutes} min" }.orEmpty()
-                "$usedMinutes min$limitText used - $reason"
+                val limitText = limitMinutes?.let { minutes -> " / ${formatLimitMinutesLabel(minutes)}" }.orEmpty()
+                "${formatLimitMinutesLabel(usedMinutes)}$limitText used - $reason"
             },
             dailyReason = { usedMinutes, limitMinutes ->
-                val limitText = limitMinutes?.let { minutes -> " / ${minutes} min" }.orEmpty()
-                "Total usage $usedMinutes min$limitText"
+                val limitText = limitMinutes?.let { minutes -> " / ${formatLimitMinutesLabel(minutes)}" }.orEmpty()
+                "Total usage ${formatLimitMinutesLabel(usedMinutes)}$limitText"
             },
-            remaining = "Remaining time: 0 min",
+            remaining = "Remaining time: ${formatLimitMinutesLabel(0)}",
+            parentControls = "Parent Time Override",
+            parentPin = "Admin PIN",
+            extraTime = "Extra time",
+            extraTimeHint = "30m, 1h, 1h 30m",
+            addTime = "Add time",
+            unlockToday = "Unlock for today",
+            invalidParentPin = "Invalid admin PIN",
             emergencyPin = "Emergency PIN",
             invalidPin = "Invalid PIN",
             emergencyUnlock = "Emergency Unlock",
             killSwitch = "Kill Switch",
             close = "Close",
-            back = "Back",
+            back = "Home",
             safetyNote = "Safe Mode and Kill Switch always remain available.",
         )
     }

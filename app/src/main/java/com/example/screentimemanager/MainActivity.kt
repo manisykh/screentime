@@ -14,7 +14,12 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
@@ -110,16 +115,19 @@ import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.drawable.toBitmap
 import com.example.screentimemanager.blocking.BlockedActivity
+import com.example.screentimemanager.blocking.UsageMonitorForegroundService
 import com.example.screentimemanager.data.AppLanguage
 import com.example.screentimemanager.data.AppGroupPolicy
 import com.example.screentimemanager.data.EventLogEntry
 import com.example.screentimemanager.data.ForegroundDetectionStatus
+import com.example.screentimemanager.data.TemporaryUnlockState
 import com.example.screentimemanager.data.UsagePolicySettings
 import com.example.screentimemanager.data.normalizedAppGroups
 import com.example.screentimemanager.data.toAppGroupsEncoded
 import com.example.screentimemanager.notification.UsageNotificationHelper
 import com.example.screentimemanager.safety.BlockDecision
 import com.example.screentimemanager.safety.BlockDecisionResult
+import com.example.screentimemanager.safety.SafetyGate
 import com.example.screentimemanager.ui.safety.AppGroupSummary
 import com.example.screentimemanager.ui.safety.AppLimitSummary
 import com.example.screentimemanager.ui.safety.AutoRecoveryStatus
@@ -137,6 +145,7 @@ import com.example.screentimemanager.ui.safety.toAppLimitRules
 import com.example.screentimemanager.ui.theme.ScreenTimeManagerTheme
 import com.example.screentimemanager.ui.theme.AppOver
 import com.example.screentimemanager.ui.theme.AppSafe
+import kotlinx.coroutines.delay
 import com.example.screentimemanager.ui.theme.AppWarn
 import com.example.screentimemanager.usage.AppUsageInfo
 import com.example.screentimemanager.usage.InstalledAppInfo
@@ -159,6 +168,13 @@ class MainActivity : ComponentActivity() {
         setContent {
             ScreenTimeManagerTheme {
                 val uiState by safeModeViewModel.uiState.collectAsState()
+                LaunchedEffect(uiState.safeModeEnabled, uiState.policyEnforcementEnabled) {
+                    if (!uiState.safeModeEnabled && uiState.policyEnforcementEnabled) {
+                        UsageMonitorForegroundService.start(this@MainActivity)
+                    } else {
+                        UsageMonitorForegroundService.stop(this@MainActivity)
+                    }
+                }
                 val notificationPermissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestPermission(),
                     onResult = {
@@ -179,12 +195,15 @@ class MainActivity : ComponentActivity() {
                         onKillSwitchClick = safeModeViewModel::activateKillSwitch,
                         onEmergencyUnlock = safeModeViewModel::submitEmergencyPin,
                         onEmergencyPinChanged = safeModeViewModel::clearEmergencyUnlockStatus,
+                        onAllowedAppsChanged = safeModeViewModel::setAllowedAppPackages,
                         onOpenUsageAccessSettings = ::openUsageAccessSettings,
                         onOpenAccessibilitySettings = ::openAccessibilitySettings,
+                        onOpenOverlaySettings = ::openOverlaySettings,
                         onRefreshUsageStats = safeModeViewModel::refreshUsageStats,
                         onPolicyDraftChanged = safeModeViewModel::updatePolicyDraft,
                         onResetPolicyDraft = safeModeViewModel::resetPolicyDraft,
                         onSaveUsagePolicy = safeModeViewModel::savePolicyDraft,
+                        onPolicySaveStatusSeen = safeModeViewModel::clearPolicySaveStatus,
                         onRequestNotificationPermission = {
                             if (
                                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -224,6 +243,15 @@ class MainActivity : ComponentActivity() {
 
     private fun openAccessibilitySettings() {
         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
+
+    private fun openOverlaySettings() {
+        startActivity(
+            Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName"),
+            ),
+        )
     }
 
     private fun openNotificationSettings() {
@@ -282,12 +310,15 @@ fun ScreenTimeManagerScreen(
     onKillSwitchClick: () -> Unit,
     onEmergencyUnlock: (String) -> Unit,
     onEmergencyPinChanged: () -> Unit,
+    onAllowedAppsChanged: (Set<String>) -> Unit,
     onOpenUsageAccessSettings: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
+    onOpenOverlaySettings: () -> Unit,
     onRefreshUsageStats: () -> Unit,
     onPolicyDraftChanged: (UsagePolicySettings) -> Unit,
     onResetPolicyDraft: () -> Unit,
     onSaveUsagePolicy: (String) -> Unit,
+    onPolicySaveStatusSeen: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onUpdateAdminPin: (String, String) -> Unit,
     onUpdateEmergencyPin: (String, String) -> Unit,
@@ -303,6 +334,25 @@ fun ScreenTimeManagerScreen(
     var showPolicySaveDialog by remember { mutableStateOf(false) }
     val text = appStrings(uiState.appLanguage)
     val context = LocalContext.current
+    val hasPolicySaveProblem = uiState.policyBudgetValidation.hasOverflow ||
+        uiState.policySaveStatus == PolicySaveStatus.InvalidAdminPin ||
+        uiState.policySaveStatus == PolicySaveStatus.BudgetExceeded
+    val screenBackground by animateColorAsState(
+        targetValue = when {
+            hasPolicySaveProblem || uiState.policyDraftHasChanges -> AppOver.copy(alpha = 0.045f)
+            uiState.policySaveStatus == PolicySaveStatus.Saved -> AppSafe.copy(alpha = 0.06f)
+            else -> MaterialTheme.colorScheme.background
+        },
+        animationSpec = tween(durationMillis = 420),
+        label = "policy-save-background",
+    )
+
+    LaunchedEffect(uiState.policySaveStatus) {
+        if (uiState.policySaveStatus == PolicySaveStatus.Saved) {
+            delay(1_200L)
+            onPolicySaveStatusSeen()
+        }
+    }
 
     fun selectTab(nextTab: ScreenTab) {
         if (nextTab == selectedTab) {
@@ -316,6 +366,7 @@ fun ScreenTimeManagerScreen(
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
+            .background(screenBackground)
             .fillMaxWidth(),
     ) {
         val isExpanded = maxWidth >= 720.dp
@@ -371,29 +422,21 @@ fun ScreenTimeManagerScreen(
 
                         ScreenTab.Policy -> UsagePolicySection(
                             settings = uiState.policyDraftSettings,
+                            temporaryUnlockState = uiState.temporaryUnlockState,
                             installedApps = uiState.installedApps,
                             text = text,
                             isExpanded = isExpanded,
                             contentMode = PolicyContentMode.DaysAndGroups,
-                            policySaveStatus = uiState.policySaveStatus,
-                            hasPolicyChanges = uiState.policyDraftHasChanges,
-                            budgetValidation = uiState.policyBudgetValidation,
-                            onRequestSavePolicy = { showPolicySaveDialog = true },
-                            onResetPolicyDraft = onResetPolicyDraft,
                             onPolicyDraftChanged = onPolicyDraftChanged,
                         )
 
                         ScreenTab.Apps -> UsagePolicySection(
                             settings = uiState.policyDraftSettings,
+                            temporaryUnlockState = uiState.temporaryUnlockState,
                             installedApps = uiState.installedApps,
                             text = text,
                             isExpanded = isExpanded,
                             contentMode = PolicyContentMode.AppLimits,
-                            policySaveStatus = uiState.policySaveStatus,
-                            hasPolicyChanges = uiState.policyDraftHasChanges,
-                            budgetValidation = uiState.policyBudgetValidation,
-                            onRequestSavePolicy = { showPolicySaveDialog = true },
-                            onResetPolicyDraft = onResetPolicyDraft,
                             onPolicyDraftChanged = onPolicyDraftChanged,
                         )
 
@@ -406,6 +449,7 @@ fun ScreenTimeManagerScreen(
                             onPolicyEnforcementChanged = onPolicyEnforcementChanged,
                             onKillSwitchClick = onKillSwitchClick,
                             onOpenAccessibilitySettings = onOpenAccessibilitySettings,
+                            onOpenOverlaySettings = onOpenOverlaySettings,
                             onRequestNotificationPermission = onRequestNotificationPermission,
                             onOpenBlockScreenPreview = { result ->
                                 context.startActivity(
@@ -437,6 +481,7 @@ fun ScreenTimeManagerScreen(
                             onAppLanguageChanged = onAppLanguageChanged,
                             onWarningNotificationsChanged = onWarningNotificationsChanged,
                             onLimitNotificationsChanged = onLimitNotificationsChanged,
+                            onAllowedAppsChanged = onAllowedAppsChanged,
                             onRequestNotificationPermission = onRequestNotificationPermission,
                             onUpdateAdminPin = onUpdateAdminPin,
                             onUpdateEmergencyPin = onUpdateEmergencyPin,
@@ -452,11 +497,15 @@ fun ScreenTimeManagerScreen(
             BottomTabBar(
                 selectedTab = selectedTab,
                 text = text,
+                policySaveStatus = uiState.policySaveStatus,
+                hasPolicyChanges = uiState.policyDraftHasChanges,
+                budgetValidation = uiState.policyBudgetValidation,
                 onTabSelected = { tab -> selectTab(tab) },
+                onRequestSavePolicy = { showPolicySaveDialog = true },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(horizontal = 20.dp, vertical = 10.dp)
-                    .widthIn(max = 560.dp),
+                    .widthIn(max = 680.dp),
             )
         }
 
@@ -468,6 +517,7 @@ fun ScreenTimeManagerScreen(
                 hasPolicyChanges = uiState.policyDraftHasChanges,
                 budgetValidation = uiState.policyBudgetValidation,
                 onAdminPinChanged = { policyAdminPin = it },
+                onResetPolicyDraft = onResetPolicyDraft,
                 onDismiss = {
                     showPolicySaveDialog = false
                     policyAdminPin = ""
@@ -537,6 +587,7 @@ fun PolicySaveDialog(
     hasPolicyChanges: Boolean,
     budgetValidation: PolicyBudgetValidation,
     onAdminPinChanged: (String) -> Unit,
+    onResetPolicyDraft: () -> Unit,
     onDismiss: () -> Unit,
     onSave: () -> Unit,
 ) {
@@ -585,7 +636,7 @@ fun PolicySaveDialog(
                     keyboardActions = KeyboardActions(
                         onDone = {
                             focusManager.clearFocus()
-                            if (adminPin.isNotBlank() && !hasBudgetOverflow) {
+                            if (adminPin.isNotBlank() && hasPolicyChanges && !hasBudgetOverflow) {
                                 onSave()
                             }
                         },
@@ -601,14 +652,26 @@ fun PolicySaveDialog(
                     focusManager.clearFocus()
                     onSave()
                 },
-                enabled = adminPin.isNotBlank() && !hasBudgetOverflow,
+                enabled = adminPin.isNotBlank() && hasPolicyChanges && !hasBudgetOverflow,
             ) {
                 Text(text.savePolicy)
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(text.cancel)
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(
+                    onClick = {
+                        focusManager.clearFocus()
+                        onResetPolicyDraft()
+                        onDismiss()
+                    },
+                    enabled = hasPolicyChanges,
+                ) {
+                    Text(text.resetChanges)
+                }
+                TextButton(onClick = onDismiss) {
+                    Text(text.cancel)
+                }
             }
         },
     )
@@ -626,7 +689,7 @@ private fun policyValidationMessage(
     }
     val overflowingDays = budgetValidation.overflowingDayIndexes
         .joinToString(", ") { index -> text.dayLabels.getOrElse(index) { "" } }
-    return "${text.policyBudgetExceeded}: $overflowingDays - ${text.appLimits} ${budgetValidation.appLimitTotalMinutes}${text.minutes}, ${text.appGroups} ${budgetValidation.groupBudgetTotalMinutes}${text.minutes}"
+    return "${text.policyBudgetExceeded}: $overflowingDays - ${text.appLimits} ${formatLimitMinutesLabel(budgetValidation.appLimitTotalMinutes)}, ${text.appGroups} ${formatLimitMinutesLabel(budgetValidation.groupBudgetTotalMinutes)}"
 }
 
 @Composable
@@ -666,7 +729,11 @@ fun Header(onSettingsClick: () -> Unit) {
 private fun BottomTabBar(
     selectedTab: ScreenTab,
     text: AppStrings,
+    policySaveStatus: PolicySaveStatus,
+    hasPolicyChanges: Boolean,
+    budgetValidation: PolicyBudgetValidation,
     onTabSelected: (ScreenTab) -> Unit,
+    onRequestSavePolicy: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -692,6 +759,82 @@ private fun BottomTabBar(
                     modifier = Modifier.weight(1f),
                 )
             }
+            BottomSaveAction(
+                text = text,
+                policySaveStatus = policySaveStatus,
+                hasPolicyChanges = hasPolicyChanges,
+                hasBudgetOverflow = budgetValidation.hasOverflow,
+                onClick = onRequestSavePolicy,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BottomSaveAction(
+    text: AppStrings,
+    policySaveStatus: PolicySaveStatus,
+    hasPolicyChanges: Boolean,
+    hasBudgetOverflow: Boolean,
+    onClick: () -> Unit,
+) {
+    val pulseTransition = rememberInfiniteTransition(label = "bottom-save-pulse")
+    val pulseAlpha by pulseTransition.animateFloat(
+        initialValue = 0.62f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 780),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "bottom-save-pulse-alpha",
+    )
+    val activeAlpha = if ((hasPolicyChanges || hasBudgetOverflow) && policySaveStatus != PolicySaveStatus.Saved) pulseAlpha else 1f
+    val status = when {
+        hasBudgetOverflow -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.InvalidAdminPin -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.BudgetExceeded -> LimitStatus.Exceeded
+        hasPolicyChanges -> LimitStatus.Exceeded
+        else -> LimitStatus.Normal
+    }
+    val containerColor = when (status) {
+        LimitStatus.Normal -> if (policySaveStatus == PolicySaveStatus.Saved) {
+            AppSafe.copy(alpha = 0.18f)
+        } else {
+            Color.Transparent
+        }
+        LimitStatus.Warning -> Color(0xFFFFF1D6).copy(alpha = activeAlpha)
+        LimitStatus.Exceeded -> AppOver.copy(alpha = 0.14f * activeAlpha)
+    }
+    val contentColor = when (status) {
+        LimitStatus.Normal -> if (policySaveStatus == PolicySaveStatus.Saved) AppSafe else MaterialTheme.colorScheme.onSurfaceVariant
+        LimitStatus.Warning -> Color(0xFF9A6500)
+        LimitStatus.Exceeded -> AppOver
+    }
+    Surface(
+        onClick = onClick,
+        modifier = Modifier
+            .height(58.dp)
+            .widthIn(min = 64.dp),
+        shape = RoundedCornerShape(24.dp),
+        color = containerColor,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Canvas(modifier = Modifier.size(8.dp)) {
+                drawCircle(color = contentColor)
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = text.savePolicy,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+                color = contentColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -882,6 +1025,7 @@ fun OverviewContent(
         rightContent = {
             UsageStatsSection(
                 hasUsageAccess = uiState.hasUsageAccess,
+                usageAccessChecking = uiState.usageAccessChecking,
                 todayUsage = uiState.todayUsage,
                 policySummary = uiState.policySummary,
                 text = text,
@@ -927,7 +1071,13 @@ fun AdaptiveTwoPane(
 @Composable
 fun StatusCard(uiState: SafeModeUiState, text: AppStrings) {
     val summary = uiState.policySummary
-    val overMinutes = (summary.totalUsedMinutes - summary.totalLimitMinutes).coerceAtLeast(0)
+    val effectiveTotalLimitMinutes = (summary.totalLimitMinutes + summary.totalExtraMinutes)
+        .coerceAtLeast(summary.totalLimitMinutes)
+    val overMinutes = if (summary.totalUnlockedForToday) {
+        0
+    } else {
+        (summary.totalUsedMinutes - effectiveTotalLimitMinutes).coerceAtLeast(0)
+    }
     val headline = if (uiState.safeModeEnabled) text.safeModeOn else text.safeModeOff
     SimpleCard {
         Row(verticalAlignment = Alignment.Top) {
@@ -947,17 +1097,33 @@ fun StatusCard(uiState: SafeModeUiState, text: AppStrings) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             UsageProgressRing(
                 usedMinutes = summary.totalUsedMinutes,
-                limitMinutes = summary.totalLimitMinutes,
+                limitMinutes = if (summary.totalUnlockedForToday) {
+                    summary.totalUsedMinutes.coerceAtLeast(1)
+                } else {
+                    effectiveTotalLimitMinutes
+                },
                 status = summary.totalStatus,
             )
             Spacer(modifier = Modifier.width(24.dp))
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.Bottom) {
-                    Text(summary.totalUsedMinutes.toString(), style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold)
-                    Text(" / ${summary.totalLimitMinutes}m", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        formatLimitMinutesLabel(summary.totalUsedMinutes),
+                        style = MaterialTheme.typography.displaySmall,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        " / ${formatLimitWithAllowance(summary.totalLimitMinutes, summary.totalExtraMinutes, summary.totalUnlockedForToday, text)}",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
                 Text(
-                    if (overMinutes > 0) "+${overMinutes}m over limit" else text.limitStatus(summary.totalStatus),
+                    if (overMinutes > 0) "+${formatLimitMinutesLabel(overMinutes)} over limit" else text.limitStatus(summary.totalStatus),
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.Bold,
                     color = if (overMinutes > 0) AppOver else summary.totalStatus.semanticColor(),
@@ -1087,8 +1253,15 @@ fun ProgressLine(
     limitMinutes: Int,
     status: LimitStatus,
     text: AppStrings,
+    extraMinutes: Int = 0,
+    unlockedForToday: Boolean = false,
 ) {
-    val rawProgress = if (limitMinutes <= 0) 0f else usedMinutes.toFloat() / limitMinutes.toFloat()
+    val effectiveLimitMinutes = (limitMinutes + extraMinutes).coerceAtLeast(limitMinutes)
+    val rawProgress = if (unlockedForToday || effectiveLimitMinutes <= 0) {
+        0f
+    } else {
+        usedMinutes.toFloat() / effectiveLimitMinutes.toFloat()
+    }
     val progress by animateFloatAsState(
         targetValue = rawProgress.coerceIn(0f, 1f),
         animationSpec = tween(durationMillis = 600),
@@ -1098,13 +1271,26 @@ fun ProgressLine(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "${usedMinutes}m / ${limitMinutes}m",
+                "${formatLimitMinutesLabel(usedMinutes)} / ${formatLimitWithAllowance(limitMinutes, extraMinutes, unlockedForToday, text)}",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        GaugeBar(fraction = progress, status = status, height = 8)
+        GaugeBar(fraction = progress, status = if (unlockedForToday) LimitStatus.Normal else status, height = 8)
+    }
+}
+
+fun formatLimitWithAllowance(
+    limitMinutes: Int,
+    extraMinutes: Int,
+    unlockedForToday: Boolean,
+    text: AppStrings,
+): String {
+    return when {
+        unlockedForToday -> text.unlockedToday
+        extraMinutes > 0 -> "${formatLimitMinutesLabel(limitMinutes)}+${formatLimitMinutesLabel(extraMinutes)}"
+        else -> formatLimitMinutesLabel(limitMinutes)
     }
 }
 
@@ -1155,6 +1341,7 @@ fun SafetyContent(
     onPolicyEnforcementChanged: (Boolean) -> Unit,
     onKillSwitchClick: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
+    onOpenOverlaySettings: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onOpenBlockScreenPreview: (BlockDecisionResult) -> Unit,
     onPinChanged: (String) -> Unit,
@@ -1203,6 +1390,15 @@ fun SafetyContent(
             readiness = uiState.blockingReadiness,
             text = text,
             onOpenAccessibilitySettings = onOpenAccessibilitySettings,
+            onOpenOverlaySettings = onOpenOverlaySettings,
+        )
+
+        BlockSafetyStatusSection(
+            results = uiState.blockDecisionResults,
+            temporaryUnlockState = uiState.temporaryUnlockState,
+            policySummary = uiState.policySummary,
+            installedApps = uiState.installedApps,
+            text = text,
         )
 
         DetectionStatusSection(
@@ -1259,6 +1455,7 @@ fun SettingsContent(
     onAppLanguageChanged: (AppLanguage) -> Unit,
     onWarningNotificationsChanged: (Boolean) -> Unit,
     onLimitNotificationsChanged: (Boolean) -> Unit,
+    onAllowedAppsChanged: (Set<String>) -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onUpdateAdminPin: (String, String) -> Unit,
     onUpdateEmergencyPin: (String, String) -> Unit,
@@ -1306,6 +1503,13 @@ fun SettingsContent(
                 Text(text.notificationPermission)
             }
         }
+
+        AlwaysAllowedAppsSection(
+            installedApps = uiState.installedApps,
+            allowedAppPackages = uiState.allowedAppPackages,
+            text = text,
+            onAllowedAppsChanged = onAllowedAppsChanged,
+        )
 
         SimpleCard {
             SectionTitle(text.pinSettings)
@@ -1403,6 +1607,176 @@ fun NotificationPreferenceRow(
             )
         }
         Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+@Composable
+fun AlwaysAllowedAppsSection(
+    installedApps: List<InstalledAppInfo>,
+    allowedAppPackages: Set<String>,
+    text: AppStrings,
+    onAllowedAppsChanged: (Set<String>) -> Unit,
+) {
+    SimpleCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SectionTitle(text.alwaysAllowedApps, Modifier.weight(1f))
+            StatusBadge(text.selectedApps(allowedAppPackages.size), LimitStatus.Normal)
+        }
+        Text(
+            text.alwaysAllowedDescription,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Text(
+            text.requiredAllowedApps,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        SafetyGate.requiredNeverBlockPackages.sorted().forEach { packageName ->
+            RequiredAllowedPackageRow(packageName = packageName)
+        }
+
+        Text(
+            text.userAllowedApps,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        val sortedApps = remember(installedApps, allowedAppPackages) {
+            installedApps.sortedWith(
+                compareByDescending<InstalledAppInfo> { app -> app.packageName in allowedAppPackages }
+                    .thenBy { app -> app.appName.lowercase() },
+            )
+        }
+        if (sortedApps.isEmpty()) {
+            Text(text.noSelectableApps, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            ContainedLazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 360.dp),
+                resetKey = sortedApps.map { app -> app.packageName } + allowedAppPackages.sorted(),
+            ) {
+                items(sortedApps, key = { app -> app.packageName }) { app ->
+                    val selected = app.packageName in allowedAppPackages
+                    UserAllowedAppRow(
+                        app = app,
+                        selected = selected,
+                        text = text,
+                        onToggle = {
+                            val nextPackages = if (selected) {
+                                allowedAppPackages - app.packageName
+                            } else {
+                                allowedAppPackages + app.packageName
+                            }
+                            onAllowedAppsChanged(nextPackages)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RequiredAllowedPackageRow(packageName: String) {
+    val context = LocalContext.current
+    val appName = remember(packageName) {
+        runCatching {
+            val packageManager = context.packageManager
+            val applicationInfo = packageManager.getApplicationInfo(packageName, 0)
+            packageManager.getApplicationLabel(applicationInfo).toString()
+        }.getOrDefault(packageName)
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        AppIcon(packageName = packageName, contentDescription = appName, size = 34.dp)
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                appName,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                packageName,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        StatusBadge("LOCK", LimitStatus.Normal)
+    }
+}
+
+@Composable
+private fun UserAllowedAppRow(
+    app: InstalledAppInfo,
+    selected: Boolean,
+    text: AppStrings,
+    onToggle: () -> Unit,
+) {
+    Column {
+        Surface(
+            onClick = onToggle,
+            shape = RoundedCornerShape(18.dp),
+            color = if (selected) {
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            },
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                AppIcon(packageName = app.packageName, contentDescription = app.appName, size = 36.dp)
+                Spacer(modifier = Modifier.width(14.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        app.appName,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        app.packageName,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                ) {
+                    Text(
+                        if (selected) text.allowed else text.allow,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
+        )
     }
 }
 
@@ -1530,6 +1904,7 @@ fun BlockingReadinessSection(
     readiness: BlockingReadiness,
     text: AppStrings,
     onOpenAccessibilitySettings: () -> Unit,
+    onOpenOverlaySettings: () -> Unit,
 ) {
     SimpleCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1550,6 +1925,9 @@ fun BlockingReadinessSection(
         OutlinedButton(onClick = onOpenAccessibilitySettings) {
             Text(text.openAccessibilitySettings)
         }
+        OutlinedButton(onClick = onOpenOverlaySettings) {
+            Text(text.openOverlaySettings)
+        }
     }
 }
 
@@ -1565,6 +1943,193 @@ fun ReadinessRow(label: String, ready: Boolean) {
             if (ready) LimitStatus.Normal else LimitStatus.Warning,
         )
     }
+}
+
+@Composable
+fun BlockSafetyStatusSection(
+    results: List<BlockDecisionResult>,
+    temporaryUnlockState: TemporaryUnlockState,
+    policySummary: PolicySummary,
+    installedApps: List<InstalledAppInfo>,
+    text: AppStrings,
+) {
+    val blockTargets = results.filter { result -> result.decision.isWouldBlockDecision() }
+    val todayTemporaryState = temporaryUnlockState.forToday()
+    val installedNameByPackage = installedApps.associate { app -> app.packageName to app.appName }
+    val appSummaryByPackage = policySummary.appLimitSummaries.associateBy { summary -> summary.packageName }
+    val groupSummaryByPackage = policySummary.groupSummaries
+        .flatMap { groupSummary -> groupSummary.packageNames.map { packageName -> packageName to groupSummary } }
+        .toMap()
+
+    SimpleCard {
+        SectionTitle(text.blockSafetyStatus)
+
+        Text(
+            text.currentBlockTargets,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        if (blockTargets.isEmpty()) {
+            Text(text.noCurrentBlockTargets, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            blockTargets.take(6).forEach { result ->
+                val usageText = listOfNotNull(
+                    formatLimitMinutesLabel(result.usedMinutes),
+                    result.limitMinutes?.let { limitMinutes -> formatLimitMinutesLabel(limitMinutes) },
+                ).joinToString(" / ")
+                if (result.decision == BlockDecision.WouldBlockTotalLimit) {
+                    SafetyStatusRow(
+                        title = text.dailyLimit,
+                        supportingText = "${text.blockDecision(result.decision)} - $usageText",
+                        statusLabel = text.blockDecision(result.decision),
+                        status = LimitStatus.Exceeded,
+                    )
+                } else {
+                    AppRow(
+                        appName = result.appName,
+                        packageName = result.packageName,
+                        supportingText = "${text.blockDecision(result.decision)} - $usageText",
+                        trailingContent = {
+                            StatusBadge(text.blockDecision(result.decision), LimitStatus.Exceeded)
+                        },
+                    )
+                }
+            }
+        }
+
+        Text(
+            text.temporaryAllowances,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        val hasTemporaryTotalAllowance = todayTemporaryState.totalUnlockedForToday ||
+            todayTemporaryState.totalExtraMinutes > 0
+        val hasTemporaryPackageAllowance = todayTemporaryState.packageAllowances.any { (_, allowance) ->
+            allowance.unlockedForToday || allowance.extraMinutes > 0
+        }
+        if (!hasTemporaryTotalAllowance && !hasTemporaryPackageAllowance) {
+            Text(text.noTemporaryAllowances, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            if (hasTemporaryTotalAllowance) {
+                val remaining = remainingTemporaryMinutes(
+                    baseLimitMinutes = policySummary.totalLimitMinutes,
+                    extraMinutes = todayTemporaryState.totalExtraMinutes,
+                    usedMinutes = policySummary.totalUsedMinutes,
+                )
+                SafetyStatusRow(
+                    title = text.dailyLimit,
+                    supportingText = if (todayTemporaryState.totalUnlockedForToday) {
+                        text.unlockedToday
+                    } else {
+                        text.temporaryAllowanceDetail(remaining, todayTemporaryState.totalExtraMinutes)
+                    },
+                    statusLabel = if (todayTemporaryState.totalUnlockedForToday) {
+                        text.unlockedToday
+                    } else {
+                        "+${formatLimitMinutesLabel(todayTemporaryState.totalExtraMinutes)}"
+                    },
+                    status = LimitStatus.Normal,
+                )
+            }
+
+            todayTemporaryState.packageAllowances
+                .filter { (_, allowance) -> allowance.unlockedForToday || allowance.extraMinutes > 0 }
+                .toSortedMap(compareBy { packageName ->
+                    installedNameByPackage[packageName]
+                        ?: appSummaryByPackage[packageName]?.appName
+                        ?: packageName
+                })
+                .forEach { (packageName, allowance) ->
+                    val appSummary = appSummaryByPackage[packageName]
+                    val groupSummary = groupSummaryByPackage[packageName]
+                    val appName = installedNameByPackage[packageName]
+                        ?: appSummary?.appName
+                        ?: packageName
+                    val remaining = remainingTemporaryPackageMinutes(
+                        extraMinutes = allowance.extraMinutes,
+                        appSummary = appSummary,
+                        groupSummary = groupSummary,
+                    )
+                    AppRow(
+                        appName = appName,
+                        packageName = packageName,
+                        supportingText = if (allowance.unlockedForToday) {
+                            text.unlockedToday
+                        } else {
+                            text.temporaryAllowanceDetail(remaining, allowance.extraMinutes)
+                        },
+                        trailingContent = {
+                            StatusBadge(
+                                if (allowance.unlockedForToday) {
+                                    text.unlockedToday
+                                } else {
+                                    "+${formatLimitMinutesLabel(allowance.extraMinutes)}"
+                                },
+                                LimitStatus.Normal,
+                            )
+                        },
+                    )
+                }
+        }
+    }
+}
+
+@Composable
+private fun SafetyStatusRow(
+    title: String,
+    supportingText: String,
+    statusLabel: String,
+    status: LimitStatus,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            Text(
+                supportingText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        StatusBadge(statusLabel, status)
+    }
+}
+
+private fun remainingTemporaryMinutes(
+    baseLimitMinutes: Int,
+    extraMinutes: Int,
+    usedMinutes: Int,
+): Int {
+    if (extraMinutes <= 0) {
+        return 0
+    }
+    return (baseLimitMinutes + extraMinutes - usedMinutes).coerceIn(0, extraMinutes)
+}
+
+private fun remainingTemporaryPackageMinutes(
+    extraMinutes: Int,
+    appSummary: AppLimitSummary?,
+    groupSummary: AppGroupSummary?,
+): Int {
+    if (extraMinutes <= 0) {
+        return 0
+    }
+    if (appSummary != null) {
+        return remainingTemporaryMinutes(
+            baseLimitMinutes = appSummary.limitMinutes,
+            extraMinutes = extraMinutes,
+            usedMinutes = appSummary.usedMinutes,
+        )
+    }
+    if (groupSummary != null) {
+        return (groupSummary.limitMinutes + groupSummary.extraMinutes - groupSummary.usedMinutes)
+            .coerceIn(0, extraMinutes)
+    }
+    return extraMinutes
 }
 
 @Composable
@@ -1669,7 +2234,7 @@ fun BlockScreenPreviewSection(
                         Text(
                             text = listOfNotNull(
                                 text.usedMinutes(previewTarget.usedMinutes),
-                                previewTarget.limitMinutes?.let { limitMinutes -> "${limitMinutes}${text.minutes}" },
+                                previewTarget.limitMinutes?.let { limitMinutes -> formatLimitMinutesLabel(limitMinutes) },
                             ).joinToString(" / "),
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1685,7 +2250,7 @@ fun BlockScreenPreviewSection(
                         )
                     }
                     Text(
-                        "${text.remainingTime}: 0${text.minutes}",
+                        "${text.remainingTime}: ${formatLimitMinutesLabel(0)}",
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1745,6 +2310,7 @@ fun EventLogSection(
 @Composable
 fun UsageStatsSection(
     hasUsageAccess: Boolean,
+    usageAccessChecking: Boolean,
     todayUsage: List<AppUsageInfo>,
     policySummary: PolicySummary,
     text: AppStrings,
@@ -1796,6 +2362,8 @@ fun UsageStatsSection(
         } else if (!hasUsageAccess) {
             Text(text.usageAccessRequired)
             Button(onClick = onOpenUsageAccessSettings) { Text(text.openUsageAccessSettings) }
+        } else if (usageAccessChecking) {
+            Text(text.usageAccessChecking, color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else if (todayUsage.isEmpty()) {
             Text(text.noUsageRecorded)
         }
@@ -1828,7 +2396,14 @@ fun TodayUsageHero(
                     Text(appUsage.appName, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Text("Most used today", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Text(formatDuration(appUsage.totalTimeMillis), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(
+                    formatDuration(appUsage.totalTimeMillis),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.widthIn(min = 84.dp),
+                )
             }
             MiniUsageBar(
                 fraction = appUsage.totalTimeMillis.toFloat() / totalUsageMillis.toFloat(),
@@ -1857,9 +2432,12 @@ fun UsageListRow(appUsage: AppUsageInfo, topUsageMillis: Long, status: LimitStat
         Spacer(modifier = Modifier.width(14.dp))
         Text(
             formatDuration(appUsage.totalTimeMillis),
+            modifier = Modifier.widthIn(min = 72.dp),
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            textAlign = TextAlign.End,
         )
     }
 }
@@ -1918,6 +2496,7 @@ fun PolicySummarySection(summary: PolicySummary, text: AppStrings, onEditPolicy:
                             groupSummary.limitMinutes,
                             groupSummary.status,
                             text,
+                            extraMinutes = groupSummary.extraMinutes,
                         )
                     }
                 }
@@ -1928,7 +2507,7 @@ fun PolicySummarySection(summary: PolicySummary, text: AppStrings, onEditPolicy:
         } else {
             Text(text.appLimits, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             summary.appLimitSummaries.forEach { appSummary ->
-                PolicyAppSummaryLine(appSummary)
+                PolicyAppSummaryLine(appSummary, text)
             }
         }
     }
@@ -1969,6 +2548,7 @@ fun GroupSummarySheet(
                 groupSummary.limitMinutes,
                 groupSummary.status,
                 text,
+                extraMinutes = groupSummary.extraMinutes,
             )
             Text(text.groupApps, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             if (groupSummary.appUsages.isEmpty()) {
@@ -1985,9 +2565,22 @@ fun GroupSummarySheet(
                             appName = appUsage.appName,
                             packageName = appUsage.packageName,
                             supportingText = text.usedMinutes(appUsage.usedMinutes),
-                            trailingContent = if (limitMinutes != null) {
+                            trailingContent = if (limitMinutes != null || appUsage.extraMinutes > 0 || appUsage.unlockedForToday) {
                                 {
-                                    LimitTimeChip(formatLimitMinutesLabel(limitMinutes))
+                                    LimitTimeChip(
+                                        if (limitMinutes != null) {
+                                            formatLimitWithAllowance(
+                                                limitMinutes = limitMinutes,
+                                                extraMinutes = appUsage.extraMinutes,
+                                                unlockedForToday = appUsage.unlockedForToday,
+                                                text = text,
+                                            )
+                                        } else if (appUsage.unlockedForToday) {
+                                            text.unlockedToday
+                                        } else {
+                                            "+${formatLimitMinutesLabel(appUsage.extraMinutes)}"
+                                        },
+                                    )
                                 }
                             } else {
                                 null
@@ -2017,7 +2610,14 @@ fun AppLimitSummaryRow(summary: AppLimitSummary, text: AppStrings) {
     AppRow(
         appName = summary.appName,
         packageName = summary.packageName,
-        supportingText = "${summary.usedMinutes}m / ${summary.limitMinutes}m",
+        supportingText = "${formatLimitMinutesLabel(summary.usedMinutes)} / ${
+            formatLimitWithAllowance(
+                limitMinutes = summary.limitMinutes,
+                extraMinutes = summary.extraMinutes,
+                unlockedForToday = summary.unlockedForToday,
+                text = text,
+            )
+        }",
         trailingContent = {
             StatusBadge(text.limitStatus(summary.status), summary.status)
         },
@@ -2040,11 +2640,24 @@ fun AppRow(
         AppIcon(packageName = packageName, contentDescription = appName)
         Spacer(modifier = Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(appName, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            Text(
+                appName,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (supportingText.isNotBlank()) {
-                Text(supportingText, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    supportingText,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
+        Spacer(modifier = Modifier.width(8.dp))
         trailingContent?.invoke()
     }
 }
@@ -2061,6 +2674,8 @@ private fun LimitTimeChip(label: String) {
             style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.primary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -2098,14 +2713,21 @@ fun AppIcon(packageName: String, contentDescription: String, size: androidx.comp
 }
 
 @Composable
-fun PolicyAppSummaryLine(summary: AppLimitSummary) {
+fun PolicyAppSummaryLine(summary: AppLimitSummary, text: AppStrings) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             AppIcon(packageName = summary.packageName, contentDescription = summary.appName, size = 24.dp)
             Spacer(modifier = Modifier.width(8.dp))
             Text(summary.appName, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "${summary.usedMinutes}m / ${summary.limitMinutes}m",
+                "${formatLimitMinutesLabel(summary.usedMinutes)} / ${
+                    formatLimitWithAllowance(
+                        limitMinutes = summary.limitMinutes,
+                        extraMinutes = summary.extraMinutes,
+                        unlockedForToday = summary.unlockedForToday,
+                        text = text,
+                    )
+                }",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2114,20 +2736,33 @@ fun PolicyAppSummaryLine(summary: AppLimitSummary) {
         ProgressOnlyBar(
             usedMinutes = summary.usedMinutes,
             limitMinutes = summary.limitMinutes,
+            extraMinutes = summary.extraMinutes,
+            unlockedForToday = summary.unlockedForToday,
             status = summary.status,
         )
     }
 }
 
 @Composable
-fun ProgressOnlyBar(usedMinutes: Int, limitMinutes: Int, status: LimitStatus) {
-    val rawProgress = if (limitMinutes <= 0) 0f else usedMinutes.toFloat() / limitMinutes.toFloat()
+fun ProgressOnlyBar(
+    usedMinutes: Int,
+    limitMinutes: Int,
+    status: LimitStatus,
+    extraMinutes: Int = 0,
+    unlockedForToday: Boolean = false,
+) {
+    val effectiveLimitMinutes = (limitMinutes + extraMinutes).coerceAtLeast(limitMinutes)
+    val rawProgress = if (unlockedForToday || effectiveLimitMinutes <= 0) {
+        0f
+    } else {
+        usedMinutes.toFloat() / effectiveLimitMinutes.toFloat()
+    }
     val progress by animateFloatAsState(
         targetValue = rawProgress.coerceIn(0f, 1f),
         animationSpec = tween(durationMillis = 600),
         label = "summary-app-bar",
     )
-    GaugeBar(fraction = progress, status = status, height = 8)
+    GaugeBar(fraction = progress, status = if (unlockedForToday) LimitStatus.Normal else status, height = 8)
 }
 
 @Composable
@@ -2196,11 +2831,13 @@ fun DayLimitChips(
             val selected = selectedDayIndex == index
             val isWeekend = index >= 5
             val minutes = dailyLimits.getOrNull(index).orEmpty()
+            val formattedMinutes = formatLimitMinutesLabel(minutes.toIntOrNull() ?: 0)
+            val chipMinutes = formattedMinutes.replace(" ", "\n")
             Surface(
                 onClick = { onDaySelected(index) },
                 modifier = Modifier
                     .weight(1f)
-                    .height(56.dp),
+                    .height(72.dp),
                 shape = RoundedCornerShape(16.dp),
                 color = when {
                     selected -> MaterialTheme.colorScheme.primary
@@ -2223,10 +2860,13 @@ fun DayLimitChips(
                         color = if (selected) Color.White else if (isWeekend) Color(0xFF8B5A1F) else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        text = minutes.ifBlank { "0" },
-                        style = MaterialTheme.typography.labelLarge,
+                        text = chipMinutes,
+                        style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
                         color = if (selected) Color.White else if (isWeekend) Color(0xFF8B5A1F) else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        textAlign = TextAlign.Center,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
@@ -2338,13 +2978,11 @@ fun EditableMinuteValue(
     maxMinutes: Int = POLICY_MAX_MINUTES,
 ) {
     var isEditing by remember { mutableStateOf(false) }
-    var draftValue by remember(valueMinutes) { mutableStateOf(valueMinutes.takeIf { it > 0 }?.toString().orEmpty()) }
+    var draftValue by remember(valueMinutes) { mutableStateOf(formatLimitMinutesLabel(valueMinutes)) }
     val focusManager = LocalFocusManager.current
 
     fun commitValue() {
-        val minutes = draftValue
-            .filter { character -> character.isDigit() }
-            .toIntOrNull()
+        val minutes = parseTimeInputToMinutes(draftValue)
             ?.let { raw -> ((raw + 2) / 5) * 5 }
             ?.coerceIn(minMinutes.coerceAtMost(maxMinutes), maxMinutes)
             ?: minMinutes.coerceAtMost(maxMinutes)
@@ -2358,11 +2996,11 @@ fun EditableMinuteValue(
             value = draftValue,
             onValueChange = { value ->
                 draftValue = value
-                    .filter { character -> character.isDigit() }
-                    .take(3)
+                    .filter { character -> character.isDigit() || character.equals('h', ignoreCase = true) || character.equals('m', ignoreCase = true) }
+                    .take(7)
             },
             keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Number,
+                keyboardType = KeyboardType.Text,
                 imeAction = ImeAction.Done,
             ),
             keyboardActions = KeyboardActions(onDone = { commitValue() }),
@@ -2373,26 +3011,26 @@ fun EditableMinuteValue(
                 color = MaterialTheme.colorScheme.primary,
             ),
             modifier = Modifier
-                .width(132.dp)
+                .width(156.dp)
                 .height(54.dp),
         )
     } else {
         Surface(
             onClick = {
-                draftValue = valueMinutes.takeIf { it > 0 }?.toString().orEmpty()
+                draftValue = formatLimitMinutesLabel(valueMinutes)
                 isEditing = true
             },
             shape = RoundedCornerShape(14.dp),
             color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
             modifier = Modifier
-                .width(132.dp)
+                .width(156.dp)
                 .height(44.dp),
         ) {
             Box(contentAlignment = Alignment.Center) {
                 Text(
-                    if (valueMinutes > 0) formatLimitMinutesLabel(valueMinutes) else text.noLimit,
+                    formatLimitMinutesLabel(valueMinutes),
                     modifier = Modifier.padding(horizontal = 10.dp),
-                    style = MaterialTheme.typography.titleLarge,
+                    style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary,
                     maxLines = 1,
@@ -2449,19 +3087,24 @@ fun MinuteControlPanel(
 private fun MinuteAxisLabels(maxMinutes: Int) {
     val labels = remember(maxMinutes) {
         if (maxMinutes <= 0) {
-            listOf("0")
+            listOf(formatLimitMinutesLabel(0))
         } else if (maxMinutes < 60) {
             listOf(0, maxMinutes / 4, maxMinutes / 2, (maxMinutes * 3) / 4, maxMinutes)
-                .mapIndexed { index, minutes -> if (index == 0) "0" else "${minutes}m" }
+                .map { minutes -> formatLimitMinutesLabel(minutes) }
         } else {
             val maxHours = (maxMinutes / 60).coerceAtLeast(1)
             listOf(0, maxHours / 4, maxHours / 2, (maxHours * 3) / 4, maxHours)
-                .mapIndexed { index, hours -> if (index == 0) "0" else "${hours}h" }
+                .map { hours -> formatLimitMinutesLabel(hours * 60) }
         }
     }
     Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
         labels.forEach { label ->
-            Text(label, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                label,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
         }
     }
 }
@@ -2562,8 +3205,19 @@ fun AppGroupChip(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Surface(modifier = Modifier.size(10.dp), shape = CircleShape, color = dotColor) {}
-            Text(name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            Text("${budgetMinutes}m \u00B7 $appCount", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                name,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                "${formatLimitMinutesLabel(budgetMinutes)} \u00B7 $appCount",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
         }
     }
 }
@@ -2639,6 +3293,8 @@ fun AppFilterChip(label: String, selected: Boolean, onClick: () -> Unit) {
 fun AppLimitRow(
     app: InstalledAppInfo,
     limitMinutes: Int?,
+    extraMinutes: Int,
+    unlockedForToday: Boolean,
     text: AppStrings,
     onClick: () -> Unit,
 ) {
@@ -2661,21 +3317,39 @@ fun AppLimitRow(
                 Column(modifier = Modifier.weight(1f)) {
                     Text(app.appName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                     Text(
-                        if (hasLimit) text.minutesPerDay(limitMinutes ?: 0) else text.noLimit,
+                        when {
+                            unlockedForToday -> text.unlockedToday
+                            hasLimit -> formatLimitWithAllowance(limitMinutes ?: 0, extraMinutes, false, text)
+                            extraMinutes > 0 -> "+${formatLimitMinutesLabel(extraMinutes)}"
+                            else -> text.noLimit
+                        },
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Surface(
                     shape = RoundedCornerShape(16.dp),
-                    color = if (hasLimit) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                    color = if (hasLimit || extraMinutes > 0 || unlockedForToday) {
+                        MaterialTheme.colorScheme.primaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant
+                    },
                 ) {
                     Text(
-                        if (hasLimit) formatLimitMinutesLabel(limitMinutes ?: 0) else text.addLimit,
+                        when {
+                            unlockedForToday -> text.unlockedToday
+                            hasLimit -> formatLimitWithAllowance(limitMinutes ?: 0, extraMinutes, false, text)
+                            extraMinutes > 0 -> "+${formatLimitMinutesLabel(extraMinutes)}"
+                            else -> text.addLimit
+                        },
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
-                        color = if (hasLimit) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (hasLimit || extraMinutes > 0 || unlockedForToday) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                     )
                 }
                 Text(
@@ -2844,12 +3518,13 @@ private fun LimitPresetChip(label: String, selected: Boolean, onClick: () -> Uni
 }
 
 fun formatLimitMinutesLabel(minutes: Int): String {
-    val hours = minutes / 60
-    val remainingMinutes = minutes % 60
+    val safeMinutes = minutes.coerceAtLeast(0)
+    val hours = safeMinutes / 60
+    val remainingMinutes = safeMinutes % 60
     return when {
         hours > 0 && remainingMinutes > 0 -> "${hours}h ${remainingMinutes}m"
         hours > 0 -> "${hours}h"
-        else -> "${minutes}m"
+        else -> "${remainingMinutes}m"
     }
 }
 
@@ -2907,15 +3582,11 @@ fun GroupAppSelectionRow(
 @Composable
 private fun UsagePolicySection(
     settings: UsagePolicySettings,
+    temporaryUnlockState: TemporaryUnlockState,
     installedApps: List<InstalledAppInfo>,
     text: AppStrings,
     isExpanded: Boolean,
     contentMode: PolicyContentMode,
-    policySaveStatus: PolicySaveStatus,
-    hasPolicyChanges: Boolean,
-    budgetValidation: PolicyBudgetValidation,
-    onRequestSavePolicy: () -> Unit,
-    onResetPolicyDraft: () -> Unit,
     onPolicyDraftChanged: (UsagePolicySettings) -> Unit,
 ) {
     val dailyLimits = listOf(
@@ -2938,6 +3609,7 @@ private fun UsagePolicySection(
         }
     }
     val appLimits = settings.appLimitMap()
+    val todayTemporaryUnlockState = temporaryUnlockState.forToday()
     var appSearchQuery by remember { mutableStateOf("") }
     var appLimitFilter by remember { mutableStateOf(AppLimitFilter.All) }
     var selectedLimitApp by remember { mutableStateOf<InstalledAppInfo?>(null) }
@@ -2961,7 +3633,7 @@ private fun UsagePolicySection(
         SimpleCard {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 SectionTitle(text.dailyPolicy, Modifier.weight(1f))
-                Text("minutes / day", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(text.timePerDay, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             DayLimitChips(
                 dayLabels = text.dayLabels,
@@ -3218,9 +3890,12 @@ private fun UsagePolicySection(
                 ) {
                     items(visibleApps, key = { app -> app.packageName }) { app ->
                         val appLimit = appLimits[app.packageName]
+                        val allowance = todayTemporaryUnlockState.packageAllowances[app.packageName]
                         AppLimitRow(
                             app = app,
                             limitMinutes = appLimit,
+                            extraMinutes = allowance?.extraMinutes ?: 0,
+                            unlockedForToday = allowance?.unlockedForToday == true,
                             text = text,
                             onClick = { selectedLimitApp = app },
                         )
@@ -3251,22 +3926,8 @@ private fun UsagePolicySection(
         )
     }
 
-    val shouldShowSaveAction = hasPolicyChanges ||
-        policySaveStatus != PolicySaveStatus.Idle ||
-        budgetValidation.hasOverflow
-
     if (contentMode == PolicyContentMode.DaysAndGroups) {
         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            if (shouldShowSaveAction) {
-                PolicySaveActionCard(
-                    text = text,
-                    policySaveStatus = policySaveStatus,
-                    hasPolicyChanges = hasPolicyChanges,
-                    budgetValidation = budgetValidation,
-                    onRequestSavePolicy = onRequestSavePolicy,
-                    onResetPolicyDraft = onResetPolicyDraft,
-                )
-            }
             AdaptiveTwoPane(
                 isExpanded = isExpanded,
                 leftContent = {
@@ -3279,86 +3940,7 @@ private fun UsagePolicySection(
         }
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            if (shouldShowSaveAction) {
-                PolicySaveActionCard(
-                    text = text,
-                    policySaveStatus = policySaveStatus,
-                    hasPolicyChanges = hasPolicyChanges,
-                    budgetValidation = budgetValidation,
-                    onRequestSavePolicy = onRequestSavePolicy,
-                    onResetPolicyDraft = onResetPolicyDraft,
-                )
-            }
             appLimitsSection()
-        }
-    }
-}
-
-@Composable
-private fun PolicySaveActionCard(
-    text: AppStrings,
-    policySaveStatus: PolicySaveStatus,
-    hasPolicyChanges: Boolean,
-    budgetValidation: PolicyBudgetValidation,
-    onRequestSavePolicy: () -> Unit,
-    onResetPolicyDraft: () -> Unit,
-) {
-    val hasBudgetOverflow = budgetValidation.hasOverflow
-    val validationMessage = policyValidationMessage(budgetValidation, text)
-    SimpleCard {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                SectionTitle(text.savePolicy)
-                StatusBadge(
-                    label = when {
-                        hasBudgetOverflow -> text.policyBudgetExceeded
-                        policySaveStatus == PolicySaveStatus.InvalidAdminPin -> text.invalidAdminPin
-                        policySaveStatus == PolicySaveStatus.BudgetExceeded -> text.policyBudgetExceeded
-                        hasPolicyChanges -> text.unsavedChanges
-                        policySaveStatus == PolicySaveStatus.Saved -> text.policySaved
-                        else -> text.policyUpToDate
-                    },
-                    status = when {
-                        hasBudgetOverflow -> LimitStatus.Exceeded
-                        policySaveStatus == PolicySaveStatus.InvalidAdminPin -> LimitStatus.Exceeded
-                        policySaveStatus == PolicySaveStatus.BudgetExceeded -> LimitStatus.Exceeded
-                        hasPolicyChanges -> LimitStatus.Warning
-                        else -> LimitStatus.Normal
-                    },
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = onResetPolicyDraft,
-                    enabled = hasPolicyChanges,
-                    shape = RoundedCornerShape(18.dp),
-                ) {
-                    Text(text.resetChanges)
-                }
-                Button(
-                    onClick = onRequestSavePolicy,
-                    enabled = hasPolicyChanges && !hasBudgetOverflow,
-                    shape = RoundedCornerShape(18.dp),
-                ) {
-                    Text(text.savePolicy)
-                }
-            }
-        }
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(42.dp),
-            contentAlignment = Alignment.TopStart,
-        ) {
-            if (validationMessage != null) {
-                Text(
-                    text = validationMessage,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = AppOver,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
         }
     }
 }
@@ -3554,9 +4136,34 @@ fun String?.toLimitMinutes(): Int {
 
 fun formatDuration(totalTimeMillis: Long): String {
     val totalMinutes = (totalTimeMillis + 59_999L) / 60_000L
-    val hours = totalMinutes / 60
-    val minutes = totalMinutes % 60
-    return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
+    return formatLimitMinutesLabel(totalMinutes.toInt())
+}
+
+fun parseTimeInputToMinutes(input: String): Int? {
+    val normalized = input.trim().lowercase(Locale.US)
+    if (normalized.isBlank()) {
+        return null
+    }
+
+    val hours = Regex("""(\d+)\s*h""")
+        .find(normalized)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+    val minutes = Regex("""(\d+)\s*m""")
+        .find(normalized)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+
+    if (hours != null || minutes != null) {
+        return ((hours ?: 0) * 60 + (minutes ?: 0)).coerceIn(0, POLICY_MAX_MINUTES)
+    }
+
+    return normalized
+        .filter { character -> character.isDigit() }
+        .toIntOrNull()
+        ?.coerceIn(0, POLICY_MAX_MINUTES)
 }
 
 fun formatClockTime(timestampMillis: Long): String {
@@ -3604,6 +4211,7 @@ data class AppStrings(
     val safeModeEnabled: String,
     val invalidPin: String,
     val todayUsage: String,
+    val usageAccessChecking: String,
     val usageAccessRequired: String,
     val openUsageAccessSettings: String,
     val refresh: String,
@@ -3616,6 +4224,7 @@ data class AppStrings(
     val weekdayShort: String,
     val weekendShort: String,
     val dailyPolicy: String,
+    val timePerDay: String,
     val dayLabels: List<String>,
     val applyWeekdays: String,
     val applyWeekend: String,
@@ -3638,13 +4247,13 @@ data class AppStrings(
     val unrestrictedApps: String,
     val searchApps: String,
     val noLimit: String,
+    val unlockedToday: String,
     val addLimit: String,
     val clearLimit: String,
     val minutesPerDay: (Int) -> String,
     val applyLimit: String,
     val appLimitGroupAllowance: (String, Int, Int) -> String,
     val newGroup: String,
-    val minutes: String,
     val noSelectableApps: String,
     val savePolicy: String,
     val resetChanges: String,
@@ -3663,6 +4272,12 @@ data class AppStrings(
     val warningNotificationsDescription: String,
     val limitNotifications: String,
     val limitNotificationsDescription: String,
+    val alwaysAllowedApps: String,
+    val alwaysAllowedDescription: String,
+    val requiredAllowedApps: String,
+    val userAllowedApps: String,
+    val allow: String,
+    val allowed: String,
     val pinSettings: String,
     val currentAdminPin: String,
     val newAdminPin: String,
@@ -3688,6 +4303,14 @@ data class AppStrings(
     val emergencyUnlockReady: String,
     val killSwitchReady: String,
     val openAccessibilitySettings: String,
+    val openOverlaySettings: String,
+    val blockSafetyStatus: String,
+    val currentBlockTargets: String,
+    val temporaryAllowances: String,
+    val noCurrentBlockTargets: String,
+    val noTemporaryAllowances: String,
+    val dailyLimit: String,
+    val temporaryAllowanceDetail: (Int, Int) -> String,
     val blockSimulation: String,
     val blockScreenPreview: String,
     val previewOnly: String,
@@ -3735,6 +4358,7 @@ fun appStrings(language: AppLanguage): AppStrings {
             safeModeEnabled = "\uC548\uC804 \uBAA8\uB4DC \uD65C\uC131\uD654\uB428",
             invalidPin = "PIN\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4",
             todayUsage = "\uC624\uB298 \uC0AC\uC6A9",
+            usageAccessChecking = "\uC0AC\uC6A9\uC815\uBCF4\uB97C \uD655\uC778 \uC911\uC785\uB2C8\uB2E4",
             usageAccessRequired = "\uC0AC\uC6A9\uC815\uBCF4 \uC811\uADFC \uAD8C\uD55C\uC774 \uD544\uC694\uD569\uB2C8\uB2E4",
             openUsageAccessSettings = "\uAD8C\uD55C \uC124\uC815",
             refresh = "\uC0C8\uB85C\uACE0\uCE68",
@@ -3755,13 +4379,14 @@ fun appStrings(language: AppLanguage): AppStrings {
             weekdayShort = "\uD3C9\uC77C",
             weekendShort = "\uC8FC\uB9D0",
             dailyPolicy = "\uC694\uC77C\uBCC4 \uC81C\uD55C",
+            timePerDay = "h/m / \uC77C",
             dayLabels = listOf("\uC6D4", "\uD654", "\uC218", "\uBAA9", "\uAE08", "\uD1A0", "\uC77C"),
             applyWeekdays = "\uD3C9\uC77C",
             applyWeekend = "\uC8FC\uB9D0",
             appGroupBudget = "\uC571 \uADF8\uB8F9",
             appGroups = "\uC571 \uADF8\uB8F9",
             groupName = "\uADF8\uB8F9 \uC774\uB984",
-            groupBudgetMinutes = "\uC608\uC0B0(\uBD84)",
+            groupBudgetMinutes = "\uC608\uC0B0",
             groupApps = "\uADF8\uB8F9 \uC571",
             selectedApps = { count -> "\uC120\uD0DD ${count}\uAC1C" },
             inGroup = "\uD3EC\uD568",
@@ -3769,7 +4394,7 @@ fun appStrings(language: AppLanguage): AppStrings {
             addGroup = "\uADF8\uB8F9 \uCD94\uAC00",
             deleteGroup = "\uADF8\uB8F9 \uC0AD\uC81C",
             deleteCurrentGroup = "- \uADF8\uB8F9 \uC0AD\uC81C",
-            groupBudgetTotal = { total, dailyMinimum -> "\uADF8\uB8F9 \uC608\uC0B0 \uD569\uACC4 ${total}\uBD84 / \uC77C\uC77C \uCD5C\uC18C ${dailyMinimum}\uBD84" },
+            groupBudgetTotal = { total, dailyMinimum -> "\uADF8\uB8F9 \uC608\uC0B0 \uD569\uACC4 ${formatLimitMinutesLabel(total)} / \uC77C\uC77C \uCD5C\uC18C ${formatLimitMinutesLabel(dailyMinimum)}" },
             appLimits = "\uC571\uBCC4 \uC81C\uD55C",
             activeAppLimits = { count -> "\uD65C\uC131 ${count}\uAC1C" },
             allApps = "\uC804\uCCB4",
@@ -3777,13 +4402,13 @@ fun appStrings(language: AppLanguage): AppStrings {
             unrestrictedApps = "\uBBF8\uC81C\uD55C",
             searchApps = "\uC571 \uAC80\uC0C9",
             noLimit = "\uC81C\uD55C \uC5C6\uC74C",
+            unlockedToday = "\uC624\uB298 \uCC28\uB2E8 \uD574\uC81C",
             addLimit = "\uCD94\uAC00",
             clearLimit = "\uD574\uC81C",
-            minutesPerDay = { minutes -> "${minutes}\uBD84/\uC77C" },
+            minutesPerDay = { minutes -> "${formatLimitMinutesLabel(minutes)}/\uC77C" },
             applyLimit = "\uC801\uC6A9",
-            appLimitGroupAllowance = { groupName, maxMinutes, groupBudget -> "${groupName} \uADF8\uB8F9\uC5D0\uC11C \uCD5C\uB300 ${maxMinutes}\uBD84\uAE4C\uC9C0 \uC124\uC815\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4 (\uADF8\uB8F9 ${groupBudget}\uBD84)" },
+            appLimitGroupAllowance = { groupName, maxMinutes, groupBudget -> "${groupName} \uADF8\uB8F9\uC5D0\uC11C \uCD5C\uB300 ${formatLimitMinutesLabel(maxMinutes)}\uAE4C\uC9C0 \uC124\uC815\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4 (\uADF8\uB8F9 ${formatLimitMinutesLabel(groupBudget)})" },
             newGroup = "+ \uC0C8 \uADF8\uB8F9",
-            minutes = "\uBD84",
             noSelectableApps = "\uC120\uD0DD \uAC00\uB2A5\uD55C \uC571\uC774 \uC5C6\uC2B5\uB2C8\uB2E4",
             savePolicy = "\uC800\uC7A5",
             resetChanges = "\uB418\uB3CC\uB9AC\uAE30",
@@ -3802,6 +4427,12 @@ fun appStrings(language: AppLanguage): AppStrings {
             warningNotificationsDescription = "\uC0AC\uC6A9\uB7C9\uC774 \uC81C\uD55C\uC758 80%\uC5D0 \uB3C4\uB2EC\uD558\uBA74 \uC54C\uB9BC\uC744 \uBCF4\uB0C5\uB2C8\uB2E4",
             limitNotifications = "\uCD08\uACFC \uC54C\uB9BC",
             limitNotificationsDescription = "\uC81C\uD55C\uC744 \uB118\uAE30\uAC70\uB098 \uCC28\uB2E8 \uC9C1\uC804 \uC0C1\uD0DC\uC5D0\uC11C \uC54C\uB9BC\uC744 \uBCF4\uB0C5\uB2C8\uB2E4",
+            alwaysAllowedApps = "\uD56D\uC0C1 \uD5C8\uC6A9 \uC571",
+            alwaysAllowedDescription = "\uC120\uD0DD\uD55C \uC571\uC740 \uC0AC\uC6A9\uB7C9 \uD1B5\uACC4\uC5D0\uB294 \uB0A8\uC9C0\uB9CC \uCC28\uB2E8\uB418\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uD544\uC218 \uC608\uC678 \uC571\uC740 \uC0AD\uC81C\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4",
+            requiredAllowedApps = "\uD544\uC218 \uD5C8\uC6A9",
+            userAllowedApps = "\uC0AC\uC6A9\uC790 \uD5C8\uC6A9",
+            allow = "\uD5C8\uC6A9",
+            allowed = "\uD5C8\uC6A9\uB428",
             pinSettings = "PIN \uC124\uC815",
             currentAdminPin = "\uD604\uC7AC \uAD00\uB9AC PIN",
             newAdminPin = "\uC0C8 \uAD00\uB9AC PIN",
@@ -3827,19 +4458,29 @@ fun appStrings(language: AppLanguage): AppStrings {
             emergencyUnlockReady = "\uAE34\uAE09 \uD574\uC81C",
             killSwitchReady = "Kill Switch",
             openAccessibilitySettings = "\uC811\uADFC\uC131 \uC124\uC815",
+            openOverlaySettings = "\uC624\uBC84\uB808\uC774 \uC124\uC815",
+            blockSafetyStatus = "\uCC28\uB2E8 \uC548\uC804\uC131 \uAC80\uC99D",
+            currentBlockTargets = "\uD604\uC7AC \uCC28\uB2E8 \uB300\uC0C1",
+            temporaryAllowances = "\uC784\uC2DC \uD5C8\uC6A9",
+            noCurrentBlockTargets = "\uD604\uC7AC \uCC28\uB2E8\uB420 \uB300\uC0C1\uC774 \uC5C6\uC2B5\uB2C8\uB2E4",
+            noTemporaryAllowances = "\uC624\uB298 \uC801\uC6A9\uB41C \uC784\uC2DC \uD5C8\uC6A9\uC774 \uC5C6\uC2B5\uB2C8\uB2E4",
+            dailyLimit = "\uC77C\uC77C \uC81C\uD55C",
+            temporaryAllowanceDetail = { remaining, extra ->
+                "\uB0A8\uC740 \uCD94\uAC00 ${formatLimitMinutesLabel(remaining)} / \uCD94\uAC00 ${formatLimitMinutesLabel(extra)}"
+            },
             blockSimulation = "\uCC28\uB2E8 \uC2DC\uBBAC\uB808\uC774\uC158",
             blockScreenPreview = "\uCC28\uB2E8 \uD654\uBA74",
             previewOnly = "\uBBF8\uB9AC\uBCF4\uAE30",
             blockedTodayMessage = "\uC624\uB298 \uC0AC\uC6A9 \uC2DC\uAC04\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
             remainingTime = "\uB0A8\uC740 \uC2DC\uAC04",
-            parentPin = "\uBCF4\uD638\uC790 PIN",
+            parentPin = "\uAD00\uB9AC PIN",
             noBlockPreviewTarget = "\uCC28\uB2E8 \uBBF8\uB9AC\uBCF4\uAE30 \uB300\uC0C1\uC774 \uC5C6\uC2B5\uB2C8\uB2E4",
             openBlockScreenPreview = "\uCC28\uB2E8 \uD654\uBA74 \uBBF8\uB9AC\uBCF4\uAE30",
             noSimulationTargets = "\uC2DC\uBBAC\uB808\uC774\uC158 \uB300\uC0C1 \uC571\uC774 \uC5C6\uC2B5\uB2C8\uB2E4",
             detectionStatus = "\uCD5C\uADFC \uAC10\uC9C0",
             detectionStatusDescription = "\uC811\uADFC\uC131 \uC11C\uBE44\uC2A4\uAC00 \uB9C8\uC9C0\uB9C9\uC73C\uB85C \uD3C9\uAC00\uD55C \uC77C\uBC18 \uC0AC\uC6A9\uC790 \uC571 1\uAC1C\uB9CC \uD45C\uC2DC\uD569\uB2C8\uB2E4. \uC2DC\uC2A4\uD15C, \uD0A4\uBCF4\uB4DC, \uC124\uC815, \uC608\uC678 \uC571\uC740 \uC81C\uC678\uD569\uB2C8\uB2E4",
             noDetectionStatus = "\uC544\uC9C1 \uAC10\uC9C0\uB41C \uC571\uC774 \uC5C6\uC2B5\uB2C8\uB2E4",
-            usedMinutes = { minutes -> "${minutes}\uBD84 \uC0AC\uC6A9" },
+            usedMinutes = { minutes -> "${formatLimitMinutesLabel(minutes)} \uC0AC\uC6A9" },
             detectionDecision = { decision ->
                 when (decision) {
                     "safe mode" -> "Safe Mode"
@@ -3895,6 +4536,7 @@ fun appStrings(language: AppLanguage): AppStrings {
             safeModeEnabled = "Safe Mode Enabled",
             invalidPin = "Invalid PIN",
             todayUsage = "Today Usage",
+            usageAccessChecking = "Checking usage access",
             usageAccessRequired = "Usage access permission is required",
             openUsageAccessSettings = "Permission Settings",
             refresh = "Refresh",
@@ -3915,13 +4557,14 @@ fun appStrings(language: AppLanguage): AppStrings {
             weekdayShort = "Weekday",
             weekendShort = "Weekend",
             dailyPolicy = "Daily Limits",
+            timePerDay = "h/m / day",
             dayLabels = listOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"),
             applyWeekdays = "Weekdays",
             applyWeekend = "Weekend",
             appGroupBudget = "App Group",
             appGroups = "App Groups",
             groupName = "Group name",
-            groupBudgetMinutes = "Budget minutes",
+            groupBudgetMinutes = "Budget",
             groupApps = "Group apps",
             selectedApps = { count -> "$count selected" },
             inGroup = "In",
@@ -3929,7 +4572,7 @@ fun appStrings(language: AppLanguage): AppStrings {
             addGroup = "Add group",
             deleteGroup = "Delete group",
             deleteCurrentGroup = "- Delete",
-            groupBudgetTotal = { total, dailyMinimum -> "Group budgets ${total}m / daily minimum ${dailyMinimum}m" },
+            groupBudgetTotal = { total, dailyMinimum -> "Group budgets ${formatLimitMinutesLabel(total)} / daily minimum ${formatLimitMinutesLabel(dailyMinimum)}" },
             appLimits = "App Limits",
             activeAppLimits = { count -> "$count active" },
             allApps = "All",
@@ -3937,13 +4580,13 @@ fun appStrings(language: AppLanguage): AppStrings {
             unrestrictedApps = "Unrestricted",
             searchApps = "Search apps",
             noLimit = "No limit",
+            unlockedToday = "Unlocked today",
             addLimit = "Add",
             clearLimit = "Clear",
-            minutesPerDay = { minutes -> "$minutes min/day" },
+            minutesPerDay = { minutes -> "${formatLimitMinutesLabel(minutes)}/day" },
             applyLimit = "Apply",
-            appLimitGroupAllowance = { groupName, maxMinutes, groupBudget -> "Up to ${maxMinutes}m available in $groupName group (${groupBudget}m group)" },
+            appLimitGroupAllowance = { groupName, maxMinutes, groupBudget -> "Up to ${formatLimitMinutesLabel(maxMinutes)} available in $groupName group (${formatLimitMinutesLabel(groupBudget)} group)" },
             newGroup = "+ New",
-            minutes = "Min",
             noSelectableApps = "No selectable apps",
             savePolicy = "Save",
             resetChanges = "Reset",
@@ -3962,6 +4605,12 @@ fun appStrings(language: AppLanguage): AppStrings {
             warningNotificationsDescription = "Send an alert when usage reaches 80% of a limit.",
             limitNotifications = "Limit notifications",
             limitNotificationsDescription = "Send an alert when a limit is exceeded or an app is about to be blocked.",
+            alwaysAllowedApps = "Always Allowed Apps",
+            alwaysAllowedDescription = "Selected apps remain visible in usage stats but are never blocked. Required safety apps cannot be removed.",
+            requiredAllowedApps = "Required allowed",
+            userAllowedApps = "User allowed",
+            allow = "Allow",
+            allowed = "Allowed",
             pinSettings = "PIN Settings",
             currentAdminPin = "Current admin PIN",
             newAdminPin = "New admin PIN",
@@ -3987,19 +4636,29 @@ fun appStrings(language: AppLanguage): AppStrings {
             emergencyUnlockReady = "Emergency unlock",
             killSwitchReady = "Kill Switch",
             openAccessibilitySettings = "Accessibility Settings",
+            openOverlaySettings = "Overlay Settings",
+            blockSafetyStatus = "Blocking Safety Check",
+            currentBlockTargets = "Current block targets",
+            temporaryAllowances = "Temporary allowances",
+            noCurrentBlockTargets = "No current block targets",
+            noTemporaryAllowances = "No temporary allowances today",
+            dailyLimit = "Daily limit",
+            temporaryAllowanceDetail = { remaining, extra ->
+                "Remaining extra ${formatLimitMinutesLabel(remaining)} / added ${formatLimitMinutesLabel(extra)}"
+            },
             blockSimulation = "Block Simulation",
             blockScreenPreview = "Block Screen",
             previewOnly = "Preview",
             blockedTodayMessage = "Today's screen time is over",
             remainingTime = "Remaining time",
-            parentPin = "Parent PIN",
+            parentPin = "Admin PIN",
             noBlockPreviewTarget = "No exceeded app to preview",
             openBlockScreenPreview = "Open Block Screen Preview",
             noSimulationTargets = "No apps to simulate",
             detectionStatus = "Recent Detection",
             detectionStatusDescription = "Shows the last regular user app evaluated by Accessibility. System, keyboard, Settings, and whitelisted apps are excluded.",
             noDetectionStatus = "No app detected yet",
-            usedMinutes = { minutes -> "${minutes}m used" },
+            usedMinutes = { minutes -> "${formatLimitMinutesLabel(minutes)} used" },
             detectionDecision = { decision ->
                 when (decision) {
                     "total limit exceeded" -> "Total over"
@@ -4054,12 +4713,15 @@ private fun ScreenTimeManagerPreviewContent() {
             onKillSwitchClick = {},
             onEmergencyUnlock = {},
             onEmergencyPinChanged = {},
+            onAllowedAppsChanged = {},
             onOpenUsageAccessSettings = {},
             onOpenAccessibilitySettings = {},
+            onOpenOverlaySettings = {},
             onRefreshUsageStats = {},
             onPolicyDraftChanged = {},
             onResetPolicyDraft = {},
             onSaveUsagePolicy = {},
+            onPolicySaveStatusSeen = {},
             onRequestNotificationPermission = {},
             onUpdateAdminPin = { _, _ -> },
             onUpdateEmergencyPin = { _, _ -> },

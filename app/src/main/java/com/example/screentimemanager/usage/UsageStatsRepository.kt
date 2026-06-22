@@ -44,9 +44,21 @@ class UsageStatsRepository(
         return when (mode) {
             AppOpsManager.MODE_ALLOWED -> true
             AppOpsManager.MODE_IGNORED,
-            AppOpsManager.MODE_ERRORED,
-            AppOpsManager.MODE_DEFAULT -> false
+            AppOpsManager.MODE_ERRORED -> false
+            AppOpsManager.MODE_DEFAULT -> canQueryUsageStats()
             else -> false
+        }
+    }
+
+    private fun canQueryUsageStats(): Boolean {
+        return try {
+            val endTime = System.currentTimeMillis()
+            val startTime = endTime - USAGE_ACCESS_PROBE_WINDOW_MILLIS
+            usageStatsManager
+                .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, endTime)
+                .isNotEmpty()
+        } catch (_: RuntimeException) {
+            false
         }
     }
 
@@ -95,6 +107,87 @@ class UsageStatsRepository(
                 .take(maxItems)
         } catch (_: RuntimeException) {
             emptyList()
+        }
+    }
+
+    fun getTodayUsageMillisByPackage(skipAccessCheck: Boolean = false): Map<String, Long> {
+        if (!skipAccessCheck && !hasUsageAccess()) {
+            return emptyMap()
+        }
+
+        return try {
+            val startTime = localDayStartMillis()
+            val endTime = System.currentTimeMillis()
+            val eventUsageByPackage = runCatching {
+                getEventForegroundUsage(startTime, endTime)
+            }.getOrDefault(emptyMap())
+            val statsUsageByPackage = runCatching {
+                getStatsForegroundUsage(startTime, endTime)
+            }.getOrDefault(emptyMap())
+            val dailyUsageByPackage = runCatching {
+                getDailyForegroundUsage(startTime, endTime)
+            }.getOrDefault(emptyMap())
+            val launchablePackages = runCatching {
+                getLaunchablePackages()
+            }.getOrDefault(emptySet())
+
+            (eventUsageByPackage.keys + statsUsageByPackage.keys + dailyUsageByPackage.keys)
+                .associateWith { packageName ->
+                    maxOf(
+                        eventUsageByPackage[packageName] ?: 0L,
+                        statsUsageByPackage[packageName] ?: 0L,
+                        dailyUsageByPackage[packageName] ?: 0L,
+                    )
+                }
+                .filter { (packageName, totalTimeMillis) ->
+                    totalTimeMillis >= MIN_VISIBLE_USAGE_MILLIS &&
+                        (launchablePackages.isEmpty() || packageName in launchablePackages) &&
+                        isVisibleUsageApp(packageName)
+                }
+        } catch (_: RuntimeException) {
+            emptyMap()
+        }
+    }
+
+    fun getAppLabel(packageName: String): String {
+        return getAppName(packageName)
+    }
+
+    fun getCurrentForegroundPackageName(
+        lookbackMillis: Long = CURRENT_FOREGROUND_LOOKBACK_MILLIS,
+    ): String? {
+        if (!hasUsageAccess()) {
+            return null
+        }
+
+        return try {
+            val endTime = System.currentTimeMillis()
+            val startTime = maxOf(endTime - lookbackMillis, localDayStartMillis())
+            val usageEvents = usageStatsManager.queryEvents(startTime, endTime)
+            val event = UsageEvents.Event()
+            var foregroundPackageName: String? = null
+
+            while (usageEvents.hasNextEvent()) {
+                usageEvents.getNextEvent(event)
+                val eventPackageName = event.packageName.orEmpty()
+                when {
+                    isForegroundEvent(event.eventType) -> {
+                        foregroundPackageName = if (eventPackageName.isNotBlank() && isVisibleUsageApp(eventPackageName)) {
+                            eventPackageName
+                        } else {
+                            null
+                        }
+                    }
+
+                    isBackgroundEvent(event.eventType) && foregroundPackageName == eventPackageName -> {
+                        foregroundPackageName = null
+                    }
+                }
+            }
+
+            foregroundPackageName
+        } catch (_: RuntimeException) {
+            null
         }
     }
 
@@ -248,5 +341,7 @@ class UsageStatsRepository(
 
     companion object {
         private const val MIN_VISIBLE_USAGE_MILLIS = 10_000L
+        private const val USAGE_ACCESS_PROBE_WINDOW_MILLIS = 7L * 24L * 60L * 60L * 1000L
+        private const val CURRENT_FOREGROUND_LOOKBACK_MILLIS = 12L * 60L * 60L * 1000L
     }
 }

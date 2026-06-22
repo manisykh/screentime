@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-06-22
+
+- Restored the blocking overlay Open Manager action so it opens the blocked
+  controls screen with parent PIN, extra time, and unlock-today options instead
+  of jumping directly to the app main screen.
+- Added a short manager-open grace window to prevent the foreground monitor from
+  immediately reattaching the blocking overlay while the controls screen is
+  launching.
+- Aligned the foreground monitor's daily usage package filter with the main app
+  usage list by excluding hidden/non-launchable packages and very short entries,
+  reducing Daily Time mismatches between the block UI and the main dashboard.
+- Kept second-level time in the ongoing notification while showing block-screen
+  usage with the same minute label format used by the main app.
+
+## 2026-06-21
+
+- Added a foreground usage monitor service that runs with an ongoing
+  notification, checks the current foreground app every second through
+  UsageStats, updates the notification with second-level usage, and enforces
+  blocks without requiring AccessibilityService.
+- Defined the product target as AppBlock-style enforcement: second-level
+  foreground monitoring, ongoing notification, home redirection on exceed, and
+  immediate re-block on app re-entry rather than OS-level process killing.
+- Added active foreground session timing inside the monitor service so the
+  currently running app is counted before UsageStats finalizes the session on
+  background/stop. This prevents limits from being detected only after the app
+  is backgrounded and reopened.
+- Moved real blocking responsibility from AccessibilityService to the foreground
+  monitor path. AccessibilityService now records would-block detections as a
+  secondary signal so the two enforcement paths do not fight each other.
+- Strengthened real blocking enforcement for immersive games and video apps:
+  the AccessibilityService watchdog now falls back to UsageEvents foreground
+  detection when accessibility windows are unavailable, compensates active
+  foreground session usage before UsageStats settles, keeps a blocking overlay
+  guarded, hard-enforces Home/BlockedActivity when the blocked app remains in
+  foreground, and repeatedly pauses active media while the block still applies.
+- Removed repeated Home/BlockedActivity forcing and periodic overlay
+  remove/re-add while a blocking overlay is already attached, preventing the
+  blocked app and block UI from alternating during gameplay.
+- Restored accessibility overlay as the primary blocking window, made the
+  blocking scrim fully opaque, added immersive system-UI flags, and reassert
+  only the overlay while the blocked app remains foreground. Home/BlockedActivity
+  fallback is now used only when overlay attachment fails.
+- Documented the reliability boundary of normal-permission blocking and noted
+  Device Owner / managed-device mode as the path for stricter enforcement.
+
 ## 2026-06-12
 
 - Re-applied the UI/UX comparison review with the blue primary palette,
@@ -183,3 +229,27 @@
   overwrite the last external app detection.
 - Filtered launchers, keyboards, setup/system UI packages, and other
   non-user-facing system components out of usage and policy app lists.
+- Strengthened real blocking behavior: the AccessibilityService now listens to
+  additional window-content and focus events for PIP/multi-window detection,
+  falls back to active window package detection, re-blocks app re-entry faster,
+  throttles duplicate evaluations, and the blocking screen sends real Back/Home
+  exits to the launcher instead of returning to the blocked app.
+- Added a short media pause guard after opening the blocking screen so video
+  apps that enter PIP on block are more likely to stop playback even if the user
+  taps play again during the guard window.
+- Changed real blocking to send Home before opening the blocking screen, then
+  retry the block launch once shortly after, so full-screen games and immersive
+  apps are less likely to remain visible or playable behind the block.
+- Prevented PIP windows from repeatedly relaunching the blocked screen while
+  Screen Time Manager's blocked screen is already the active or focused window.
+- Added a launcher Home intent fallback in addition to the accessibility Home
+  action before launching the blocked screen, improving behavior for games that
+  ignore or delay the global Home action.
+- Switched real blocking to a full-screen accessibility overlay as the primary
+  path for games and immersive apps, with app overlay and `BlockedActivity`
+  fallbacks. The overlay keeps Emergency Unlock and Kill Switch visible.
+- Added a blocking overlay guard that periodically verifies the overlay remains
+  attached while the target is still blocked and restores it if the system
+  detaches it.
+- Added a foreground enforcement loop so games and video apps can be blocked
+  while already running, even when no new accessibility window event is emitted.
