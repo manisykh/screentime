@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">ScreenTimeManager</string>
-    <string name="accessibility_service_description">Detects foreground apps for screen time policy checks. This version does not block apps.</string>
+    <string name="app_name">ScreenRest</string>
+    <string name="notification_listener_service_label">ScreenRest Notification Access</string>
 </resources>

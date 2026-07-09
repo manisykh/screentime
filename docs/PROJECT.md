@@ -22,7 +22,8 @@ self-lockout.
 2. Safe Mode state is persisted with DataStore.
 3. Emergency Unlock and Kill Switch are available before blocking features.
 4. UsageStatsManager-based usage summary is added after safety controls.
-5. AccessibilityService is implemented only after Safe Mode, Emergency Unlock,
+5. Blocking enforcement uses UsageStats, ForegroundService monitoring, and
+   display-over-other-apps overlay permission after Safe Mode, Emergency Unlock,
    Kill Switch, Auto Recovery, and whitelist rules are documented and present.
 
 ## Roadmap
@@ -57,7 +58,8 @@ self-lockout.
 
 ### Phase 4: Blocking
 
-- AccessibilityService
+- Foreground usage monitor
+- Display-over-other-apps blocking overlay
 - Blocking screen
 - Parent PIN unlock
 
@@ -87,5 +89,6 @@ Blocking must not be implemented before the Phase 1 safety foundation.
 - Admin PIN and Emergency PIN are separated.
 - Shared blocking safety gate is implemented for Safe Mode, Policy Enforcement,
   and never-block packages.
-- AccessibilityService is implemented as no-op detection only; it does not block.
-- Blocking screen is not implemented yet.
+- Foreground usage monitoring and blocking overlay enforcement are implemented
+  without requiring AccessibilityService permission.
+- Blocking screen and parent PIN time override are implemented.

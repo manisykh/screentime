@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <queries>
         <intent>
@@ -18,12 +20,12 @@
     </queries>
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/app_icon"
         android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
+        android:roundIcon="@mipmap/app_icon_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.ScreenTimeManager"
         tools:targetApi="31">
@@ -40,22 +42,14 @@
         </activity>
         <activity
             android:name=".blocking.BlockedActivity"
+            android:excludeFromRecents="true"
             android:exported="false"
             android:label="@string/app_name"
-            android:theme="@style/Theme.ScreenTimeManager" />
-        <service
-            android:name=".blocking.ScreenTimeAccessibilityService"
-            android:exported="false"
-            android:label="@string/app_name"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/screen_time_accessibility_service" />
-        </service>
+            android:launchMode="singleTop"
+            android:noHistory="false"
+            android:showWhenLocked="true"
+            android:theme="@style/Theme.ScreenTimeManager"
+            android:turnScreenOn="true" />
         <service
             android:name=".blocking.UsageMonitorForegroundService"
             android:exported="false"
@@ -65,6 +59,27 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="usage_monitoring_and_screen_time_enforcement" />
         </service>
+        <service
+            android:name=".notification.ScreenTimeNotificationListenerService"
+            android:exported="false"
+            android:label="@string/notification_listener_service_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+        <receiver
+            android:name=".blocking.BootRecoveryReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.DATE_CHANGED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

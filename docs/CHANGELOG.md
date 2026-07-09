@@ -1,5 +1,277 @@
 # Changelog
 
+## 2026-07-05
+
+- Removed the duplicate always-allowed apps card from the Blocking tab so app
+  allowance management appears only inside allow-only mode.
+- Added PIN visibility toggles to shared Compose PIN fields and hardened the
+  blocking overlay PIN inputs to use numeric password mode by default.
+- Added a Safety tab usage-consistency diagnostic that compares the foreground
+  monitor notification counter against Today Usage for the same app.
+- Added an allow-policy relationship summary inside allow-only mode to clarify
+  required allowed apps, global always-allowed apps, and schedule-specific
+  allowed apps.
+- Expanded group statistics so each group can show its top used apps and any
+  app-level limit/temporary allowance context.
+- Added parent-management state, local parent/device pairing, and a remote
+  command inbox that can apply remote extra time or unlock-for-today commands
+  to the existing temporary allowance system.
+- Clarified Admin PIN vs Emergency PIN roles in Settings: Admin PIN approves
+  policy and parent overrides, while Emergency PIN remains an offline Safe Mode
+  recovery path.
+
+## 2026-07-04
+
+- Hardened local-day usage reset behavior by filtering UsageStats fallback data
+  unless the app has a same-day usage signal, pruning unobserved monotonic and
+  continuity entries, and clearing persisted monitor foreground state on daily
+  rollover.
+- Clarified allowed-app policy ownership: required never-block apps are kept out
+  of user allowed-app storage, user allowed apps sync into schedule allowed-app
+  lists as already allowed, and schedule templates store only schedule-specific
+  allowed apps.
+- Moved launcher phone and messaging apps out of the absolute never-block list
+  so users can choose whether to always allow them, while keeping the in-call
+  telephony system UI as a required safety exception.
+- Reused the wheel-style time picker for daily, group, and app duration editing
+  and contained wheel/list scrolling so bottom sheets do not move while the
+  inner picker is being scrolled.
+- Collapsed the always-allowed app lists by default so required and user-allowed
+  app details are shown only when the user expands the section.
+- Put the required allowed-app list inside its own contained scroll area when
+  the always-allowed section is expanded.
+- Consolidated permission action buttons into a single Settings permission
+  section, removed scattered permission buttons from other tabs, and replaced
+  the top-right Settings shortcut with a permission warning badge when setup is
+  incomplete.
+- Tuned the Settings permission section into a flatter compact list with a
+  smaller header warning badge, compact status chip, reduced warning tint, and
+  smaller permission action buttons.
+- Removed the completed permission card border and elevation so the ready state
+  reads as a clean status panel instead of a warning card.
+
+## 2026-07-01
+
+- Added periodic and immediate service health checks for Usage Access, overlay,
+  notification permission, notification access, exact alarm readiness, and
+  foreground monitor freshness.
+- Added Safety tab health status so missing permissions or a stale monitor can
+  be seen without digging through logs.
+- Added local-day rollover recovery using date/time change broadcasts, a
+  midnight exact-alarm hook, and an in-app rollover loop to clear daily
+  temporary allowances on the Korean local day boundary.
+- Clarified schedule blocking and allow-only mode behavior in the UI.
+- Allowed app groups to be completely deleted and preserved the empty app-group
+  state instead of recreating a default group.
+- Improved app search input so Korean IME composition is preserved and searches
+  can match both app names and package names.
+- Stabilized app-group name editing with a composition-aware local text buffer
+  so Korean and English input are not overwritten by draft recomposition.
+- Moved per-schedule allowed-app editing into a bottom sheet, added allowed-app
+  counts to schedule templates, and surfaced guidance that each template can
+  have its own allowed apps.
+- Reworked schedule blocking from preset/template-save controls into schedule
+  item management with new/delete actions, name editing, inline time/day
+  controls, and per-schedule allowed-app selection.
+- Updated the overview policy summary so schedule, group, and app-limit draft
+  changes are reflected immediately while editing.
+- Added schedule status to the overview policy summary and Safety diagnostics,
+  including active schedule, next schedule, schedule window, repeat days, and
+  allowed-app counts.
+- Localized blocked-screen titles and reason text for daily limit, app limit,
+  group limit, schedule blocking, and allow-only mode blocks.
+- Reorganized the main tabs into Overview, Time, Block, Stats, Safety, and
+  Settings. Time now groups daily, app, and group limits; Block now groups
+  schedule blocking, allow-only mode, and always-allowed apps.
+- Reset the foreground monitor's active app session and usage cache at the
+  local-day boundary so usage smoothing cannot carry yesterday's app time into
+  today's app totals.
+- Added usage anomaly auditing and impossible-value guards so a tablet/OEM
+  UsageStats spike cannot persist hundreds of hours into today's usage, policy
+  summaries, or blocking calculations.
+
+## 2026-06-28
+
+- Aligned the blocking permission model with commercial app-blocker style
+  setup: Usage Access, notification access, display-over-other-apps,
+  notification permission, and alarms/reminders.
+- Removed AccessibilityService from the app manifest and blocking readiness.
+- Added a NotificationListenerService entry for notification-access setup and
+  use active media sessions to pause/stop PIP or media playback before falling
+  back to media key events.
+- Added exact-alarm recovery scheduling so the foreground monitor has another
+  recovery path after task removal or process cleanup.
+
+## 2026-06-26
+
+- Hardened blocking re-entry and foreground counting: Home exit grace now ends
+  as soon as a managed app returns to foreground, foreground detection falls
+  back to recent UsageStats when UsageEvents are delayed, and active-session
+  grace is longer to avoid timer stalls during transient foreground gaps.
+- Prevented Policy Enforcement from being enabled unless Usage Access and
+  display-over-other-apps permission are ready, so the UI does not imply strong
+  blocking when Android overlay permission is missing.
+- Kept the blocking overlay as the primary block surface instead of immediately
+  launching BlockedActivity, and removed AccessibilityService from the blocking
+  path so strong blocking depends on display-over-other-apps permission.
+- Added a first-run permission setup dialog that consolidates Usage Access,
+  display-over-other-apps, and notification permission setup into one checklist.
+- Split foreground usage refresh from heavier statistics refresh so returning to
+  the app updates today's usage without reloading 30-day charts and top-app
+  statistics.
+- Moved SafeMode UI-state composition work to a background dispatcher so policy
+  summaries and block-decision previews do not run on the main UI thread.
+- Reduced tab-transition rendering cost by drawing only the active tab during
+  the transition instead of keeping the previous full tab content alive.
+- Added in-memory app-icon bitmap caching and background icon decoding to reduce
+  list scroll and tab-switch jank.
+- Cached launchable package lists and app labels inside UsageStatsRepository to
+  avoid repeated PackageManager work during usage refreshes.
+- Added a shared usage-continuity store so the monitor notification, main app,
+  workers, and block screen all read from the same same-day monotonic usage
+  source.
+- Persisted active foreground usage during limited-app monitoring and flushed it
+  on app switches/service teardown so usage cannot jump backward after process
+  death, memory cleanup, or delayed UsageStats updates.
+- Added usage-monitor heartbeat status with last tick, foreground app, decision,
+  recovery reason, and stop reason for Safety tab diagnostics.
+- Strengthened the monitor watchdog worker so boot, app update, task removal,
+  and periodic checks restart the foreground monitor when policy enforcement is
+  active but the monitor is stopped or stale.
+- Centralized blocking decisions in BlockDecisionEngine so the foreground
+  monitor, accessibility helper, and preview paths use the same priority order:
+  fail-safe exits, allow-only mode, daily limit, schedule, group limit, then app
+  limit.
+- Kept limited-app foreground sessions alive across transient System UI/PIP/full
+  screen signals so blocking does not stop evaluating while a game or video app
+  remains visibly active.
+- Restarted the foreground usage monitor from MainActivity.onResume when policy
+  enforcement is active, covering cases where the service was killed while the
+  app state itself did not change.
+- Changed policy, schedule, app-limit, and blocked-screen extra-time controls
+  to 1-minute increments so short-limit blocking tests can run quickly.
+- Changed real blocking enforcement to show the overlay shield before launching
+  BlockedActivity, then remove the shield only after the blocked screen is
+  confirmed in front. This prevents silent activity-launch failures from leaving
+  the blocked app visible after its limit is exceeded.
+
+## 2026-06-25
+
+- Added boot and package-replaced recovery so policy checking and the usage
+  monitor are re-scheduled after device restart or app update.
+- Added same-day stable usage continuity inside the foreground monitor so
+  notification and block decisions do not move backward when UsageStats briefly
+  reports a lower value after app switching.
+- Added schedule templates that can save, apply, and delete current schedule
+  windows through the existing policy-draft save flow.
+- Improved allow-only mode setup by surfacing always-allowed app management
+  directly below the allow-only control when the mode is enabled.
+- Hid the daily statistics chart when all returned daily usage values are zero,
+  showing the empty-state text instead.
+- Refined the bottom save action with consistent tab alignment, a larger status
+  dot, border, and state-colored fill behavior.
+- Routed policy summary group and app limit gauges through the same progress
+  bar component for visual consistency.
+- Removed Accessibility permission from the visible blocking-readiness
+  requirements. Usage Access, Safe Mode, policy enforcement, whitelist, and
+  emergency recovery remain the required readiness gates.
+- Kept AccessibilityService as an optional foreground-signal helper and
+  re-applied its event configuration at service connection time for more
+  reliable diagnostics when the user enables it.
+- Added a one-shot UsageMonitor recovery worker after monitor task removal so
+  recent-app cleanup and memory cleanup events get an additional restart path.
+- Extended the foreground missing grace window to reduce false monitoring
+  drops during short UsageStats gaps while switching limited apps.
+- Expanded the Statistics tab from a 7-day list to a 30-day horizontally
+  scrollable usage chart with today, weekend, average, and peak-day context.
+- Added flexible Top Apps statistics ranges so the ranking can switch between
+  1-day, 7-day, and 30-day usage totals.
+- Restyled the policy-save PIN dialog to match the app's rounded card, status
+  badge, and primary action button visual system.
+- Improved schedule-blocking setup with clearer active-window/repeat summaries,
+  bedtime/study/meal presets, and quick every-day/weekday/weekend repeat chips.
+
+## 2026-06-24
+
+- Reworked foreground usage accounting so UsageEvents are the primary source
+  whenever available, avoiding stale aggregate UsageStats values that can keep
+  counting a backgrounded, closed, or PIP app.
+- Added an in-process foreground app tracker fed by AccessibilityService active
+  and focused windows. The monitor now trusts this fresh signal before falling
+  back to UsageStats, and launcher/System UI/Settings events clear the active
+  usage session.
+- Removed duplicate active-session elapsed-time compensation from blocking
+  services so notification time, main app usage, and block decisions use one
+  shared usage calculation path.
+- Stopped active usage sessions on screen-off/keyguard signals and paused the
+  foreground monitor's detailed counting while the device is not interactive.
+- Added same-day monotonic usage smoothing so temporary UsageStats jitter cannot
+  lower an app's counted time and reopen a just-blocked app below its limit.
+- Hid Kill Switch from normal test-user surfaces while keeping the internal
+  recovery path available for developer/debug safety.
+- Extended schedule blocking with live status, time-window display, and quick
+  bedtime/study presets.
+- Added allow-only mode so only required exceptions and user-selected always
+  allowed apps can open while the mode is active.
+- Added a Statistics tab with recent daily usage, today's top apps, and group
+  usage summaries.
+- Wired Accessibility foreground app signals directly into the usage monitor so
+  switching among multiple limited apps immediately refreshes the ongoing
+  notification and block decision for the newly foregrounded app.
+- Added AccessibilityService direct blocking fallback so managed apps are still
+  blocked after device memory cleanup even if the foreground monitor service has
+  not restarted yet.
+- Added a foreground monitor task-removal restart request to reduce monitoring
+  gaps after recent-app or memory cleanup events.
+- Added focused foreground-detection debug logs under the `STM-Foreground` tag
+  to compare Accessibility events, monitor immediate requests, UsageStats
+  foreground resolution, notification decisions, and blocking decisions while
+  switching among multiple limited apps.
+- Added active foreground-session usage smoothing in the monitor so notification
+  seconds continue moving even when UsageStats delays foreground-time updates
+  for a newly opened limited app.
+
+## 2026-06-23
+
+- Hardened the foreground blocking overlay without changing the existing
+  Open Manager flow or time display: overlay references are volatile, overlay
+  removal from the monitor loop now runs on the main dispatcher, repeated
+  package evaluation is cached within one monitor tick, and the overlay requests
+  focus while consuming Back key events.
+- Updated foreground monitor notifications to include today's temporary extra
+  time, for example `(+5m)`, and to use the effective limit after parent time
+  overrides.
+- Changed real blocking to open the full parent-control blocked screen first,
+  using the simple overlay only as a fallback if the activity cannot be opened.
+- Differentiated blocked-screen backgrounds: app/group blocks use a dark navy
+  background while daily total blocks use a dark red background.
+- Reduced notification noise and unnecessary foreground usage evaluation for
+  unrestricted apps: detailed second-level notification text is now shown only
+  for apps with direct app/group limits or when a block is about to happen,
+  while unrestricted apps show a quiet "Monitoring limited apps" status.
+- Improved foreground app detection after a block: hidden System UI, launcher,
+  and keyboard foreground events no longer clear the current visible app, and
+  the monitor keeps a short grace window for transient UsageStats gaps so the
+  next limited app starts second-level monitoring promptly.
+- Added a foreground blocking watchdog that keeps enforcing while a package is
+  still blocked: it repeatedly pauses/stops active media for PIP/video apps,
+  re-sends Home and reopens the blocked screen when the blocked app regains
+  foreground, and avoids disrupting the parent controls screen when Screen Time
+  Manager itself is foreground.
+- Strengthened the blocked screen visual state by tinting the card itself:
+  app/group blocks now use a blue-tinted card and daily total blocks use a
+  red-tinted card with stronger borders and badges.
+- Added blocked-screen foreground verification: after launching the blocked
+  activity, the foreground monitor now checks whether Screen Time Manager
+  actually reached the front and falls back to the overlay shield if a PIP,
+  video, or immersive app remains visible.
+- Added schedule blocking policy storage, UI controls, and block decisions so
+  selected days and time windows can block apps while still respecting Safe
+  Mode, policy enforcement, required exceptions, and always allowed apps.
+- Added a short home-exit grace path from the blocking screen so pressing Home
+  clears the current block overlay/guard and reaches the launcher instead of
+  alternating between the overlay and BlockedActivity.
+
 ## 2026-06-22
 
 - Restored the blocking overlay Open Manager action so it opens the blocked

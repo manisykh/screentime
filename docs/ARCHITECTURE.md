@@ -37,14 +37,15 @@ DataStore / Room / Android system services
 
 - UsageStatsManager for usage statistics
 - WorkManager for periodic background work
-- AccessibilityService for detection now and blocking only after the remaining
-  safety foundations are complete
+- Foreground service for active usage monitoring and enforcement
+- Display-over-other-apps overlay for the primary blocking surface
 
 ## Current Modules
 
 - `data/SettingsDataStore.kt`: DataStore instance.
 - `data/SettingsRepository.kt`: Safe Mode, Kill Switch, Emergency Unlock, and
-  Auto Recovery persistence. It also stores the current MVP usage policy values.
+  Auto Recovery persistence. It also stores policy values, temporary parent
+  allowances, local parent/device pairing state, and the remote command inbox.
 - `ui/safety/SafeModeViewModel.kt`: UI state and safety actions.
 - `usage/UsageStatsRepository.kt`: Usage access permission check and today usage
   query.
@@ -54,8 +55,9 @@ DataStore / Room / Android system services
   packages.
 - `safety/SafetyGate.kt`: Shared Safe Mode, Policy Enforcement, and never-block
   package gate for future blocking decisions.
-- `blocking/ScreenTimeAccessibilityService.kt`: No-op foreground detection
-  service that records safety-gated would-block decisions without enforcement.
+- `blocking/UsageMonitorForegroundService.kt`: Foreground monitoring and
+  blocking enforcement service.
+- `blocking/BlockedActivity.kt`: Parent controls and fallback blocked screen.
 - `worker/UsagePolicyCheckWorker.kt`: Periodic display-only policy checks that
   write event logs and may send Android notifications.
 - `notification/UsageNotificationHelper.kt`: Notification channel and policy
@@ -73,6 +75,20 @@ Current policy settings are stored in DataStore:
 - Multiple app group package lists
 - Multiple app group budgets in minutes
 - Per-app limit rules stored as package-to-minutes pairs
+
+## Parent Management
+
+The current parent-management implementation is the app-side boundary for a
+future backend:
+
+- Admin PIN controls policy changes and local parent pairing.
+- Emergency PIN is not a parent approval mechanism; it is only for offline Safe
+  Mode recovery.
+- Remote commands are persisted as an inbox in DataStore and can apply:
+  app extra time, app unlock-for-today, daily extra time, and daily
+  unlock-for-today.
+- A real account service can later replace the local simulator by writing the
+  same command model into the repository boundary.
 
 These values are not enforced yet. Enforcement must wait until the remaining
 safety gates are complete and must always respect Safe Mode.
@@ -105,21 +121,18 @@ if (!SafetyGate.evaluateBlocking(
 This check is required before any blocking screen, app interception, or
 enforcement logic.
 
-## Pre-Blocking Flow
+## Blocking Flow
 
-The current blocking-related flow is intentionally split:
+The current blocking flow does not require AccessibilityService:
 
 ```text
-AccessibilityService
+UsageMonitorForegroundService
     -> SafetyGate.evaluateBlocking(...)
     -> BlockDecisionEngine.evaluate(...)
-    -> event log only
-
-Safety tab preview button
-    -> BlockedActivity preview
+    -> SYSTEM_ALERT_WINDOW overlay
+    -> BlockedActivity fallback / parent controls
 ```
 
-`BlockedActivity` is registered for the future blocked-screen experience, but
-the AccessibilityService does not start it yet. This keeps the app one step
-before real enforcement while allowing the blocked-screen UX, Emergency Unlock,
-and Kill Switch paths to be reviewed safely.
+`SYSTEM_ALERT_WINDOW` is required for strong blocking over immersive apps.
+Without overlay permission, the app can still open a fallback blocked activity,
+but Android may allow some foreground apps to regain focus.

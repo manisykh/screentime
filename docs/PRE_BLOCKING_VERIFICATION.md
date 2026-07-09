@@ -7,7 +7,7 @@
 - 사용자가 기기 제어권을 잃지 않는다.
 - Safe Mode, Kill Switch, Emergency Unlock이 항상 우선한다.
 - 정책 저장/계산/감지는 정상 동작한다.
-- AccessibilityService는 아직 실제 차단을 실행하지 않는다.
+- 차단은 Usage Access, foreground monitor, overlay, notification access 경로로 동작한다.
 
 ## 0. 빌드와 설치
 
@@ -203,7 +203,7 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 기대 결과:
 
 - 선택한 요일 값이 즉시 UI에 반영됨
-- 5분 또는 15분 단위 조절이 자연스러움
+- 1분 단위 조절이 자연스러움
 - 저장 전 변경 상태가 표시됨
 - 저장 후 최신 상태로 표시됨
 - 오늘 요일의 제한이 개요 정책 요약에 반영됨
@@ -234,8 +234,8 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 1. 앱 탭으로 이동
 2. 검색으로 앱 찾기
 3. 앱 항목 선택
-4. 바텀 시트에서 제한 없음, 5분, 10분, 15분, 30분 선택
-5. 슬라이더와 -5/+5 버튼으로 미세 조정
+4. 바텀 시트에서 제한 없음, 1분, 2분, 3분 등 짧은 제한 선택
+5. 슬라이더와 직접 입력으로 1분 단위 미세 조정
 6. 적용
 7. 관리 PIN 입력 후 저장
 
@@ -313,20 +313,21 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 - 실제 차단은 발생하지 않음
 - Safe Mode ON에서는 백그라운드 정책 체크가 강제 동작하지 않음
 
-## 18. AccessibilityService 권한
+## 18. 알림 접근과 알람 권한
 
 절차:
 
 1. 안전 탭으로 이동
-2. 접근성 설정 버튼 클릭
-3. Android 접근성 설정에서 Screen Time Manager 활성화
-4. 앱으로 돌아와 준비 상태 확인
+2. 알림 접근 설정 버튼 클릭
+3. Android 알림 접근 설정에서 Screen Time Manager 활성화
+4. 알람 설정 버튼 클릭 후 알람 및 리마인더 허용 확인
+5. 앱으로 돌아와 준비 상태 확인
 
 기대 결과:
 
-- 접근성 권한 상태가 준비 상태에 반영됨
-- 서비스가 켜져도 실제 차단은 발생하지 않음
-- 이벤트 로그에 서비스 연결 기록이 남을 수 있음
+- 알림 접근과 알람 및 리마인더 권한 상태가 준비 상태에 반영됨
+- 접근성 권한 없이도 차단 준비 상태를 판단함
+- 서비스가 켜져도 Safe Mode ON이면 실제 차단은 발생하지 않음
 
 ## 19. 최근 감지
 
@@ -334,7 +335,7 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 
 1. Safe Mode OFF
 2. Policy Enforcement ON
-3. AccessibilityService ON
+3. 알림 접근, 오버레이, 알람 및 리마인더 권한 ON
 4. Chrome 같은 일반 앱 실행
 5. Screen Time Manager로 돌아와 안전 탭 확인
 6. 키보드를 띄운 뒤 다시 안전 탭 확인
@@ -392,7 +393,7 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 
 1. Safe Mode OFF
 2. Policy Enforcement ON
-3. AccessibilityService ON
+3. 알림 접근, 오버레이, 알람 및 리마인더 권한 ON
 4. Chrome 제한을 초과 상태로 만들기
 5. Chrome 실행
 
@@ -433,7 +434,7 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 1. Safe Mode 변경
 2. Kill Switch 실행
 3. 정책 저장
-4. AccessibilityService ON/OFF
+4. 알림 접근/오버레이 권한 ON/OFF
 5. 설정 탭에서 이벤트 로그 확인
 6. 이벤트 로그 지우기
 
@@ -487,8 +488,8 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 - 앱 그룹 저장 정상
 - 앱별 제한 저장 정상
 - 정책 예산 초과 저장 차단 정상
-- AccessibilityService는 감지만 수행
-- 차단 화면은 수동 미리보기로만 열림
-- 초과 앱을 실행해도 자동 차단되지 않음
+- foreground monitor와 overlay가 실제 차단을 수행
+- 차단 화면은 초과 앱 실행 시 자동으로 표시됨
+- Safe Mode ON 또는 Policy Enforcement OFF에서는 자동 차단되지 않음
 
 위 항목 중 하나라도 실패하면 실제 차단 연결 전에 먼저 수정합니다.

@@ -13,7 +13,7 @@ When Safe Mode is enabled:
 
 - App blocking is disabled.
 - Usage time limits are disabled.
-- AccessibilityService enforcement is disabled.
+- Foreground monitoring and blocking overlays are disabled.
 - Background monitoring is stopped.
 - Blocking screens are not shown.
 
@@ -45,7 +45,6 @@ parent/developer settings flow.
 The Kill Switch must immediately:
 
 - Disable all policies.
-- Stop AccessibilityService enforcement.
 - Stop Foreground Service monitoring.
 - Clear all active blocks.
 - Enable Safe Mode.
@@ -89,7 +88,6 @@ runtime. Required system safety apps cannot be removed from the whitelist.
 
 ## Development Rules
 
-- AccessibilityService must not be implemented before Safe Mode exists.
 - Every blocking feature must respect Safe Mode.
 - Settings must never be blocked.
 - Real devices should remain in Safe Mode during development.
@@ -104,12 +102,12 @@ Stored policy values must not:
 
 - Launch a blocking screen.
 - Stop another app.
-- Start AccessibilityService enforcement.
 - Start foreground monitoring.
 - Override Safe Mode.
 
 Policy summaries are also display-only. A limit being exceeded must not cause
-blocking until the AccessibilityService safety gate is explicitly implemented.
+blocking unless Safe Mode is OFF, policy enforcement is ON, and the shared
+SafetyGate allows evaluation.
 
 Warning and exceeded states must not directly enforce policy. By themselves
 they must not:
@@ -160,34 +158,28 @@ It must:
 - Respect the required whitelist and user-selected always-allowed apps.
 - Keep Emergency Unlock and Kill Switch available on block surfaces.
 
-## AccessibilityService Enforcement
+## Strong Blocking Permissions
 
-The current AccessibilityService implementation is a secondary detection path.
-Real enforcement is handled by the foreground usage monitor service so blocking
-does not require Accessibility permission.
+Screen Time Manager does not require AccessibilityService for the normal
+blocking path. The strong blocking path is built around Usage Access,
+ForegroundService monitoring, display-over-other-apps overlay, notification
+access, notification permission, and alarms/reminders recovery.
 
-It may:
+The foreground monitor remains responsible for:
 
-- Appear in Android Accessibility settings.
-- Observe foreground app package changes.
-- Retrieve interactive window packages for PIP or multi-window detection.
-- Display the latest foreground detection status in the Safety tab.
-- Record event-log entries.
-- Run `SafetyGate.evaluateBlocking(...)`.
-- Record would-block detections when a limit is exceeded.
+- Safe Mode and Policy Enforcement gates.
+- Required never-block whitelist and user always-allowed apps.
+- Usage, schedule, group, and app-limit policy decisions.
+- Overlay or blocked-screen enforcement.
+- Media pause attempts for PIP or media playback apps.
+- Exact-alarm recovery when the monitor process is removed.
 
-It must not:
-
-- Close or stop another app.
-- Kill another app process.
-- Launch a blocking screen while the foreground monitor service is responsible
-  for enforcement.
-- Enforce policy while Safe Mode is ON.
-- Enforce policy while Policy Enforcement is OFF.
+With Safe Mode ON or Policy Enforcement OFF, notification-access events, recovery
+alarms, and monitor ticks must not cause a block surface to appear.
 
 ## Blocking Reliability Boundary
 
-Normal app permissions can combine UsageStats, AccessibilityService, media
+Normal app permissions can combine UsageStats, a foreground service, media
 pause, and overlay windows, but Android does not guarantee that a third-party
 app can permanently cover or control every immersive game, secure surface, PIP
 window, or vendor-customized foreground surface.
@@ -198,31 +190,27 @@ Android management APIs in addition to the current safety gate. It must still
 keep Emergency Unlock, Kill Switch, required whitelist apps, and Safe Mode
 recovery paths available before stronger enforcement is enabled.
 - Block required whitelist or user always-allowed packages.
-- Store screen text from accessibility windows.
-
 Kill Switch remains the highest-priority recovery path because it enables Safe
 Mode. With Safe Mode ON, the service must return before any detection logic that
 could lead toward enforcement.
 
-With Policy Enforcement OFF, the service must also return before whitelist or
-policy checks. This keeps accessibility permission separate from policy
-activation.
+With Policy Enforcement OFF, monitoring must also return before whitelist or
+policy checks.
 
 ## Blocking Screen State
 
 The blocked-screen Activity remains `exported=false` and may be opened from:
 
 - An explicit in-app preview action.
-- AccessibilityService after the safety gate and policy decision both allow
+- The foreground monitor after the safety gate and policy decision both allow
   enforcement.
 
 In real blocking mode:
 
 - Emergency Unlock and Kill Switch must remain visible.
 - Parent/Admin PIN time override may grant temporary access for today.
-- A full-screen accessibility overlay may cover games or immersive apps after
-  AccessibilityService safety checks pass. Android "draw over other apps"
-  permission is used only as a fallback overlay path.
+- A full-screen application overlay may cover games or immersive apps after
+  SafetyGate and policy checks pass.
 - The blocking overlay must expose Emergency Unlock and Kill Switch.
 - The service may send Home before opening the blocking screen so full-screen
   apps do not remain usable behind the block.

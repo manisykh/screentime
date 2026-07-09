@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.screentimemanager"
+    namespace = "com.manisykh.screenrest"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.screentimemanager"
+        applicationId = "com.manisykh.screenrest"
         minSdk = 30
         targetSdk = 35
         versionCode = 1
