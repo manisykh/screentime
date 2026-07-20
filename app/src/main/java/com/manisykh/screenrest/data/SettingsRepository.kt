@@ -18,6 +18,8 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.util.UUID
 
+private const val MAX_TEMPORARY_EXTRA_MINUTES = 720
+
 data class EventLogEntry(
     val timestampMillis: Long,
     val type: EventLogType,
@@ -89,6 +91,30 @@ enum class EventLogType {
     Safety,
 }
 
+private const val EVENT_LOG_TYPE_INFO = "Info"
+private const val EVENT_LOG_TYPE_WARNING = "Warning"
+private const val EVENT_LOG_TYPE_EXCEEDED = "Exceeded"
+private const val EVENT_LOG_TYPE_SAFETY = "Safety"
+
+private fun EventLogType.toStorageValue(): String {
+    return when (this) {
+        EventLogType.Info -> EVENT_LOG_TYPE_INFO
+        EventLogType.Warning -> EVENT_LOG_TYPE_WARNING
+        EventLogType.Exceeded -> EVENT_LOG_TYPE_EXCEEDED
+        EventLogType.Safety -> EVENT_LOG_TYPE_SAFETY
+    }
+}
+
+private fun String.toEventLogTypeOrNull(): EventLogType? {
+    return when (this) {
+        EVENT_LOG_TYPE_INFO -> EventLogType.Info
+        EVENT_LOG_TYPE_WARNING -> EventLogType.Warning
+        EVENT_LOG_TYPE_EXCEEDED -> EventLogType.Exceeded
+        EVENT_LOG_TYPE_SAFETY -> EventLogType.Safety
+        else -> null
+    }
+}
+
 data class UsagePolicySettings(
     val weekdayLimitMinutes: Int = 120,
     val weekendLimitMinutes: Int = 240,
@@ -116,7 +142,28 @@ data class UsagePolicySettings(
 data class TemporaryPackageAllowance(
     val extraMinutes: Int = 0,
     val unlockedForToday: Boolean = false,
+    val temporaryAllowedUntilMillis: Long = 0L,
 )
+
+fun TemporaryPackageAllowance.isTemporarilyAllowed(nowMillis: Long = System.currentTimeMillis()): Boolean {
+    return temporaryAllowedUntilMillis > nowMillis
+}
+
+fun TemporaryPackageAllowance.temporaryRemainingMinutes(nowMillis: Long = System.currentTimeMillis()): Int {
+    if (!isTemporarilyAllowed(nowMillis)) {
+        return 0
+    }
+    return ((temporaryAllowedUntilMillis - nowMillis + 59_999L) / 60_000L).toInt().coerceAtLeast(0)
+}
+
+fun TemporaryPackageAllowance.withExtraTime(extraMinutes: Int, nowMillis: Long = System.currentTimeMillis()): TemporaryPackageAllowance {
+    val safeExtraMinutes = extraMinutes.coerceAtLeast(1)
+    val extraUntilMillis = nowMillis + safeExtraMinutes * 60_000L
+    return copy(
+        extraMinutes = (this.extraMinutes + safeExtraMinutes).coerceAtMost(MAX_TEMPORARY_EXTRA_MINUTES),
+        temporaryAllowedUntilMillis = maxOf(temporaryAllowedUntilMillis, extraUntilMillis),
+    )
+}
 
 data class TemporaryUnlockState(
     val dateKey: String = "",
@@ -138,8 +185,50 @@ data class ParentManagementState(
     val parentAccountId: String = "",
     val childDeviceId: String = "",
     val childDeviceName: String = "",
+    val localProfileName: String = "",
     val lastSyncMillis: Long = 0L,
     val remoteCommands: List<RemoteParentCommand> = emptyList(),
+    val remoteUnlockRequests: List<RemoteUnlockRequest> = emptyList(),
+    val deviceRole: ParentDeviceRole = ParentDeviceRole.Child,
+    val pairingCode: String = "",
+    val linkedChildPairingCodes: Set<String> = emptySet(),
+    val linkedChildDevices: List<LinkedChildDevice> = emptyList(),
+    val linkedParentDevices: List<LinkedParentDevice> = emptyList(),
+)
+
+enum class ParentDeviceRole {
+    Child,
+    Parent,
+}
+
+private const val PARENT_DEVICE_ROLE_CHILD = "Child"
+private const val PARENT_DEVICE_ROLE_PARENT = "Parent"
+
+private fun ParentDeviceRole.toStorageValue(): String {
+    return when (this) {
+        ParentDeviceRole.Parent -> PARENT_DEVICE_ROLE_PARENT
+        ParentDeviceRole.Child -> PARENT_DEVICE_ROLE_CHILD
+    }
+}
+
+private fun String.toParentDeviceRole(): ParentDeviceRole {
+    return when (this) {
+        PARENT_DEVICE_ROLE_PARENT -> ParentDeviceRole.Parent
+        else -> ParentDeviceRole.Child
+    }
+}
+
+data class LinkedChildDevice(
+    val childDeviceId: String,
+    val childDeviceName: String,
+    val pairingCode: String = "",
+    val linkedAtMillis: Long = 0L,
+)
+
+data class LinkedParentDevice(
+    val parentUid: String,
+    val parentDisplayName: String,
+    val linkedAtMillis: Long = 0L,
 )
 
 data class RemoteParentCommand(
@@ -160,10 +249,145 @@ enum class RemoteParentCommandType {
     UnlockTotalToday,
 }
 
+private const val REMOTE_PARENT_COMMAND_TYPE_ADD_APP_TIME = "AddAppTime"
+private const val REMOTE_PARENT_COMMAND_TYPE_UNLOCK_APP_TODAY = "UnlockAppToday"
+private const val REMOTE_PARENT_COMMAND_TYPE_ADD_TOTAL_TIME = "AddTotalTime"
+private const val REMOTE_PARENT_COMMAND_TYPE_UNLOCK_TOTAL_TODAY = "UnlockTotalToday"
+
+private fun RemoteParentCommandType.toStorageValue(): String {
+    return when (this) {
+        RemoteParentCommandType.AddAppTime -> REMOTE_PARENT_COMMAND_TYPE_ADD_APP_TIME
+        RemoteParentCommandType.UnlockAppToday -> REMOTE_PARENT_COMMAND_TYPE_UNLOCK_APP_TODAY
+        RemoteParentCommandType.AddTotalTime -> REMOTE_PARENT_COMMAND_TYPE_ADD_TOTAL_TIME
+        RemoteParentCommandType.UnlockTotalToday -> REMOTE_PARENT_COMMAND_TYPE_UNLOCK_TOTAL_TODAY
+    }
+}
+
+private fun String.toRemoteParentCommandTypeOrNull(): RemoteParentCommandType? {
+    return when (this) {
+        REMOTE_PARENT_COMMAND_TYPE_ADD_APP_TIME -> RemoteParentCommandType.AddAppTime
+        REMOTE_PARENT_COMMAND_TYPE_UNLOCK_APP_TODAY -> RemoteParentCommandType.UnlockAppToday
+        REMOTE_PARENT_COMMAND_TYPE_ADD_TOTAL_TIME -> RemoteParentCommandType.AddTotalTime
+        REMOTE_PARENT_COMMAND_TYPE_UNLOCK_TOTAL_TODAY -> RemoteParentCommandType.UnlockTotalToday
+        else -> null
+    }
+}
+
 enum class RemoteParentCommandStatus {
     Pending,
     Applied,
     Failed,
+}
+
+private const val REMOTE_PARENT_COMMAND_STATUS_PENDING = "Pending"
+private const val REMOTE_PARENT_COMMAND_STATUS_APPLIED = "Applied"
+private const val REMOTE_PARENT_COMMAND_STATUS_FAILED = "Failed"
+
+private fun RemoteParentCommandStatus.toStorageValue(): String {
+    return when (this) {
+        RemoteParentCommandStatus.Pending -> REMOTE_PARENT_COMMAND_STATUS_PENDING
+        RemoteParentCommandStatus.Applied -> REMOTE_PARENT_COMMAND_STATUS_APPLIED
+        RemoteParentCommandStatus.Failed -> REMOTE_PARENT_COMMAND_STATUS_FAILED
+    }
+}
+
+private fun String.toRemoteParentCommandStatusOrNull(): RemoteParentCommandStatus? {
+    return when (this) {
+        REMOTE_PARENT_COMMAND_STATUS_PENDING -> RemoteParentCommandStatus.Pending
+        REMOTE_PARENT_COMMAND_STATUS_APPLIED -> RemoteParentCommandStatus.Applied
+        REMOTE_PARENT_COMMAND_STATUS_FAILED -> RemoteParentCommandStatus.Failed
+        else -> null
+    }
+}
+
+data class RemoteUnlockRequest(
+    val id: String,
+    val childDeviceId: String,
+    val childDeviceName: String,
+    val createdAtMillis: Long,
+    val expiresAtMillis: Long,
+    val blockReason: RemoteRequestBlockReason,
+    val targetPackageName: String = "",
+    val targetAppName: String = "",
+    val targetGroupName: String = "",
+    val scheduleName: String = "",
+    val usedMillis: Long = 0L,
+    val limitMillis: Long? = null,
+    val alreadyGrantedExtraMinutes: Int = 0,
+    val unlockedForToday: Boolean = false,
+    val requestedMinutes: Int = 0,
+    val childMessage: String = "",
+    val status: RemoteUnlockRequestStatus = RemoteUnlockRequestStatus.Pending,
+)
+
+enum class RemoteRequestBlockReason {
+    DailyLimit,
+    AppGroupLimit,
+    AppLimit,
+    ScheduleBlock,
+    AllowOnlyMode,
+}
+
+private const val REMOTE_REQUEST_BLOCK_REASON_DAILY_LIMIT = "DailyLimit"
+private const val REMOTE_REQUEST_BLOCK_REASON_APP_GROUP_LIMIT = "AppGroupLimit"
+private const val REMOTE_REQUEST_BLOCK_REASON_APP_LIMIT = "AppLimit"
+private const val REMOTE_REQUEST_BLOCK_REASON_SCHEDULE_BLOCK = "ScheduleBlock"
+private const val REMOTE_REQUEST_BLOCK_REASON_ALLOW_ONLY_MODE = "AllowOnlyMode"
+
+private fun RemoteRequestBlockReason.toStorageValue(): String {
+    return when (this) {
+        RemoteRequestBlockReason.DailyLimit -> REMOTE_REQUEST_BLOCK_REASON_DAILY_LIMIT
+        RemoteRequestBlockReason.AppGroupLimit -> REMOTE_REQUEST_BLOCK_REASON_APP_GROUP_LIMIT
+        RemoteRequestBlockReason.AppLimit -> REMOTE_REQUEST_BLOCK_REASON_APP_LIMIT
+        RemoteRequestBlockReason.ScheduleBlock -> REMOTE_REQUEST_BLOCK_REASON_SCHEDULE_BLOCK
+        RemoteRequestBlockReason.AllowOnlyMode -> REMOTE_REQUEST_BLOCK_REASON_ALLOW_ONLY_MODE
+    }
+}
+
+private fun String.toRemoteRequestBlockReasonOrNull(): RemoteRequestBlockReason? {
+    return when (this) {
+        REMOTE_REQUEST_BLOCK_REASON_DAILY_LIMIT -> RemoteRequestBlockReason.DailyLimit
+        REMOTE_REQUEST_BLOCK_REASON_APP_GROUP_LIMIT -> RemoteRequestBlockReason.AppGroupLimit
+        REMOTE_REQUEST_BLOCK_REASON_APP_LIMIT -> RemoteRequestBlockReason.AppLimit
+        REMOTE_REQUEST_BLOCK_REASON_SCHEDULE_BLOCK -> RemoteRequestBlockReason.ScheduleBlock
+        REMOTE_REQUEST_BLOCK_REASON_ALLOW_ONLY_MODE -> RemoteRequestBlockReason.AllowOnlyMode
+        else -> null
+    }
+}
+
+enum class RemoteUnlockRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+    Failed,
+}
+
+private const val REMOTE_UNLOCK_REQUEST_STATUS_PENDING = "Pending"
+private const val REMOTE_UNLOCK_REQUEST_STATUS_APPROVED = "Approved"
+private const val REMOTE_UNLOCK_REQUEST_STATUS_REJECTED = "Rejected"
+private const val REMOTE_UNLOCK_REQUEST_STATUS_EXPIRED = "Expired"
+private const val REMOTE_UNLOCK_REQUEST_STATUS_FAILED = "Failed"
+
+private fun RemoteUnlockRequestStatus.toStorageValue(): String {
+    return when (this) {
+        RemoteUnlockRequestStatus.Pending -> REMOTE_UNLOCK_REQUEST_STATUS_PENDING
+        RemoteUnlockRequestStatus.Approved -> REMOTE_UNLOCK_REQUEST_STATUS_APPROVED
+        RemoteUnlockRequestStatus.Rejected -> REMOTE_UNLOCK_REQUEST_STATUS_REJECTED
+        RemoteUnlockRequestStatus.Expired -> REMOTE_UNLOCK_REQUEST_STATUS_EXPIRED
+        RemoteUnlockRequestStatus.Failed -> REMOTE_UNLOCK_REQUEST_STATUS_FAILED
+    }
+}
+
+private fun String.toRemoteUnlockRequestStatusOrNull(): RemoteUnlockRequestStatus? {
+    return when (this) {
+        REMOTE_UNLOCK_REQUEST_STATUS_PENDING -> RemoteUnlockRequestStatus.Pending
+        REMOTE_UNLOCK_REQUEST_STATUS_APPROVED -> RemoteUnlockRequestStatus.Approved
+        REMOTE_UNLOCK_REQUEST_STATUS_REJECTED -> RemoteUnlockRequestStatus.Rejected
+        REMOTE_UNLOCK_REQUEST_STATUS_EXPIRED -> RemoteUnlockRequestStatus.Expired
+        REMOTE_UNLOCK_REQUEST_STATUS_FAILED -> RemoteUnlockRequestStatus.Failed
+        else -> null
+    }
 }
 
 data class AppGroupPolicy(
@@ -187,17 +411,29 @@ enum class AppLanguage {
     English,
 }
 
+private const val APP_LANGUAGE_KOREAN = "Korean"
+private const val APP_LANGUAGE_ENGLISH = "English"
+
 data class PolicySectionExpansionSettings(
     val dailyPolicyExpanded: Boolean = true,
     val appGroupsExpanded: Boolean = true,
     val appLimitsExpanded: Boolean = true,
     val scheduleBlockingExpanded: Boolean = true,
     val allowOnlyModeExpanded: Boolean = true,
+    val settingsLanguageExpanded: Boolean = true,
+    val settingsNotificationExpanded: Boolean = true,
+    val settingsPinExpanded: Boolean = true,
+    val settingsParentManagementExpanded: Boolean = true,
+    val settingsEventLogExpanded: Boolean = false,
 )
 
 class SettingsRepository(
     private val dataStore: DataStore<Preferences>,
+    private val parentRemoteSyncDataSource: ParentRemoteSyncDataSource = LocalOnlyParentRemoteSyncDataSource,
 ) {
+    fun observeParentRemoteChanges(childDeviceIds: Set<String>) =
+        parentRemoteSyncDataSource.observeChanges(childDeviceIds)
+
     private val preferences: Flow<Preferences> = dataStore.data
         .catch { exception ->
             if (exception is IOException) {
@@ -240,13 +476,19 @@ class SettingsRepository(
                 appLimitsExpanded = preferences[APP_LIMITS_EXPANDED] ?: true,
                 scheduleBlockingExpanded = preferences[SCHEDULE_BLOCKING_EXPANDED] ?: true,
                 allowOnlyModeExpanded = preferences[ALLOW_ONLY_MODE_EXPANDED] ?: true,
+                settingsLanguageExpanded = preferences[SETTINGS_LANGUAGE_EXPANDED] ?: true,
+                settingsNotificationExpanded = preferences[SETTINGS_NOTIFICATION_EXPANDED] ?: true,
+                settingsPinExpanded = preferences[SETTINGS_PIN_EXPANDED] ?: true,
+                settingsParentManagementExpanded = preferences[SETTINGS_PARENT_MANAGEMENT_EXPANDED] ?: true,
+                settingsEventLogExpanded = preferences[SETTINGS_EVENT_LOG_EXPANDED] ?: false,
             )
         }
 
     val appLanguage: Flow<AppLanguage> = preferences
         .map { preferences ->
-            when (preferences[APP_LANGUAGE]) {
-                AppLanguage.English.name -> AppLanguage.English
+            val savedLanguage = preferences[APP_LANGUAGE].orEmpty()
+            when (savedLanguage) {
+                APP_LANGUAGE_ENGLISH -> AppLanguage.English
                 else -> AppLanguage.Korean
             }
         }
@@ -394,9 +636,42 @@ class SettingsRepository(
         }
     }
 
+    suspend fun setSettingsLanguageExpanded(expanded: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[SETTINGS_LANGUAGE_EXPANDED] = expanded
+        }
+    }
+
+    suspend fun setSettingsNotificationExpanded(expanded: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[SETTINGS_NOTIFICATION_EXPANDED] = expanded
+        }
+    }
+
+    suspend fun setSettingsPinExpanded(expanded: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[SETTINGS_PIN_EXPANDED] = expanded
+        }
+    }
+
+    suspend fun setSettingsParentManagementExpanded(expanded: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[SETTINGS_PARENT_MANAGEMENT_EXPANDED] = expanded
+        }
+    }
+
+    suspend fun setSettingsEventLogExpanded(expanded: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[SETTINGS_EVENT_LOG_EXPANDED] = expanded
+        }
+    }
+
     suspend fun setAppLanguage(language: AppLanguage) {
         dataStore.edit { preferences ->
-            preferences[APP_LANGUAGE] = language.name
+            preferences[APP_LANGUAGE] = when (language) {
+                AppLanguage.English -> APP_LANGUAGE_ENGLISH
+                AppLanguage.Korean -> APP_LANGUAGE_KOREAN
+            }
         }
     }
 
@@ -432,6 +707,7 @@ class SettingsRepository(
             val nextState = current.copy(
                 paired = true,
                 parentAccountId = cleanParentId,
+                localProfileName = current.localProfileName.ifBlank { cleanParentId },
                 childDeviceId = current.childDeviceId.ifBlank { UUID.randomUUID().toString() },
                 childDeviceName = cleanDeviceName,
                 lastSyncMillis = System.currentTimeMillis(),
@@ -443,32 +719,471 @@ class SettingsRepository(
         return paired
     }
 
+    suspend fun setParentDeviceRole(role: ParentDeviceRole, adminPin: String): Boolean {
+        var updated = false
+        dataStore.edit { preferences ->
+            if (!isAdminPinValid(preferences, adminPin.trim())) {
+                appendEvent(preferences, EventLogType.Warning, "Parent management role change failed: invalid admin PIN")
+                return@edit
+            }
+            val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                deviceRole = role,
+                lastSyncMillis = System.currentTimeMillis(),
+            ).toParentManagementStateEncoded()
+            appendEvent(preferences, EventLogType.Info, "Parent management role changed: ${role.toStorageValue()}")
+            updated = true
+        }
+        return updated
+    }
+
+    suspend fun setParentProfileName(profileName: String): Boolean {
+        val cleanName = profileName.trim()
+        if (cleanName.isBlank()) {
+            return false
+        }
+        var updated = false
+        var updatedState: ParentManagementState? = null
+        dataStore.edit { preferences ->
+            val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            val nextState = current.copy(
+                localProfileName = cleanName,
+                parentAccountId = if (current.deviceRole == ParentDeviceRole.Parent) {
+                    cleanName
+                } else {
+                    current.parentAccountId
+                },
+                childDeviceName = if (current.deviceRole == ParentDeviceRole.Child) {
+                    cleanName
+                } else {
+                    current.childDeviceName
+                },
+                lastSyncMillis = System.currentTimeMillis(),
+            )
+            preferences[PARENT_MANAGEMENT_STATE] = nextState.toParentManagementStateEncoded()
+            appendEvent(preferences, EventLogType.Info, "Parent profile name updated")
+            updatedState = nextState
+            updated = true
+        }
+        updatedState?.let { state ->
+            val result = if (state.deviceRole == ParentDeviceRole.Child) {
+                parentRemoteSyncDataSource.updateChildProfile(
+                    childDeviceId = state.childDeviceId,
+                    childDeviceName = state.childDeviceName.ifBlank { cleanName },
+                    pairingCode = state.pairingCode,
+                )
+            } else {
+                parentRemoteSyncDataSource.updateParentProfile(
+                    childDeviceIds = state.syncChildDevices().map { child -> child.childDeviceId },
+                    parentDisplayName = cleanName,
+                )
+            }
+            recordParentRemoteSyncResult(
+                action = "update profile name",
+                result = result,
+            )
+        }
+        return updated
+    }
+
+    suspend fun generateChildPairingCode(adminPin: String): Boolean {
+        var generated = false
+        var generatedCode = ""
+        var generatedChildDeviceId = ""
+        var generatedChildDeviceName = ""
+        dataStore.edit { preferences ->
+            if (!isAdminPinValid(preferences, adminPin.trim())) {
+                appendEvent(preferences, EventLogType.Warning, "Pairing code generation failed: invalid admin PIN")
+                return@edit
+            }
+            val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            val childDeviceId = current.childDeviceId.ifBlank { UUID.randomUUID().toString() }
+            val childDisplayName = current.localProfileName
+                .ifBlank { current.childDeviceName }
+                .ifBlank { "Child device" }
+            val pairingCode = createPairingCode()
+            preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                deviceRole = ParentDeviceRole.Child,
+                paired = true,
+                childDeviceId = childDeviceId,
+                childDeviceName = childDisplayName,
+                localProfileName = childDisplayName,
+                pairingCode = pairingCode,
+                lastSyncMillis = System.currentTimeMillis(),
+            ).toParentManagementStateEncoded()
+            appendEvent(preferences, EventLogType.Safety, "Child pairing code generated")
+            generatedCode = pairingCode
+            generatedChildDeviceId = childDeviceId
+            generatedChildDeviceName = childDisplayName
+            generated = true
+        }
+        if (!generated) {
+            return false
+        }
+        val remoteResult = parentRemoteSyncDataSource.publishPairingCode(
+            pairingCode = generatedCode,
+            childDeviceId = generatedChildDeviceId,
+            childDeviceName = generatedChildDeviceName,
+        )
+        recordParentRemoteSyncResult(
+                action = "publish pairing code",
+                result = remoteResult,
+        )
+        if (remoteResult != ParentRemoteSyncResult.Success) {
+            dataStore.edit { preferences ->
+                val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+                if (current.pairingCode == generatedCode) {
+                    preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                        paired = current.linkedParentDevices.isNotEmpty(),
+                        pairingCode = "",
+                    ).toParentManagementStateEncoded()
+                }
+                appendEvent(
+                    preferences,
+                    EventLogType.Warning,
+                    "Pairing code generation rolled back: cloud publish failed",
+                )
+            }
+            return false
+        }
+        return true
+    }
+
+    suspend fun registerChildPairingCode(pairingCode: String, childDeviceName: String, adminPin: String): Boolean {
+        val cleanCode = pairingCode.normalizedPairingCode()
+        if (cleanCode.isBlank()) {
+            return false
+        }
+        var adminPinValid = false
+        dataStore.edit { preferences ->
+            if (!isAdminPinValid(preferences, adminPin.trim())) {
+                appendEvent(preferences, EventLogType.Warning, "Child device register failed: invalid admin PIN")
+                return@edit
+            }
+            adminPinValid = true
+        }
+        if (!adminPinValid) {
+            return false
+        }
+        val localParentDisplayName = parentManagementState.first().localProfileName
+            .ifBlank { parentManagementState.first().parentAccountId }
+            .ifBlank { "Parent device" }
+        val pairingRecord = parentRemoteSyncDataSource.resolvePairingCode(
+            pairingCode = cleanCode,
+            parentDisplayName = localParentDisplayName,
+        )
+        if (pairingRecord == null) {
+            dataStore.edit { preferences ->
+                appendEvent(preferences, EventLogType.Warning, "Child device register failed: invalid or expired pairing code")
+            }
+            return false
+        }
+        var registered = false
+        dataStore.edit { preferences ->
+            val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            val resolvedChildDeviceId = pairingRecord.childDeviceId
+            val resolvedChildDeviceName = pairingRecord.childDeviceName
+                .ifBlank { childDeviceName.trim() }
+                .ifBlank { current.childDeviceName.ifBlank { "Child device" } }
+            val linkedChild = LinkedChildDevice(
+                childDeviceId = resolvedChildDeviceId,
+                childDeviceName = resolvedChildDeviceName,
+                pairingCode = cleanCode,
+                linkedAtMillis = System.currentTimeMillis(),
+            )
+            preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                deviceRole = ParentDeviceRole.Parent,
+                paired = true,
+                parentAccountId = current.parentAccountId.ifBlank { localParentDisplayName },
+                localProfileName = current.localProfileName.ifBlank { localParentDisplayName },
+                childDeviceId = resolvedChildDeviceId,
+                childDeviceName = resolvedChildDeviceName,
+                linkedChildPairingCodes = current.linkedChildPairingCodes + cleanCode,
+                linkedChildDevices = (current.linkedChildDevices + linkedChild)
+                    .distinctBy { child -> child.childDeviceId },
+                lastSyncMillis = System.currentTimeMillis(),
+            ).toParentManagementStateEncoded()
+            appendEvent(preferences, EventLogType.Safety, "Child device registered: $cleanCode")
+            registered = true
+        }
+        if (registered) {
+            recordParentRemoteSyncResult(
+                action = "confirm parent profile after child registration",
+                result = parentRemoteSyncDataSource.updateParentProfile(
+                    childDeviceIds = listOf(pairingRecord.childDeviceId),
+                    parentDisplayName = localParentDisplayName,
+                ),
+            )
+        }
+        return registered
+    }
+
     suspend fun unlinkParentAccount(adminPin: String): Boolean {
         var unlinked = false
+        var childDeviceIdsForRemote = emptyList<String>()
+        var parentAccountIdForRemote = ""
         dataStore.edit { preferences ->
             if (!isAdminPinValid(preferences, adminPin.trim())) {
                 appendEvent(preferences, EventLogType.Warning, "Parent unlink failed: invalid admin PIN")
                 return@edit
             }
             val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            childDeviceIdsForRemote = current.linkedChildDevices
+                .map { child -> child.childDeviceId }
+                .plus(current.childDeviceId)
+                .filter { childDeviceId -> childDeviceId.isNotBlank() }
+                .distinct()
+            parentAccountIdForRemote = current.parentAccountId
             preferences[PARENT_MANAGEMENT_STATE] = current.copy(
                 paired = false,
                 parentAccountId = "",
+                linkedChildPairingCodes = emptySet(),
+                linkedChildDevices = emptyList(),
                 lastSyncMillis = System.currentTimeMillis(),
             ).toParentManagementStateEncoded()
             appendEvent(preferences, EventLogType.Safety, "Parent account unlinked")
             unlinked = true
         }
+        if (unlinked) {
+            childDeviceIdsForRemote.forEach { childDeviceId ->
+                recordParentRemoteSyncResult(
+                    action = "unlink child",
+                    result = parentRemoteSyncDataSource.unlinkChild(
+                        childDeviceId = childDeviceId,
+                        parentAccountId = parentAccountIdForRemote,
+                    ),
+                )
+            }
+        }
+        return unlinked
+    }
+
+    suspend fun unlinkLinkedChildDevice(childDeviceId: String, adminPin: String): Boolean {
+        val cleanChildDeviceId = childDeviceId.trim()
+        if (cleanChildDeviceId.isBlank()) {
+            return false
+        }
+        var unlinked = false
+        var parentAccountIdForRemote = ""
+        dataStore.edit { preferences ->
+            if (!isAdminPinValid(preferences, adminPin.trim())) {
+                appendEvent(preferences, EventLogType.Warning, "Linked child unlink failed: invalid admin PIN")
+                return@edit
+            }
+            val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            parentAccountIdForRemote = current.parentAccountId
+            val remainingChildren = current.linkedChildDevices
+                .filterNot { child -> child.childDeviceId == cleanChildDeviceId }
+            val nextPrimaryChild = remainingChildren.firstOrNull()
+            preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                paired = remainingChildren.isNotEmpty() || current.deviceRole == ParentDeviceRole.Child,
+                childDeviceId = if (current.childDeviceId == cleanChildDeviceId) {
+                    nextPrimaryChild?.childDeviceId.orEmpty()
+                } else {
+                    current.childDeviceId
+                },
+                childDeviceName = if (current.childDeviceId == cleanChildDeviceId) {
+                    nextPrimaryChild?.childDeviceName.orEmpty()
+                } else {
+                    current.childDeviceName
+                },
+                linkedChildDevices = remainingChildren,
+                linkedChildPairingCodes = current.linkedChildPairingCodes.filterNot { code ->
+                    current.linkedChildDevices.any { child ->
+                        child.childDeviceId == cleanChildDeviceId && child.pairingCode == code
+                    }
+                }.toSet(),
+                lastSyncMillis = System.currentTimeMillis(),
+            ).toParentManagementStateEncoded()
+            appendEvent(preferences, EventLogType.Safety, "Linked child device unlinked")
+            unlinked = true
+        }
+        if (unlinked) {
+            recordParentRemoteSyncResult(
+                action = "unlink selected child",
+                result = parentRemoteSyncDataSource.unlinkChild(
+                    childDeviceId = cleanChildDeviceId,
+                    parentAccountId = parentAccountIdForRemote,
+                ),
+            )
+        }
+        return unlinked
+    }
+
+    suspend fun unlinkLinkedParentDevice(parentUid: String, adminPin: String): Boolean {
+        val cleanParentUid = parentUid.trim()
+        if (cleanParentUid.isBlank()) {
+            return false
+        }
+        var unlinked = false
+        var childDeviceIdForRemote = ""
+        dataStore.edit { preferences ->
+            if (!isAdminPinValid(preferences, adminPin.trim())) {
+                appendEvent(preferences, EventLogType.Warning, "Linked parent unlink failed: invalid admin PIN")
+                return@edit
+            }
+            val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            childDeviceIdForRemote = current.childDeviceId
+            val remainingParents = current.linkedParentDevices
+                .filterNot { parent -> parent.parentUid == cleanParentUid }
+            preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                paired = remainingParents.isNotEmpty() || current.deviceRole == ParentDeviceRole.Parent,
+                linkedParentDevices = remainingParents,
+                lastSyncMillis = System.currentTimeMillis(),
+            ).toParentManagementStateEncoded()
+            appendEvent(preferences, EventLogType.Safety, "Linked parent device unlinked")
+            unlinked = true
+        }
+        if (unlinked) {
+            recordParentRemoteSyncResult(
+                action = "unlink selected parent",
+                result = parentRemoteSyncDataSource.unlinkParentFromChild(
+                    childDeviceId = childDeviceIdForRemote,
+                    parentUid = cleanParentUid,
+                ),
+            )
+        }
         return unlinked
     }
 
     suspend fun syncParentDevice() {
+        val currentState = parentManagementState.first()
+        val syncChildDevices = currentState.syncChildDevices()
+        var remoteSyncAttempted = false
+        var remoteSyncSucceeded = parentRemoteSyncDataSource.syncState.value.mode == ParentRemoteSyncMode.Cloud
+        val fetchedLinkedChildDevices = if (
+            currentState.deviceRole == ParentDeviceRole.Parent &&
+            syncChildDevices.isNotEmpty()
+        ) {
+            parentRemoteSyncDataSource.fetchLinkedChildDevices(
+                syncChildDevices.map { child -> child.childDeviceId },
+            ).also {
+                remoteSyncAttempted = true
+                remoteSyncSucceeded = remoteSyncSucceeded && parentRemoteSyncDataSource.syncState.value.connected
+            }
+        } else {
+            emptyList()
+        }
+        val fetchedRequests = when {
+            currentState.deviceRole == ParentDeviceRole.Parent -> {
+                syncChildDevices.flatMap { child ->
+                    parentRemoteSyncDataSource.fetchChildRequests(
+                        parentAccountId = currentState.parentAccountId,
+                        childDeviceId = child.childDeviceId,
+                    ).also {
+                        remoteSyncAttempted = true
+                        remoteSyncSucceeded = remoteSyncSucceeded && parentRemoteSyncDataSource.syncState.value.connected
+                    }
+                }
+            }
+
+            currentState.childDeviceId.isNotBlank() -> {
+                parentRemoteSyncDataSource.fetchChildRequests(
+                    parentAccountId = currentState.parentAccountId,
+                    childDeviceId = currentState.childDeviceId,
+                ).also {
+                    remoteSyncAttempted = true
+                    remoteSyncSucceeded = remoteSyncSucceeded && parentRemoteSyncDataSource.syncState.value.connected
+                }
+            }
+
+            else -> emptyList()
+        }
+        val fetchedLinkedParents = if (
+            currentState.deviceRole == ParentDeviceRole.Child &&
+            currentState.childDeviceId.isNotBlank()
+        ) {
+            parentRemoteSyncDataSource.fetchLinkedParents(currentState.childDeviceId).also {
+                remoteSyncAttempted = true
+                remoteSyncSucceeded = remoteSyncSucceeded && parentRemoteSyncDataSource.syncState.value.connected
+            }
+        } else {
+            emptyList()
+        }
+        val fetchedCommands = if (
+            currentState.deviceRole == ParentDeviceRole.Child &&
+            currentState.childDeviceId.isNotBlank()
+        ) {
+            parentRemoteSyncDataSource.fetchChildCommands(currentState.childDeviceId).also {
+                remoteSyncAttempted = true
+                remoteSyncSucceeded = remoteSyncSucceeded && parentRemoteSyncDataSource.syncState.value.connected
+            }
+        } else {
+            emptyList()
+        }
         dataStore.edit { preferences ->
             val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
-            preferences[PARENT_MANAGEMENT_STATE] = current.copy(
-                childDeviceId = current.childDeviceId.ifBlank { UUID.randomUUID().toString() },
-                lastSyncMillis = System.currentTimeMillis(),
-            ).toParentManagementStateEncoded()
+            var nextState = current.copy(
+                childDeviceId = if (current.deviceRole == ParentDeviceRole.Child) {
+                    current.childDeviceId.ifBlank { UUID.randomUUID().toString() }
+                } else {
+                    current.childDeviceId
+                },
+                linkedChildDevices = fetchedLinkedChildDevices.mergeWithLocalLinkedChildren(
+                    current.linkedChildDevices.ifEmpty {
+                        if (current.deviceRole == ParentDeviceRole.Parent && current.childDeviceId.isNotBlank()) {
+                            listOf(
+                                LinkedChildDevice(
+                                    childDeviceId = current.childDeviceId,
+                                    childDeviceName = current.childDeviceName.ifBlank { "Child device" },
+                                    linkedAtMillis = current.lastSyncMillis,
+                                ),
+                            )
+                        } else {
+                            emptyList()
+                        }
+                    },
+                ),
+                linkedParentDevices = fetchedLinkedParents.ifEmpty { current.linkedParentDevices },
+                lastSyncMillis = if (remoteSyncAttempted && remoteSyncSucceeded) {
+                    System.currentTimeMillis()
+                } else {
+                    current.lastSyncMillis
+                },
+                remoteUnlockRequests = current.remoteUnlockRequests.map { request ->
+                    request.expireIfNeeded(System.currentTimeMillis())
+                },
+            )
+            if (current.deviceRole == ParentDeviceRole.Parent && fetchedLinkedChildDevices.isNotEmpty()) {
+                val primaryChild = nextState.linkedChildDevices.firstOrNull { child ->
+                    child.childDeviceId == nextState.childDeviceId
+                } ?: nextState.linkedChildDevices.firstOrNull()
+                if (primaryChild != null) {
+                    nextState = nextState.copy(
+                        childDeviceId = primaryChild.childDeviceId,
+                        childDeviceName = primaryChild.childDeviceName,
+                    )
+                }
+            }
+            if (fetchedRequests.isNotEmpty()) {
+                val mergedRequests = (fetchedRequests + nextState.remoteUnlockRequests)
+                    .distinctBy { request -> request.id }
+                    .map { request -> request.expireIfNeeded(nextState.lastSyncMillis) }
+                    .sortedByDescending { request -> request.createdAtMillis }
+                    .take(MAX_REMOTE_UNLOCK_REQUESTS)
+                nextState = nextState.copy(remoteUnlockRequests = mergedRequests)
+            }
+            var temporaryState = preferences[TEMPORARY_UNLOCKS].orEmpty()
+                .toTemporaryUnlockState()
+                .forToday()
+            val existingCommandIds = nextState.remoteCommands.map { command -> command.id }.toSet()
+            val newCommands = fetchedCommands
+                .filter { command -> command.status == RemoteParentCommandStatus.Applied }
+                .filter { command -> command.id !in existingCommandIds }
+                .sortedBy { command -> command.timestampMillis }
+            newCommands.forEach { command ->
+                temporaryState = temporaryState.applyRemoteCommand(command)
+                appendEvent(preferences, EventLogType.Info, "Remote command applied from cloud: ${command.message}")
+            }
+            if (newCommands.isNotEmpty()) {
+                preferences[TEMPORARY_UNLOCKS] = temporaryState.toTemporaryUnlocksEncoded()
+                nextState = nextState.copy(
+                    remoteCommands = (newCommands.asReversed() + nextState.remoteCommands)
+                        .distinctBy { command -> command.id }
+                        .take(MAX_REMOTE_PARENT_COMMANDS),
+                )
+            }
+            preferences[PARENT_MANAGEMENT_STATE] = nextState.toParentManagementStateEncoded()
         }
     }
 
@@ -488,6 +1203,345 @@ class SettingsRepository(
             cleared = true
         }
         return cleared
+    }
+
+    suspend fun createRemoteUnlockRequest(
+        blockReason: RemoteRequestBlockReason,
+        targetPackageName: String,
+        targetAppName: String,
+        targetGroupName: String,
+        scheduleName: String,
+        usedMillis: Long,
+        limitMillis: Long?,
+        alreadyGrantedExtraMinutes: Int,
+        unlockedForToday: Boolean,
+        requestedMinutes: Int,
+        childMessage: String = "",
+    ): Boolean {
+        if (requestedMinutes <= 0) {
+            return false
+        }
+        var created = false
+        var createdRequest: RemoteUnlockRequest? = null
+        var reusedExistingRequest = false
+        dataStore.edit { preferences ->
+            val parentState = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            val now = System.currentTimeMillis()
+            if (!parentState.paired) {
+                appendEvent(preferences, EventLogType.Warning, "Remote unlock request failed: parent account not paired")
+                return@edit
+            }
+            val cleanedRequests = parentState.remoteUnlockRequests
+                .map { request -> request.expireIfNeeded(now) }
+            val reusableRequest = cleanedRequests.firstOrNull { request ->
+                request.status == RemoteUnlockRequestStatus.Pending &&
+                    request.expiresAtMillis >= now &&
+                    request.isSameRemoteRequestTarget(
+                        blockReason = blockReason,
+                        targetPackageName = targetPackageName,
+                        targetGroupName = targetGroupName,
+                        scheduleName = scheduleName,
+                    )
+            }
+            if (reusableRequest != null) {
+                val refreshedRequest = reusableRequest.copy(
+                    expiresAtMillis = now + REMOTE_UNLOCK_REQUEST_TTL_MILLIS,
+                    usedMillis = usedMillis.coerceAtLeast(0L),
+                    limitMillis = limitMillis?.coerceAtLeast(0L),
+                    alreadyGrantedExtraMinutes = alreadyGrantedExtraMinutes.coerceAtLeast(0),
+                    unlockedForToday = unlockedForToday,
+                    requestedMinutes = requestedMinutes.coerceAtLeast(0),
+                    childMessage = childMessage.trim(),
+                )
+                preferences[PARENT_MANAGEMENT_STATE] = parentState.copy(
+                    childDeviceId = parentState.childDeviceId.ifBlank { refreshedRequest.childDeviceId },
+                    lastSyncMillis = now,
+                    remoteUnlockRequests = (listOf(refreshedRequest) + cleanedRequests.filterNot { request ->
+                        request.id == refreshedRequest.id
+                    })
+                        .sortedByDescending { request -> request.createdAtMillis }
+                        .take(MAX_REMOTE_UNLOCK_REQUESTS),
+                ).toParentManagementStateEncoded()
+                appendEvent(
+                    preferences,
+                    EventLogType.Info,
+                    "Remote unlock request reused: ${blockReason.toStorageValue()} ${targetAppName.ifBlank { targetGroupName.ifBlank { targetPackageName } }}",
+                )
+                created = true
+                createdRequest = refreshedRequest
+                reusedExistingRequest = true
+                return@edit
+            }
+            val request = RemoteUnlockRequest(
+                id = UUID.randomUUID().toString(),
+                childDeviceId = parentState.childDeviceId.ifBlank { UUID.randomUUID().toString() },
+                childDeviceName = parentState.childDeviceName.ifBlank { "Child device" },
+                createdAtMillis = now,
+                expiresAtMillis = now + REMOTE_UNLOCK_REQUEST_TTL_MILLIS,
+                blockReason = blockReason,
+                targetPackageName = targetPackageName,
+                targetAppName = targetAppName,
+                targetGroupName = targetGroupName,
+                scheduleName = scheduleName,
+                usedMillis = usedMillis.coerceAtLeast(0L),
+                limitMillis = limitMillis?.coerceAtLeast(0L),
+                alreadyGrantedExtraMinutes = alreadyGrantedExtraMinutes.coerceAtLeast(0),
+                unlockedForToday = unlockedForToday,
+                requestedMinutes = requestedMinutes.coerceAtLeast(0),
+                childMessage = childMessage.trim(),
+                status = RemoteUnlockRequestStatus.Pending,
+            )
+            preferences[PARENT_MANAGEMENT_STATE] = parentState.copy(
+                childDeviceId = parentState.childDeviceId.ifBlank { request.childDeviceId },
+                lastSyncMillis = now,
+                remoteUnlockRequests = (listOf(request) + cleanedRequests)
+                    .take(MAX_REMOTE_UNLOCK_REQUESTS),
+            ).toParentManagementStateEncoded()
+            appendEvent(
+                preferences,
+                EventLogType.Safety,
+                "Remote unlock requested: ${blockReason.toStorageValue()} ${targetAppName.ifBlank { targetGroupName.ifBlank { targetPackageName } }} +${requestedMinutes.toTimeLabel()}",
+            )
+            created = true
+            createdRequest = request
+        }
+        val request = createdRequest ?: return false
+        val remoteResult = parentRemoteSyncDataSource.publishUnlockRequest(request)
+        recordParentRemoteSyncResult(
+            action = "publish unlock request",
+            result = remoteResult,
+        )
+        if (remoteResult != ParentRemoteSyncResult.Success) {
+            if (!reusedExistingRequest) {
+                dataStore.edit { preferences ->
+                    val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+                    preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                        remoteUnlockRequests = current.remoteUnlockRequests.filterNot { item ->
+                            item.id == request.id
+                        },
+                    ).toParentManagementStateEncoded()
+                }
+            }
+            return false
+        }
+        return created
+    }
+
+    suspend fun approveRemoteUnlockRequest(requestId: String, extraMinutes: Int, unlockForToday: Boolean): Boolean {
+        if (requestId.isBlank()) {
+            return false
+        }
+        var approved = false
+        var approvedRequest: RemoteUnlockRequest? = null
+        var approvedDecision: ParentRemoteUnlockDecision? = null
+        var approvedCommandId = ""
+        var previousTemporaryUnlocksEncoded = ""
+        dataStore.edit { preferences ->
+            val parentState = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            val now = System.currentTimeMillis()
+            val request = parentState.remoteUnlockRequests.firstOrNull { request -> request.id == requestId }
+            if (request == null) {
+                appendEvent(preferences, EventLogType.Warning, "Remote request approve failed: request not found")
+                return@edit
+            }
+            if (request.status != RemoteUnlockRequestStatus.Pending || request.expiresAtMillis < now) {
+                val expiredStatus = if (request.expiresAtMillis < now) {
+                    RemoteUnlockRequestStatus.Expired
+                } else {
+                    request.status
+                }
+                preferences[PARENT_MANAGEMENT_STATE] = parentState.copy(
+                    lastSyncMillis = now,
+                    remoteUnlockRequests = parentState.remoteUnlockRequests.map { item ->
+                        if (item.id == requestId) item.copy(status = expiredStatus) else item
+                    },
+                ).toParentManagementStateEncoded()
+                appendEvent(preferences, EventLogType.Warning, "Remote request approve failed: ${expiredStatus.toStorageValue()}")
+                return@edit
+            }
+
+            val currentTemporaryState = preferences[TEMPORARY_UNLOCKS].orEmpty()
+                .toTemporaryUnlockState()
+                .forToday()
+            previousTemporaryUnlocksEncoded = preferences[TEMPORARY_UNLOCKS].orEmpty()
+            val targetIsDaily = request.blockReason == RemoteRequestBlockReason.DailyLimit
+            val nextTemporaryState = if (unlockForToday) {
+                if (targetIsDaily) {
+                    currentTemporaryState.copy(totalUnlockedForToday = true)
+                } else {
+                    val currentAllowance =
+                        currentTemporaryState.packageAllowances[request.targetPackageName] ?: TemporaryPackageAllowance()
+                    currentTemporaryState.copy(
+                        packageAllowances = currentTemporaryState.packageAllowances + (
+                            request.targetPackageName to currentAllowance.copy(unlockedForToday = true)
+                        ),
+                    )
+                }
+            } else {
+                val safeExtraMinutes = extraMinutes.coerceAtLeast(1)
+                if (targetIsDaily) {
+                    currentTemporaryState.copy(
+                        totalExtraMinutes = (currentTemporaryState.totalExtraMinutes + safeExtraMinutes)
+                            .coerceAtMost(MAX_TEMPORARY_EXTRA_MINUTES),
+                    )
+                } else {
+                    if (request.targetPackageName.isBlank()) {
+                        appendEvent(preferences, EventLogType.Warning, "Remote request approve failed: target package missing")
+                        return@edit
+                    }
+                    val currentAllowance =
+                        currentTemporaryState.packageAllowances[request.targetPackageName] ?: TemporaryPackageAllowance()
+                    currentTemporaryState.copy(
+                        packageAllowances = currentTemporaryState.packageAllowances + (
+                            request.targetPackageName to currentAllowance.withExtraTime(
+                                extraMinutes = safeExtraMinutes,
+                                nowMillis = now,
+                            )
+                        ),
+                    )
+                }
+            }
+            preferences[TEMPORARY_UNLOCKS] = nextTemporaryState.toTemporaryUnlocksEncoded()
+
+            val commandType = when {
+                unlockForToday && targetIsDaily -> RemoteParentCommandType.UnlockTotalToday
+                unlockForToday -> RemoteParentCommandType.UnlockAppToday
+                targetIsDaily -> RemoteParentCommandType.AddTotalTime
+                else -> RemoteParentCommandType.AddAppTime
+            }
+            val commandMinutes = if (unlockForToday) 0 else extraMinutes.coerceAtLeast(1)
+            val commandTarget = request.targetAppName.ifBlank {
+                request.targetGroupName.ifBlank { request.targetPackageName }
+            }
+            val message = if (unlockForToday) {
+                "Remote parent approved unlock for today: ${request.blockReason.toStorageValue()} $commandTarget"
+            } else {
+                "Remote parent approved ${commandMinutes.toTimeLabel()}: ${request.blockReason.toStorageValue()} $commandTarget"
+            }
+            val command = RemoteParentCommand(
+                id = UUID.randomUUID().toString(),
+                timestampMillis = now,
+                type = commandType,
+                targetPackageName = request.targetPackageName,
+                targetAppName = commandTarget,
+                minutes = commandMinutes,
+                status = RemoteParentCommandStatus.Applied,
+                message = message,
+            )
+            approvedCommandId = command.id
+            preferences[PARENT_MANAGEMENT_STATE] = parentState.copy(
+                lastSyncMillis = now,
+                remoteCommands = (listOf(command) + parentState.remoteCommands).take(MAX_REMOTE_PARENT_COMMANDS),
+                remoteUnlockRequests = parentState.remoteUnlockRequests.map { item ->
+                    if (item.id == requestId) item.copy(status = RemoteUnlockRequestStatus.Approved) else item
+                }.take(MAX_REMOTE_UNLOCK_REQUESTS),
+            ).toParentManagementStateEncoded()
+            appendEvent(preferences, EventLogType.Info, message)
+            approved = true
+            approvedRequest = request
+            approvedDecision = ParentRemoteUnlockDecision(
+                requestId = requestId,
+                approved = true,
+                extraMinutes = commandMinutes,
+                unlockForToday = unlockForToday,
+                decidedAtMillis = now,
+            )
+        }
+        val request = approvedRequest
+        val decision = approvedDecision
+        if (request != null && decision != null) {
+            val remoteResult = parentRemoteSyncDataSource.publishUnlockDecision(request, decision)
+            recordParentRemoteSyncResult(
+                action = "publish unlock approval",
+                result = remoteResult,
+            )
+            if (remoteResult != ParentRemoteSyncResult.Success) {
+                dataStore.edit { preferences ->
+                    val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+                    preferences[TEMPORARY_UNLOCKS] = previousTemporaryUnlocksEncoded
+                    preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                        remoteCommands = current.remoteCommands.filterNot { command ->
+                            command.id == approvedCommandId
+                        },
+                        remoteUnlockRequests = current.remoteUnlockRequests.map { item ->
+                            if (item.id == requestId && item.status == RemoteUnlockRequestStatus.Approved) {
+                                item.copy(status = RemoteUnlockRequestStatus.Pending)
+                            } else {
+                                item
+                            }
+                        },
+                    ).toParentManagementStateEncoded()
+                    appendEvent(
+                        preferences,
+                        EventLogType.Warning,
+                        "Remote unlock approval rolled back: cloud publish failed",
+                    )
+                }
+                return false
+            }
+        }
+        return approved
+    }
+
+    suspend fun rejectRemoteUnlockRequest(requestId: String): Boolean {
+        if (requestId.isBlank()) {
+            return false
+        }
+        var rejected = false
+        var rejectedRequest: RemoteUnlockRequest? = null
+        var rejectedDecision: ParentRemoteUnlockDecision? = null
+        dataStore.edit { preferences ->
+            val parentState = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+            val now = System.currentTimeMillis()
+            val request = parentState.remoteUnlockRequests.firstOrNull { request -> request.id == requestId }
+            if (request == null) {
+                return@edit
+            }
+            preferences[PARENT_MANAGEMENT_STATE] = parentState.copy(
+                lastSyncMillis = now,
+                remoteUnlockRequests = parentState.remoteUnlockRequests.map { request ->
+                    if (request.id == requestId) request.copy(status = RemoteUnlockRequestStatus.Rejected) else request
+                }.take(MAX_REMOTE_UNLOCK_REQUESTS),
+            ).toParentManagementStateEncoded()
+            appendEvent(preferences, EventLogType.Info, "Remote unlock request rejected")
+            rejected = true
+            rejectedRequest = request
+            rejectedDecision = ParentRemoteUnlockDecision(
+                requestId = requestId,
+                approved = false,
+                decidedAtMillis = now,
+            )
+        }
+        val request = rejectedRequest
+        val decision = rejectedDecision
+        if (request != null && decision != null) {
+            val remoteResult = parentRemoteSyncDataSource.publishUnlockDecision(request, decision)
+            recordParentRemoteSyncResult(
+                action = "publish unlock rejection",
+                result = remoteResult,
+            )
+            if (remoteResult != ParentRemoteSyncResult.Success) {
+                dataStore.edit { preferences ->
+                    val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
+                    preferences[PARENT_MANAGEMENT_STATE] = current.copy(
+                        remoteUnlockRequests = current.remoteUnlockRequests.map { item ->
+                            if (item.id == requestId && item.status == RemoteUnlockRequestStatus.Rejected) {
+                                item.copy(status = RemoteUnlockRequestStatus.Pending)
+                            } else {
+                                item
+                            }
+                        },
+                    ).toParentManagementStateEncoded()
+                    appendEvent(
+                        preferences,
+                        EventLogType.Warning,
+                        "Remote unlock rejection rolled back: cloud publish failed",
+                    )
+                }
+                return false
+            }
+        }
+        return rejected
     }
 
     suspend fun saveUsagePolicySettings(settings: UsagePolicySettings, adminPin: String): Boolean {
@@ -621,9 +1675,7 @@ class SettingsRepository(
         }
         return updateTemporaryUnlocks(adminPin) { current ->
             val currentAllowance = current.packageAllowances[packageName] ?: TemporaryPackageAllowance()
-            val nextAllowance = currentAllowance.copy(
-                extraMinutes = (currentAllowance.extraMinutes + extraMinutes).coerceAtMost(MAX_TEMPORARY_EXTRA_MINUTES),
-            )
+            val nextAllowance = currentAllowance.withExtraTime(extraMinutes)
             current.copy(
                 packageAllowances = current.packageAllowances + (packageName to nextAllowance),
             ) to "Parent added ${extraMinutes.toTimeLabel()} for ${appName.ifBlank { packageName }} (today extra ${nextAllowance.extraMinutes.toTimeLabel()})"
@@ -676,9 +1728,7 @@ class SettingsRepository(
             minutes = extraMinutes,
         ) { current ->
             val currentAllowance = current.packageAllowances[packageName] ?: TemporaryPackageAllowance()
-            val nextAllowance = currentAllowance.copy(
-                extraMinutes = (currentAllowance.extraMinutes + extraMinutes).coerceAtMost(MAX_TEMPORARY_EXTRA_MINUTES),
-            )
+            val nextAllowance = currentAllowance.withExtraTime(extraMinutes)
             current.copy(packageAllowances = current.packageAllowances + (packageName to nextAllowance))
         }
     }
@@ -1001,6 +2051,23 @@ class SettingsRepository(
         return applied
     }
 
+    private suspend fun recordParentRemoteSyncResult(
+        action: String,
+        result: ParentRemoteSyncResult,
+    ) {
+        when (result) {
+            ParentRemoteSyncResult.Success -> Unit
+            ParentRemoteSyncResult.LocalOnly -> addEvent(
+                type = EventLogType.Warning,
+                message = "Parent remote sync unavailable: $action - cloud configuration missing",
+            )
+            is ParentRemoteSyncResult.Failed -> addEvent(
+                type = EventLogType.Warning,
+                message = "Parent remote sync failed: $action - ${result.reason}",
+            )
+        }
+    }
+
     private fun isAdminPinValid(preferences: Preferences, adminPin: String): Boolean {
         val savedPin = preferences[ADMIN_PIN] ?: DEFAULT_ADMIN_PIN
         return adminPin == savedPin
@@ -1030,7 +2097,7 @@ class SettingsRepository(
 
         val encodedEntry = listOf(
             System.currentTimeMillis().toString(),
-            type.name,
+            type.toStorageValue(),
             message.encodeForEventLog(),
         ).joinToString(FIELD_SEPARATOR)
 
@@ -1045,7 +2112,7 @@ class SettingsRepository(
             return null
         }
         val timestampMillis = parts[0].toLongOrNull() ?: return null
-        val type = EventLogType.entries.firstOrNull { type -> type.name == parts[1] } ?: return null
+        val type = parts[1].toEventLogTypeOrNull() ?: return null
         return EventLogEntry(
             timestampMillis = timestampMillis,
             type = type,
@@ -1221,6 +2288,11 @@ class SettingsRepository(
         private val APP_LIMITS_EXPANDED = booleanPreferencesKey("app_limits_expanded")
         private val SCHEDULE_BLOCKING_EXPANDED = booleanPreferencesKey("schedule_blocking_expanded")
         private val ALLOW_ONLY_MODE_EXPANDED = booleanPreferencesKey("allow_only_mode_expanded")
+        private val SETTINGS_LANGUAGE_EXPANDED = booleanPreferencesKey("settings_language_expanded")
+        private val SETTINGS_NOTIFICATION_EXPANDED = booleanPreferencesKey("settings_notification_expanded")
+        private val SETTINGS_PIN_EXPANDED = booleanPreferencesKey("settings_pin_expanded")
+        private val SETTINGS_PARENT_MANAGEMENT_EXPANDED = booleanPreferencesKey("settings_parent_management_expanded")
+        private val SETTINGS_EVENT_LOG_EXPANDED = booleanPreferencesKey("settings_event_log_expanded")
         private val EMERGENCY_UNLOCK_PIN = stringPreferencesKey("emergency_unlock_pin")
         private val ADMIN_PIN = stringPreferencesKey("admin_pin")
         private val APP_LANGUAGE = stringPreferencesKey("app_language")
@@ -1259,8 +2331,9 @@ class SettingsRepository(
         private const val FIELD_SEPARATOR = "|"
         private const val MAX_EVENT_LOG_ENTRIES = 50
         private const val MAX_POLICY_ALERT_KEYS = 120
-        private const val MAX_TEMPORARY_EXTRA_MINUTES = 720
         private const val MAX_REMOTE_PARENT_COMMANDS = 30
+        private const val MAX_REMOTE_UNLOCK_REQUESTS = 30
+        private const val REMOTE_UNLOCK_REQUEST_TTL_MILLIS = 10L * 60L * 1000L
         private const val MAX_CACHED_TODAY_USAGE_ENTRIES = 50
         private const val MINUTES_PER_DAY = 24 * 60
     }
@@ -1474,13 +2547,61 @@ private fun String.encodePolicyField(): String {
         .replace(";", "%3B")
         .replace("^", "%5E")
         .replace(":", "%3A")
+        .replace(",", "%2C")
 }
 
 private fun String.decodePolicyField(): String {
-    return replace("%3A", ":")
+    return replace("%2C", ",")
+        .replace("%3A", ":")
         .replace("%5E", "^")
         .replace("%3B", ";")
         .replace("%25", "%")
+}
+
+private fun TemporaryUnlockState.applyRemoteCommand(command: RemoteParentCommand): TemporaryUnlockState {
+    return when (command.type) {
+        RemoteParentCommandType.AddAppTime -> {
+            val packageName = command.targetPackageName
+            if (packageName.isBlank() || command.minutes <= 0) {
+                this
+            } else {
+                val currentAllowance = packageAllowances[packageName] ?: TemporaryPackageAllowance()
+                copy(
+                    packageAllowances = packageAllowances + (
+                        packageName to currentAllowance.withExtraTime(
+                            extraMinutes = command.minutes,
+                            nowMillis = command.timestampMillis.takeIf { timestamp -> timestamp > 0L }
+                                ?: System.currentTimeMillis(),
+                        )
+                    ),
+                )
+            }
+        }
+
+        RemoteParentCommandType.UnlockAppToday -> {
+            val packageName = command.targetPackageName
+            if (packageName.isBlank()) {
+                this
+            } else {
+                val currentAllowance = packageAllowances[packageName] ?: TemporaryPackageAllowance()
+                copy(
+                    packageAllowances = packageAllowances + (
+                        packageName to currentAllowance.copy(unlockedForToday = true)
+                    ),
+                )
+            }
+        }
+
+        RemoteParentCommandType.AddTotalTime -> {
+            if (command.minutes <= 0) {
+                this
+            } else {
+                copy(totalExtraMinutes = (totalExtraMinutes + command.minutes).coerceAtMost(MAX_TEMPORARY_EXTRA_MINUTES))
+            }
+        }
+
+        RemoteParentCommandType.UnlockTotalToday -> copy(totalUnlockedForToday = true)
+    }
 }
 
 private fun TemporaryUnlockState.toTemporaryUnlocksEncoded(): String {
@@ -1491,6 +2612,7 @@ private fun TemporaryUnlockState.toTemporaryUnlocksEncoded(): String {
                 packageName.encodePolicyField(),
                 allowance.extraMinutes.coerceAtLeast(0).toString(),
                 allowance.unlockedForToday.toString(),
+                allowance.temporaryAllowedUntilMillis.coerceAtLeast(0L).toString(),
             ).joinToString(TEMP_PACKAGE_FIELD_SEPARATOR)
         }
         .joinToString(TEMP_PACKAGE_SEPARATOR)
@@ -1517,14 +2639,22 @@ private fun String.toTemporaryUnlockState(): TemporaryUnlockState {
         .split(TEMP_PACKAGE_SEPARATOR)
         .mapNotNull { encodedPackage ->
             val packageParts = encodedPackage.split(TEMP_PACKAGE_FIELD_SEPARATOR)
-            if (packageParts.size != 3) {
+            if (packageParts.size !in 3..4) {
                 null
             } else {
                 val packageName = packageParts[0].decodePolicyField()
                 val extraMinutes = packageParts[1].toIntOrNull()?.coerceAtLeast(0) ?: 0
                 val unlockedForToday = packageParts[2].toBooleanStrictOrNull() ?: false
+                val temporaryAllowedUntilMillis = packageParts.getOrNull(3)
+                    ?.toLongOrNull()
+                    ?.coerceAtLeast(0L)
+                    ?: 0L
                 packageName.takeIf { name -> name.isNotBlank() }?.let { name ->
-                    name to TemporaryPackageAllowance(extraMinutes, unlockedForToday)
+                    name to TemporaryPackageAllowance(
+                        extraMinutes = extraMinutes,
+                        unlockedForToday = unlockedForToday,
+                        temporaryAllowedUntilMillis = temporaryAllowedUntilMillis,
+                    )
                 }
             }
         }
@@ -1546,6 +2676,18 @@ private fun ParentManagementState.toParentManagementStateEncoded(): String {
         childDeviceName.encodePolicyField(),
         lastSyncMillis.coerceAtLeast(0L).toString(),
         remoteCommands.toRemoteParentCommandsEncoded().encodePolicyField(),
+        remoteUnlockRequests.toRemoteUnlockRequestsEncoded().encodePolicyField(),
+        deviceRole.toStorageValue(),
+        pairingCode.encodePolicyField(),
+        linkedChildPairingCodes
+            .map { code -> code.normalizedPairingCode() }
+            .filter { code -> code.isNotBlank() }
+            .sorted()
+            .joinToString(",")
+            .encodePolicyField(),
+        linkedChildDevices.toLinkedChildDevicesEncoded().encodePolicyField(),
+        localProfileName.encodePolicyField(),
+        linkedParentDevices.toLinkedParentDevicesEncoded().encodePolicyField(),
     ).joinToString(PARENT_FIELD_SEPARATOR)
 }
 
@@ -1555,8 +2697,25 @@ private fun String.toParentManagementState(): ParentManagementState {
     }
 
     val parts = split(PARENT_FIELD_SEPARATOR)
-    if (parts.size != 6) {
+    if (parts.size !in 6..13) {
         return ParentManagementState()
+    }
+
+    val legacyLinkedChildren = if (parts.getOrNull(10).isNullOrBlank() && parts[2].decodePolicyField().isNotBlank()) {
+        listOf(
+            LinkedChildDevice(
+                childDeviceId = parts[2].decodePolicyField(),
+                childDeviceName = parts[3].decodePolicyField().ifBlank { "Child device" },
+                pairingCode = parts.getOrNull(9)
+                    ?.decodePolicyField()
+                    ?.split(",")
+                    ?.firstOrNull()
+                    .orEmpty(),
+                linkedAtMillis = parts[4].toLongOrNull()?.coerceAtLeast(0L) ?: 0L,
+            ),
+        )
+    } else {
+        emptyList()
     }
 
     return ParentManagementState(
@@ -1564,9 +2723,146 @@ private fun String.toParentManagementState(): ParentManagementState {
         parentAccountId = parts[1].decodePolicyField(),
         childDeviceId = parts[2].decodePolicyField(),
         childDeviceName = parts[3].decodePolicyField(),
+        localProfileName = parts.getOrNull(11)
+            ?.decodePolicyField()
+            .orEmpty()
+            .ifBlank { parts[1].decodePolicyField().ifBlank { parts[3].decodePolicyField() } },
         lastSyncMillis = parts[4].toLongOrNull()?.coerceAtLeast(0L) ?: 0L,
         remoteCommands = parts[5].decodePolicyField().toRemoteParentCommands(),
+        remoteUnlockRequests = parts.getOrNull(6)
+            ?.decodePolicyField()
+            ?.toRemoteUnlockRequests()
+            .orEmpty(),
+        deviceRole = parts.getOrNull(7)
+            ?.toParentDeviceRole()
+            ?: ParentDeviceRole.Child,
+        pairingCode = parts.getOrNull(8)
+            ?.decodePolicyField()
+            ?.normalizedPairingCode()
+            .orEmpty(),
+        linkedChildPairingCodes = parts.getOrNull(9)
+            ?.decodePolicyField()
+            ?.split(",")
+            ?.map { code -> code.normalizedPairingCode() }
+            ?.filter { code -> code.isNotBlank() }
+            ?.toSet()
+            .orEmpty(),
+        linkedChildDevices = parts.getOrNull(10)
+            ?.decodePolicyField()
+            ?.toLinkedChildDevices()
+            ?.ifEmpty { legacyLinkedChildren }
+            ?: legacyLinkedChildren,
+        linkedParentDevices = parts.getOrNull(12)
+            ?.decodePolicyField()
+            ?.toLinkedParentDevices()
+            .orEmpty(),
     )
+}
+
+private fun ParentManagementState.syncChildDevices(): List<LinkedChildDevice> {
+    val legacyChild = childDeviceId.takeIf { id -> id.isNotBlank() }?.let { id ->
+        LinkedChildDevice(
+            childDeviceId = id,
+            childDeviceName = childDeviceName.ifBlank { "Child device" },
+            linkedAtMillis = lastSyncMillis,
+        )
+    }
+    return (linkedChildDevices + listOfNotNull(legacyChild))
+        .filter { child -> child.childDeviceId.isNotBlank() }
+        .distinctBy { child -> child.childDeviceId }
+}
+
+private fun List<LinkedChildDevice>.mergeWithLocalLinkedChildren(
+    localChildren: List<LinkedChildDevice>,
+): List<LinkedChildDevice> {
+    if (isEmpty()) {
+        return localChildren
+    }
+    val remoteById = associateBy { child -> child.childDeviceId }
+    val mergedLocal = localChildren.mapNotNull { localChild ->
+        val remoteChild = remoteById[localChild.childDeviceId] ?: return@mapNotNull null
+        localChild.copy(
+            childDeviceName = remoteChild.childDeviceName.ifBlank { localChild.childDeviceName },
+            linkedAtMillis = remoteChild.linkedAtMillis.takeIf { linkedAt -> linkedAt > 0L }
+                ?: localChild.linkedAtMillis,
+        )
+    }
+    val localIds = mergedLocal.map { child -> child.childDeviceId }.toSet()
+    return (mergedLocal + filterNot { remoteChild -> remoteChild.childDeviceId in localIds })
+        .filter { child -> child.childDeviceId.isNotBlank() }
+        .distinctBy { child -> child.childDeviceId }
+}
+
+private fun List<LinkedChildDevice>.toLinkedChildDevicesEncoded(): String {
+    return distinctBy { child -> child.childDeviceId }
+        .filter { child -> child.childDeviceId.isNotBlank() }
+        .joinToString(LINKED_CHILD_SEPARATOR) { child ->
+            listOf(
+                child.childDeviceId.encodePolicyField(),
+                child.childDeviceName.encodePolicyField(),
+                child.pairingCode.encodePolicyField(),
+                child.linkedAtMillis.coerceAtLeast(0L).toString(),
+            ).joinToString(LINKED_CHILD_FIELD_SEPARATOR)
+        }
+}
+
+private fun String.toLinkedChildDevices(): List<LinkedChildDevice> {
+    if (isBlank()) {
+        return emptyList()
+    }
+    return split(LINKED_CHILD_SEPARATOR)
+        .mapNotNull { encodedChild ->
+            val parts = encodedChild.split(LINKED_CHILD_FIELD_SEPARATOR)
+            if (parts.size != 4) {
+                null
+            } else {
+                val childDeviceId = parts[0].decodePolicyField()
+                childDeviceId.takeIf { id -> id.isNotBlank() }?.let {
+                    LinkedChildDevice(
+                        childDeviceId = childDeviceId,
+                        childDeviceName = parts[1].decodePolicyField().ifBlank { "Child device" },
+                        pairingCode = parts[2].decodePolicyField(),
+                        linkedAtMillis = parts[3].toLongOrNull()?.coerceAtLeast(0L) ?: 0L,
+                    )
+                }
+            }
+        }
+        .distinctBy { child -> child.childDeviceId }
+}
+
+private fun List<LinkedParentDevice>.toLinkedParentDevicesEncoded(): String {
+    return distinctBy { parent -> parent.parentUid }
+        .filter { parent -> parent.parentUid.isNotBlank() }
+        .joinToString(LINKED_CHILD_SEPARATOR) { parent ->
+            listOf(
+                parent.parentUid.encodePolicyField(),
+                parent.parentDisplayName.encodePolicyField(),
+                parent.linkedAtMillis.coerceAtLeast(0L).toString(),
+            ).joinToString(LINKED_CHILD_FIELD_SEPARATOR)
+        }
+}
+
+private fun String.toLinkedParentDevices(): List<LinkedParentDevice> {
+    if (isBlank()) {
+        return emptyList()
+    }
+    return split(LINKED_CHILD_SEPARATOR)
+        .mapNotNull { encodedParent ->
+            val parts = encodedParent.split(LINKED_CHILD_FIELD_SEPARATOR)
+            if (parts.size != 3) {
+                null
+            } else {
+                val parentUid = parts[0].decodePolicyField()
+                parentUid.takeIf { id -> id.isNotBlank() }?.let {
+                    LinkedParentDevice(
+                        parentUid = parentUid,
+                        parentDisplayName = parts[1].decodePolicyField().ifBlank { "Parent device" },
+                        linkedAtMillis = parts[2].toLongOrNull()?.coerceAtLeast(0L) ?: 0L,
+                    )
+                }
+            }
+        }
+        .distinctBy { parent -> parent.parentUid }
 }
 
 private fun List<RemoteParentCommand>.toRemoteParentCommandsEncoded(): String {
@@ -1575,11 +2871,11 @@ private fun List<RemoteParentCommand>.toRemoteParentCommandsEncoded(): String {
             listOf(
                 command.id.encodePolicyField(),
                 command.timestampMillis.coerceAtLeast(0L).toString(),
-                command.type.name,
+                command.type.toStorageValue(),
                 command.targetPackageName.encodePolicyField(),
                 command.targetAppName.encodePolicyField(),
                 command.minutes.coerceAtLeast(0).toString(),
-                command.status.name,
+                command.status.toStorageValue(),
                 command.message.encodePolicyField(),
             ).joinToString(REMOTE_COMMAND_FIELD_SEPARATOR)
         }
@@ -1596,9 +2892,9 @@ private fun String.toRemoteParentCommands(): List<RemoteParentCommand> {
             if (parts.size != 8) {
                 null
             } else {
-                val type = RemoteParentCommandType.entries.firstOrNull { type -> type.name == parts[2] }
+                val type = parts[2].toRemoteParentCommandTypeOrNull()
                     ?: return@mapNotNull null
-                val status = RemoteParentCommandStatus.entries.firstOrNull { status -> status.name == parts[6] }
+                val status = parts[6].toRemoteParentCommandStatusOrNull()
                     ?: RemoteParentCommandStatus.Pending
                 RemoteParentCommand(
                     id = parts[0].decodePolicyField(),
@@ -1615,6 +2911,70 @@ private fun String.toRemoteParentCommands(): List<RemoteParentCommand> {
         .take(MAX_REMOTE_PARENT_COMMANDS_TOP_LEVEL)
 }
 
+private fun List<RemoteUnlockRequest>.toRemoteUnlockRequestsEncoded(): String {
+    return take(MAX_REMOTE_UNLOCK_REQUESTS_TOP_LEVEL)
+        .map { request ->
+            listOf(
+                request.id.encodePolicyField(),
+                request.childDeviceId.encodePolicyField(),
+                request.childDeviceName.encodePolicyField(),
+                request.createdAtMillis.coerceAtLeast(0L).toString(),
+                request.expiresAtMillis.coerceAtLeast(0L).toString(),
+                request.blockReason.toStorageValue(),
+                request.targetPackageName.encodePolicyField(),
+                request.targetAppName.encodePolicyField(),
+                request.targetGroupName.encodePolicyField(),
+                request.scheduleName.encodePolicyField(),
+                request.usedMillis.coerceAtLeast(0L).toString(),
+                request.limitMillis?.coerceAtLeast(0L)?.toString().orEmpty(),
+                request.alreadyGrantedExtraMinutes.coerceAtLeast(0).toString(),
+                request.unlockedForToday.toString(),
+                request.requestedMinutes.coerceAtLeast(0).toString(),
+                request.childMessage.encodePolicyField(),
+                request.status.toStorageValue(),
+            ).joinToString(REMOTE_REQUEST_FIELD_SEPARATOR)
+        }
+        .joinToString(REMOTE_REQUEST_SEPARATOR)
+}
+
+private fun String.toRemoteUnlockRequests(): List<RemoteUnlockRequest> {
+    if (isBlank()) {
+        return emptyList()
+    }
+    return split(REMOTE_REQUEST_SEPARATOR)
+        .mapNotNull { encodedRequest ->
+            val parts = encodedRequest.split(REMOTE_REQUEST_FIELD_SEPARATOR)
+            if (parts.size != 17) {
+                null
+            } else {
+                val blockReason = parts[5].toRemoteRequestBlockReasonOrNull()
+                    ?: return@mapNotNull null
+                val status = parts[16].toRemoteUnlockRequestStatusOrNull()
+                    ?: RemoteUnlockRequestStatus.Pending
+                RemoteUnlockRequest(
+                    id = parts[0].decodePolicyField(),
+                    childDeviceId = parts[1].decodePolicyField(),
+                    childDeviceName = parts[2].decodePolicyField(),
+                    createdAtMillis = parts[3].toLongOrNull()?.coerceAtLeast(0L) ?: 0L,
+                    expiresAtMillis = parts[4].toLongOrNull()?.coerceAtLeast(0L) ?: 0L,
+                    blockReason = blockReason,
+                    targetPackageName = parts[6].decodePolicyField(),
+                    targetAppName = parts[7].decodePolicyField(),
+                    targetGroupName = parts[8].decodePolicyField(),
+                    scheduleName = parts[9].decodePolicyField(),
+                    usedMillis = parts[10].toLongOrNull()?.coerceAtLeast(0L) ?: 0L,
+                    limitMillis = parts[11].toLongOrNull()?.coerceAtLeast(0L),
+                    alreadyGrantedExtraMinutes = parts[12].toIntOrNull()?.coerceAtLeast(0) ?: 0,
+                    unlockedForToday = parts[13].toBooleanStrictOrNull() ?: false,
+                    requestedMinutes = parts[14].toIntOrNull()?.coerceAtLeast(0) ?: 0,
+                    childMessage = parts[15].decodePolicyField(),
+                    status = status,
+                )
+            }
+        }
+        .take(MAX_REMOTE_UNLOCK_REQUESTS_TOP_LEVEL)
+}
+
 private fun RemoteParentCommandType.toRemoteCommandMessage(appName: String, minutes: Int): String {
     return when (this) {
         RemoteParentCommandType.AddAppTime ->
@@ -1628,6 +2988,43 @@ private fun RemoteParentCommandType.toRemoteCommandMessage(appName: String, minu
     }
 }
 
+private fun RemoteUnlockRequest.expireIfNeeded(nowMillis: Long): RemoteUnlockRequest {
+    return if (status == RemoteUnlockRequestStatus.Pending && expiresAtMillis > 0L && expiresAtMillis < nowMillis) {
+        copy(status = RemoteUnlockRequestStatus.Expired)
+    } else {
+        this
+    }
+}
+
+private fun RemoteUnlockRequest.isSameRemoteRequestTarget(
+    blockReason: RemoteRequestBlockReason,
+    targetPackageName: String,
+    targetGroupName: String,
+    scheduleName: String,
+): Boolean {
+    return this.blockReason == blockReason &&
+        this.targetPackageName == targetPackageName &&
+        this.targetGroupName == targetGroupName &&
+        this.scheduleName == scheduleName
+}
+
+private fun createPairingCode(): String {
+    val raw = UUID.randomUUID().toString()
+        .filter { char -> char.isLetterOrDigit() }
+        .take(6)
+        .uppercase()
+    return "SR-$raw"
+}
+
+private fun String.normalizedPairingCode(): String {
+    val raw = trim()
+        .uppercase()
+        .filter { char -> char.isLetterOrDigit() }
+        .removePrefix("SR")
+        .take(6)
+    return if (raw.isBlank()) "" else "SR-$raw"
+}
+
 private const val GROUP_SEPARATOR = ";"
 private const val GROUP_FIELD_SEPARATOR = "^"
 private const val EMPTY_APP_GROUPS_ENCODED = "__empty__"
@@ -1637,7 +3034,12 @@ private const val TEMP_PACKAGE_FIELD_SEPARATOR = ":"
 private const val PARENT_FIELD_SEPARATOR = "^"
 private const val REMOTE_COMMAND_SEPARATOR = ";"
 private const val REMOTE_COMMAND_FIELD_SEPARATOR = ":"
+private const val REMOTE_REQUEST_SEPARATOR = ";"
+private const val REMOTE_REQUEST_FIELD_SEPARATOR = ":"
+private const val LINKED_CHILD_SEPARATOR = ";"
+private const val LINKED_CHILD_FIELD_SEPARATOR = ":"
 private const val MAX_REMOTE_PARENT_COMMANDS_TOP_LEVEL = 30
+private const val MAX_REMOTE_UNLOCK_REQUESTS_TOP_LEVEL = 30
 private const val MAX_SCHEDULE_TEMPLATES = 12
 private const val SCHEDULE_MINUTES_PER_DAY = 24 * 60
 

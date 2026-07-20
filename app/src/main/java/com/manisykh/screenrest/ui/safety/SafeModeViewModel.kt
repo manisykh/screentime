@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.manisykh.screenrest.blocking.UsageMonitorForegroundService
@@ -16,6 +17,8 @@ import com.manisykh.screenrest.data.EventLogEntry
 import com.manisykh.screenrest.data.EventLogType
 import com.manisykh.screenrest.data.ForegroundDetectionStatus
 import com.manisykh.screenrest.data.ParentManagementState
+import com.manisykh.screenrest.data.ParentDeviceRole
+import com.manisykh.screenrest.data.ParentRemoteSyncDataSourceFactory
 import com.manisykh.screenrest.data.PolicySectionExpansionSettings
 import com.manisykh.screenrest.data.SettingsRepository
 import com.manisykh.screenrest.data.ScheduleTemplatePolicy
@@ -24,6 +27,7 @@ import com.manisykh.screenrest.data.TemporaryUnlockState
 import com.manisykh.screenrest.data.UsagePolicySettings
 import com.manisykh.screenrest.data.UsageMonitorStatus
 import com.manisykh.screenrest.data.activeScheduleAllowedPackages
+import com.manisykh.screenrest.data.temporaryRemainingMinutes
 import com.manisykh.screenrest.data.isScheduleBlockingNow
 import com.manisykh.screenrest.data.normalizedAppGroups
 import com.manisykh.screenrest.data.normalizedScheduleTemplates
@@ -33,7 +37,9 @@ import com.manisykh.screenrest.data.toScheduleTemplatesEncoded
 import com.manisykh.screenrest.data.settingsDataStore
 import com.manisykh.screenrest.data.toAppGroupsEncoded
 import com.manisykh.screenrest.notification.ScreenTimeNotificationListenerService
+import com.manisykh.screenrest.notification.ParentRemoteNotificationType
 import com.manisykh.screenrest.notification.UsageNotificationHelper
+import com.manisykh.screenrest.notification.detectParentRemoteNotifications
 import com.manisykh.screenrest.safety.BlockDecision
 import com.manisykh.screenrest.safety.BlockDecisionEngine
 import com.manisykh.screenrest.safety.BlockDecisionResult
@@ -51,8 +57,13 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -74,6 +85,9 @@ data class SafeModeUiState(
     val autoRecoveryStatus: AutoRecoveryStatus = AutoRecoveryStatus.Idle,
     val hasUsageAccess: Boolean = false,
     val usageAccessChecking: Boolean = false,
+    val statisticsRefreshing: Boolean = false,
+    val usageLastUpdatedAtMillis: Long = 0L,
+    val statisticsLastUpdatedAtMillis: Long = 0L,
     val todayUsage: List<AppUsageInfo> = emptyList(),
     val usageStatistics: UsageStatistics = UsageStatistics(),
     val installedApps: List<InstalledAppInfo> = emptyList(),
@@ -82,6 +96,7 @@ data class SafeModeUiState(
     val usagePolicySettings: UsagePolicySettings = UsagePolicySettings(),
     val temporaryUnlockState: TemporaryUnlockState = TemporaryUnlockState(),
     val policyDraftSettings: UsagePolicySettings = UsagePolicySettings(),
+    val policyDraftAllowedAppPackages: Set<String> = emptySet(),
     val policyDraftHasChanges: Boolean = false,
     val policyBudgetValidation: PolicyBudgetValidation = PolicyBudgetValidation(),
     val policySummary: PolicySummary = PolicySummary(),
@@ -100,6 +115,11 @@ data class SafeModeUiState(
     val appLimitsExpanded: Boolean = true,
     val scheduleBlockingExpanded: Boolean = true,
     val allowOnlyModeExpanded: Boolean = true,
+    val settingsLanguageExpanded: Boolean = true,
+    val settingsNotificationExpanded: Boolean = true,
+    val settingsPinExpanded: Boolean = true,
+    val settingsParentManagementExpanded: Boolean = true,
+    val settingsEventLogExpanded: Boolean = false,
 )
 
 data class UsageStatistics(
@@ -130,6 +150,7 @@ data class PolicySummary(
     val nextScheduleSummary: ScheduleSummary? = null,
     val allowOnlyModeEnabled: Boolean = false,
     val allowOnlyAllowedAppCount: Int = 0,
+    val temporaryAllowedApps: List<TemporaryAllowedAppSummary> = emptyList(),
     val warningCount: Int = 0,
     val exceededCount: Int = 0,
 )
@@ -144,6 +165,35 @@ data class ScheduleSummary(
     val activeNow: Boolean,
     val minutesUntilStart: Int? = null,
 )
+
+data class TemporaryAllowedAppSummary(
+    val appName: String,
+    val packageName: String,
+    val unlockedForToday: Boolean,
+    val temporaryRemainingMinutes: Int,
+)
+
+internal fun buildTemporaryAllowedAppSummaries(
+    temporaryUnlockState: TemporaryUnlockState,
+    appNameByPackage: Map<String, String>,
+    nowMillis: Long = System.currentTimeMillis(),
+): List<TemporaryAllowedAppSummary> {
+    return temporaryUnlockState.packageAllowances.mapNotNull { (packageName, allowance) ->
+        val remainingMinutes = allowance.temporaryRemainingMinutes(nowMillis)
+        if (!allowance.unlockedForToday && remainingMinutes <= 0) {
+            return@mapNotNull null
+        }
+        TemporaryAllowedAppSummary(
+            appName = appNameByPackage[packageName] ?: packageName,
+            packageName = packageName,
+            unlockedForToday = allowance.unlockedForToday,
+            temporaryRemainingMinutes = remainingMinutes,
+        )
+    }.sortedWith(
+        compareByDescending<TemporaryAllowedAppSummary> { summary -> summary.unlockedForToday }
+            .thenBy { summary -> summary.appName.lowercase() },
+    )
+}
 
 data class AppGroupSummary(
     val groupName: String,
@@ -162,6 +212,7 @@ data class GroupAppUsageSummary(
     val limitMinutes: Int? = null,
     val extraMinutes: Int = 0,
     val unlockedForToday: Boolean = false,
+    val temporaryRemainingMinutes: Int = 0,
 )
 
 data class AppLimitSummary(
@@ -171,6 +222,7 @@ data class AppLimitSummary(
     val limitMinutes: Int,
     val extraMinutes: Int = 0,
     val unlockedForToday: Boolean = false,
+    val temporaryRemainingMinutes: Int = 0,
     val status: LimitStatus,
 )
 
@@ -246,7 +298,10 @@ data class BlockingReadiness(
 }
 
 class SafeModeViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = SettingsRepository(application.settingsDataStore)
+    private val repository = SettingsRepository(
+        application.settingsDataStore,
+        ParentRemoteSyncDataSourceFactory.create(application),
+    )
     private val usageStatsRepository = UsageStatsRepository(application)
     private val appCatalogRepository = AppCatalogRepository(application)
     private val notificationHelper = UsageNotificationHelper(application)
@@ -263,13 +318,16 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
     )
     private val policySaveStatus = MutableStateFlow(PolicySaveStatus.Idle)
     private val policyDraftSettings = MutableStateFlow<UsagePolicySettings?>(null)
+    private val policyDraftAllowedAppPackages = MutableStateFlow<Set<String>?>(null)
     private val pinChangeStatus = MutableStateFlow(PinChangeStatus.Idle)
     private val safeModePinStatus = MutableStateFlow(SafeModePinStatus.Idle)
     private var refreshUsageJob: Job? = null
     private var alertEvaluationJob: Job? = null
     private var refreshInstalledAppsJob: Job? = null
+    private var parentRemoteListenerJob: Job? = null
     private var lastUsageRefreshAtMillis: Long = 0L
     private var lastInstalledAppsRefreshAtMillis: Long = 0L
+    private var lastParentForegroundSyncAtMillis: Long = 0L
     private var usageRefreshGeneration: Long = 0L
     private var usageAccessDeniedCount: Int = 0
 
@@ -370,8 +428,12 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
     private val transientState = combine(
         transientBaseState,
         policyDraftSettings,
-    ) { transientState, draftSettings ->
-        transientState.copy(policyDraftSettings = draftSettings)
+        policyDraftAllowedAppPackages,
+    ) { transientState, draftSettings, draftAllowedPackages ->
+        transientState.copy(
+            policyDraftSettings = draftSettings,
+            policyDraftAllowedAppPackages = draftAllowedPackages,
+        )
     }
 
     val uiState: StateFlow<SafeModeUiState> = combine(
@@ -381,6 +443,8 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         val savedSettings = persistedState.usagePolicySettings.normalizedForDraft()
         val draftSettings = (transientState.policyDraftSettings ?: persistedState.usagePolicySettings)
             .normalizedForDraft()
+        val savedAllowedPackages = persistedState.allowedAppPackages
+        val draftAllowedPackages = transientState.policyDraftAllowedAppPackages ?: savedAllowedPackages
         val todayUsage = transientState.usageState.todayUsage
             .withInstalledAppNames(transientState.usageState.installedApps)
             .withMonitorStatusUsage(
@@ -395,7 +459,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         val policySummary = buildPolicySummary(
             settings = draftSettings,
             temporaryUnlockState = persistedState.temporaryUnlockState,
-            allowedAppPackages = persistedState.allowedAppPackages,
+            allowedAppPackages = draftAllowedPackages,
             todayUsage = todayUsage,
             installedApps = transientState.usageState.installedApps,
         )
@@ -409,6 +473,9 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             autoRecoveryStatus = transientState.autoRecoveryStatus,
             hasUsageAccess = transientState.usageState.hasUsageAccess,
             usageAccessChecking = transientState.usageState.usageAccessChecking,
+            statisticsRefreshing = transientState.usageState.statisticsRefreshing,
+            usageLastUpdatedAtMillis = transientState.usageState.usageLastUpdatedAtMillis,
+            statisticsLastUpdatedAtMillis = transientState.usageState.statisticsLastUpdatedAtMillis,
             todayUsage = todayUsage.take(50),
             usageStatistics = UsageStatistics(
                 dailyUsage = transientState.usageState.dailyUsage,
@@ -419,12 +486,13 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                 ),
             ),
             installedApps = transientState.usageState.installedApps,
-            allowedAppPackages = persistedState.allowedAppPackages,
+            allowedAppPackages = draftAllowedPackages,
             parentManagementState = persistedState.parentManagementState,
             usagePolicySettings = persistedState.usagePolicySettings,
             temporaryUnlockState = persistedState.temporaryUnlockState,
             policyDraftSettings = draftSettings,
-            policyDraftHasChanges = draftSettings != savedSettings,
+            policyDraftAllowedAppPackages = draftAllowedPackages,
+            policyDraftHasChanges = draftSettings != savedSettings || draftAllowedPackages != savedAllowedPackages,
             policyBudgetValidation = budgetValidation,
             policySummary = policySummary,
             policySaveStatus = transientState.policySaveStatus,
@@ -443,14 +511,14 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                 notificationPermissionReady = transientState.usageState.notificationPermissionReady,
                 notificationAccessReady = transientState.usageState.notificationAccessReady,
                 exactAlarmReady = transientState.usageState.exactAlarmReady,
-                allowedAppPackages = persistedState.allowedAppPackages,
+                allowedAppPackages = draftAllowedPackages,
             ),
             blockDecisionResults = buildBlockDecisionResults(
                 safeModeEnabled = persistedState.safeModeEnabled,
                 policyEnforcementEnabled = persistedState.policyEnforcementEnabled,
                 settings = persistedState.usagePolicySettings,
                 temporaryUnlockState = persistedState.temporaryUnlockState,
-                allowedAppPackages = persistedState.allowedAppPackages,
+                allowedAppPackages = draftAllowedPackages,
                 todayUsage = todayUsage,
                 installedApps = transientState.usageState.installedApps,
                 summary = policySummary,
@@ -460,6 +528,11 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             appLimitsExpanded = persistedState.policySectionExpansionSettings.appLimitsExpanded,
             scheduleBlockingExpanded = persistedState.policySectionExpansionSettings.scheduleBlockingExpanded,
             allowOnlyModeExpanded = persistedState.policySectionExpansionSettings.allowOnlyModeExpanded,
+            settingsLanguageExpanded = persistedState.policySectionExpansionSettings.settingsLanguageExpanded,
+            settingsNotificationExpanded = persistedState.policySectionExpansionSettings.settingsNotificationExpanded,
+            settingsPinExpanded = persistedState.policySectionExpansionSettings.settingsPinExpanded,
+            settingsParentManagementExpanded = persistedState.policySectionExpansionSettings.settingsParentManagementExpanded,
+            settingsEventLogExpanded = persistedState.policySectionExpansionSettings.settingsEventLogExpanded,
         )
     }
         .flowOn(Dispatchers.Default)
@@ -481,6 +554,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             runDailyRolloverLoop()
         }
+        observeParentRemoteChanges()
         viewModelScope.launch {
             combine(
                 usageState,
@@ -502,6 +576,98 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    private fun observeParentRemoteChanges() {
+        viewModelScope.launch {
+            repository.parentManagementState
+                .map(::parentListenerChildIds)
+                .distinctUntilChanged()
+                .collect(::restartParentRemoteListener)
+        }
+    }
+
+    private fun restartParentRemoteListener(childDeviceIds: Set<String>) {
+        parentRemoteListenerJob?.cancel()
+        parentRemoteListenerJob = null
+        if (childDeviceIds.isEmpty()) {
+            return
+        }
+        parentRemoteListenerJob = viewModelScope.launch(Dispatchers.IO) {
+            repository.observeParentRemoteChanges(childDeviceIds)
+                .filter { change -> !change.fromCache && !change.hasPendingWrites }
+                .conflate()
+                .retryWhen { error, attempt ->
+                    Log.w("STM-ParentSync", "Firestore listener disconnected; retry=$attempt", error)
+                    if (attempt == 0L) {
+                        runCatching {
+                            repository.addEvent(
+                                EventLogType.Warning,
+                                "Parent listener disconnected; automatic retry scheduled",
+                            )
+                        }
+                    }
+                    delay(parentListenerRetryDelayMillis(attempt))
+                    true
+                }
+                .collect {
+                    synchronizeParentStateFromListener()
+                }
+        }
+    }
+
+    private suspend fun synchronizeParentStateFromListener() {
+        val before = repository.parentManagementState.first()
+        var after = before
+        for (attempt in 0 until PARENT_LISTENER_SYNC_RETRY_COUNT) {
+            repository.syncParentDevice()
+            after = repository.parentManagementState.first()
+            if (
+                after.lastSyncMillis > before.lastSyncMillis ||
+                after.remoteUnlockRequests != before.remoteUnlockRequests ||
+                after.remoteCommands != before.remoteCommands
+            ) {
+                break
+            }
+            if (attempt < PARENT_LISTENER_SYNC_RETRY_COUNT - 1) {
+                delay(PARENT_LISTENER_SYNC_RETRY_DELAY_MILLIS)
+            }
+        }
+
+        val notifications = detectParentRemoteNotifications(
+            before = before,
+            after = after,
+            nowMillis = System.currentTimeMillis(),
+        )
+        if (notifications.isEmpty()) {
+            return
+        }
+        val korean = repository.appLanguage.first() == AppLanguage.Korean
+        notifications.forEach { notification ->
+            val request = notification.request
+            val target = request.targetAppName
+                .ifBlank { request.targetGroupName }
+                .ifBlank { request.targetPackageName }
+                .ifBlank { "ScreenRest" }
+            val message = when (notification.type) {
+                ParentRemoteNotificationType.NewPendingRequest -> if (korean) {
+                    "자녀 기기에서 사용 시간 요청을 보냈습니다: $target"
+                } else {
+                    "A child device requested more time: $target"
+                }
+                ParentRemoteNotificationType.RequestApproved -> if (korean) {
+                    "부모가 사용 시간 요청을 승인했습니다: $target"
+                } else {
+                    "The parent approved the time request: $target"
+                }
+                ParentRemoteNotificationType.RequestRejected -> if (korean) {
+                    "부모가 사용 시간 요청을 거절했습니다: $target"
+                } else {
+                    "The parent rejected the time request: $target"
+                }
+            }
+            notificationHelper.showPolicyAlert(title = "ScreenRest", message = message)
+        }
+    }
+
     fun refreshForForeground(force: Boolean = false) {
         resetUsageIfDateChanged()
         refreshSystemPermissionStates()
@@ -516,6 +682,17 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         if (force || now - lastUsageRefreshAtMillis >= USAGE_REFRESH_THROTTLE_MILLIS) {
             lastUsageRefreshAtMillis = now
             refreshUsageStatsInternal(force = force, includeStatistics = false)
+        }
+        if (force || now - lastParentForegroundSyncAtMillis >= PARENT_SYNC_FOREGROUND_THROTTLE_MILLIS) {
+            lastParentForegroundSyncAtMillis = now
+            viewModelScope.launch {
+                val parentState = repository.parentManagementState.first()
+                val hasSyncTarget = parentState.childDeviceId.isNotBlank() ||
+                    parentState.linkedChildDevices.any { child -> child.childDeviceId.isNotBlank() }
+                if (parentState.paired && hasSyncTarget) {
+                    repository.syncParentDevice()
+                }
+            }
         }
     }
 
@@ -549,6 +726,9 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             usageState.value = currentState.copy(
                 dateKey = todayKey,
                 usageAccessChecking = currentState.hasUsageAccess,
+                statisticsRefreshing = false,
+                usageLastUpdatedAtMillis = 0L,
+                statisticsLastUpdatedAtMillis = 0L,
                 todayUsage = emptyList(),
                 dailyUsage = emptyList(),
                 topAppsSevenDays = emptyList(),
@@ -650,6 +830,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                     usageState.value = currentState.copy(
                         dateKey = currentUsageDateKey(),
                         usageAccessChecking = currentState.hasUsageAccess || currentState.todayUsage.isNotEmpty(),
+                        statisticsRefreshing = includeStatistics,
                     )
                 }
 
@@ -701,65 +882,8 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                     }
                 }
 
-                val todayUsage = try {
-                    withTimeoutOrNull(USAGE_QUERY_TIMEOUT_MILLIS) {
-                        usageStatsRepository.getTodayUsage(maxItems = 500, skipAccessCheck = true)
-                    }
-                } catch (exception: Exception) {
-                    if (exception is CancellationException) {
-                        throw exception
-                    }
-                    null
-                }
-                val dailyUsage = try {
-                    if (!includeStatistics) {
-                        null
-                    } else {
-                        withTimeoutOrNull(USAGE_QUERY_TIMEOUT_MILLIS) {
-                            usageStatsRepository.getDailyUsage(days = STATISTICS_DAYS, skipAccessCheck = true)
-                        }
-                    }
-                } catch (exception: Exception) {
-                    if (exception is CancellationException) {
-                        throw exception
-                    }
-                    null
-                }
-                val topAppsSevenDays = try {
-                    if (!includeStatistics) {
-                        null
-                    } else {
-                        withTimeoutOrNull(USAGE_QUERY_TIMEOUT_MILLIS) {
-                            usageStatsRepository.getTopAppsUsage(
-                                days = 7,
-                                maxItems = STATISTICS_TOP_APP_LIMIT,
-                                skipAccessCheck = true,
-                            )
-                        }
-                    }
-                } catch (exception: Exception) {
-                    if (exception is CancellationException) {
-                        throw exception
-                    }
-                    null
-                }
-                val topAppsThirtyDays = try {
-                    if (!includeStatistics) {
-                        null
-                    } else {
-                        withTimeoutOrNull(USAGE_QUERY_TIMEOUT_MILLIS) {
-                            usageStatsRepository.getTopAppsUsage(
-                                days = STATISTICS_DAYS,
-                                maxItems = STATISTICS_TOP_APP_LIMIT,
-                                skipAccessCheck = true,
-                            )
-                        }
-                    }
-                } catch (exception: Exception) {
-                    if (exception is CancellationException) {
-                        throw exception
-                    }
-                    null
+                val todayUsage = queryUsageWithRetry {
+                    usageStatsRepository.getTodayUsage(maxItems = 500, skipAccessCheck = true)
                 }
                 if (todayUsage != null) {
                     if (!isCurrentRefresh()) return@launch
@@ -780,14 +904,8 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                         dateKey = todayKey,
                         hasUsageAccess = true,
                         usageAccessChecking = false,
+                        usageLastUpdatedAtMillis = System.currentTimeMillis(),
                         todayUsage = stableTodayUsage.withInstalledAppNames(installedApps),
-                        dailyUsage = dailyUsage ?: previousState.dailyUsage,
-                        topAppsSevenDays = topAppsSevenDays
-                            ?.withInstalledAppNames(installedApps)
-                            ?: previousState.topAppsSevenDays,
-                        topAppsThirtyDays = topAppsThirtyDays
-                            ?.withInstalledAppNames(installedApps)
-                            ?: previousState.topAppsThirtyDays,
                         installedApps = installedApps,
                     )
                     repository.saveTodayUsageCache(
@@ -806,12 +924,96 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                 } else if (isCurrentRefresh()) {
                     usageState.value = usageState.value.copy(usageAccessChecking = false)
                 }
+
+                if (includeStatistics && todayUsage != null && isCurrentRefresh()) {
+                    val dailyUsage = queryUsageWithRetry {
+                        usageStatsRepository.getDailyUsage(
+                            days = STATISTICS_DAYS,
+                            skipAccessCheck = true,
+                        )
+                    }
+                    val topAppsSevenDays = queryUsageWithRetry {
+                        usageStatsRepository.getTopAppsUsage(
+                            days = 7,
+                            maxItems = STATISTICS_TOP_APP_LIMIT,
+                            skipAccessCheck = true,
+                        )
+                    }
+                    val topAppsThirtyDays = queryUsageWithRetry {
+                        usageStatsRepository.getTopAppsUsage(
+                            days = STATISTICS_DAYS,
+                            maxItems = STATISTICS_TOP_APP_LIMIT,
+                            skipAccessCheck = true,
+                        )
+                    }
+                    if (!isCurrentRefresh()) return@launch
+                    val previousState = usageState.value
+                    val installedApps = previousState.installedApps
+                    val statisticsQueryCompleted = dailyUsage != null ||
+                        topAppsSevenDays != null ||
+                        topAppsThirtyDays != null
+                    val statisticsQueryHasData = dailyUsage?.isNotEmpty() == true ||
+                        topAppsSevenDays?.isNotEmpty() == true ||
+                        topAppsThirtyDays?.isNotEmpty() == true
+                    val previousStatisticsHasData = previousState.dailyUsage.isNotEmpty() ||
+                        previousState.topAppsSevenDays.isNotEmpty() ||
+                        previousState.topAppsThirtyDays.isNotEmpty()
+                    val statisticsUpdated = statisticsQueryCompleted &&
+                        (statisticsQueryHasData || !previousStatisticsHasData)
+                    usageState.value = previousState.copy(
+                        statisticsRefreshing = false,
+                        statisticsLastUpdatedAtMillis = if (statisticsUpdated) {
+                            System.currentTimeMillis()
+                        } else {
+                            previousState.statisticsLastUpdatedAtMillis
+                        },
+                        dailyUsage = dailyUsage
+                            ?.takeUnless { usage -> usage.isEmpty() && previousState.dailyUsage.isNotEmpty() }
+                            ?: previousState.dailyUsage,
+                        topAppsSevenDays = topAppsSevenDays
+                            ?.takeUnless { usage -> usage.isEmpty() && previousState.topAppsSevenDays.isNotEmpty() }
+                            ?.withInstalledAppNames(installedApps)
+                            ?: previousState.topAppsSevenDays,
+                        topAppsThirtyDays = topAppsThirtyDays
+                            ?.takeUnless { usage -> usage.isEmpty() && previousState.topAppsThirtyDays.isNotEmpty() }
+                            ?.withInstalledAppNames(installedApps)
+                            ?: previousState.topAppsThirtyDays,
+                    )
+                }
             } finally {
-                if (isCurrentRefresh() && usageState.value.usageAccessChecking) {
-                    usageState.value = usageState.value.copy(usageAccessChecking = false)
+                if (
+                    isCurrentRefresh() &&
+                    (usageState.value.usageAccessChecking || usageState.value.statisticsRefreshing)
+                ) {
+                    usageState.value = usageState.value.copy(
+                        usageAccessChecking = false,
+                        statisticsRefreshing = false,
+                    )
                 }
             }
         }
+    }
+
+    private suspend fun <T> queryUsageWithRetry(query: suspend () -> T): T? {
+        repeat(USAGE_QUERY_RETRY_COUNT) { attempt ->
+            val result = try {
+                withTimeoutOrNull(USAGE_QUERY_TIMEOUT_MILLIS) {
+                    query()
+                }
+            } catch (exception: Exception) {
+                if (exception is CancellationException) {
+                    throw exception
+                }
+                null
+            }
+            if (result != null) {
+                return result
+            }
+            if (attempt < USAGE_QUERY_RETRY_COUNT - 1) {
+                delay(USAGE_QUERY_RETRY_DELAY_MILLIS * (attempt + 1L))
+            }
+        }
+        return null
     }
 
     private fun scheduleUsageAccessRetry(generation: Long) {
@@ -849,6 +1051,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
 
     fun resetPolicyDraft() {
         policyDraftSettings.value = null
+        policyDraftAllowedAppPackages.value = null
         policySaveStatus.value = PolicySaveStatus.Idle
     }
 
@@ -856,6 +1059,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             val draftSettings = (policyDraftSettings.value ?: uiState.value.usagePolicySettings)
                 .normalizedForDraft()
+            val draftAllowedPackages = policyDraftAllowedAppPackages.value ?: uiState.value.allowedAppPackages
             if (draftSettings.policyBudgetValidation().hasOverflow) {
                 policySaveStatus.value = PolicySaveStatus.BudgetExceeded
                 return@launch
@@ -863,13 +1067,21 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
 
             val saved = repository.saveUsagePolicySettings(draftSettings, adminPin)
             policySaveStatus.value = if (saved) {
+                repository.setAllowedAppPackages(draftAllowedPackages)
                 policyDraftSettings.value = draftSettings
+                policyDraftAllowedAppPackages.value = draftAllowedPackages
                 viewModelScope.launch {
                     repository.usagePolicySettings.first { savedSettings ->
                         savedSettings.normalizedForDraft() == draftSettings
                     }
+                    repository.allowedAppPackages.first { savedAllowedPackages ->
+                        savedAllowedPackages == draftAllowedPackages
+                    }
                     if (policyDraftSettings.value == draftSettings) {
                         policyDraftSettings.value = null
+                    }
+                    if (policyDraftAllowedAppPackages.value == draftAllowedPackages) {
+                        policyDraftAllowedAppPackages.value = null
                     }
                 }
                 evaluatePolicyAlertsAsync()
@@ -914,9 +1126,68 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun setParentDeviceRole(role: ParentDeviceRole, adminPin: String) {
+        viewModelScope.launch {
+            repository.setParentDeviceRole(role, adminPin)
+        }
+    }
+
+    fun setParentProfileName(profileName: String) {
+        viewModelScope.launch {
+            if (repository.setParentProfileName(profileName)) {
+                repository.syncParentDevice()
+            }
+        }
+    }
+
+    fun generateChildPairingCode(adminPin: String) {
+        viewModelScope.launch {
+            val success = repository.generateChildPairingCode(adminPin)
+            showParentOperationResult(
+                success = success,
+                successKorean = "연결 코드가 클라우드에 등록되었습니다",
+                failureKorean = "연결 코드를 등록하지 못했습니다. PIN과 네트워크를 확인해 주세요",
+                successEnglish = "Pairing code registered in the cloud",
+                failureEnglish = "Could not register the pairing code. Check the PIN and network",
+            )
+        }
+    }
+
+    fun registerChildPairingCode(pairingCode: String, childDeviceName: String, adminPin: String) {
+        viewModelScope.launch {
+            val success = repository.registerChildPairingCode(
+                pairingCode = pairingCode,
+                childDeviceName = childDeviceName,
+                adminPin = adminPin,
+            )
+            if (success) {
+                repository.syncParentDevice()
+            }
+            showParentOperationResult(
+                success = success,
+                successKorean = "자녀 기기가 연결되었습니다",
+                failureKorean = "자녀 기기를 연결하지 못했습니다. 코드, PIN, 네트워크를 확인해 주세요",
+                successEnglish = "Child device connected",
+                failureEnglish = "Could not connect the child device. Check the code, PIN, and network",
+            )
+        }
+    }
+
     fun unlinkParentAccount(adminPin: String) {
         viewModelScope.launch {
             repository.unlinkParentAccount(adminPin)
+        }
+    }
+
+    fun unlinkLinkedChildDevice(childDeviceId: String, adminPin: String) {
+        viewModelScope.launch {
+            repository.unlinkLinkedChildDevice(childDeviceId, adminPin)
+        }
+    }
+
+    fun unlinkLinkedParentDevice(parentUid: String, adminPin: String) {
+        viewModelScope.launch {
+            repository.unlinkLinkedParentDevice(parentUid, adminPin)
         }
     }
 
@@ -960,6 +1231,55 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun approveRemoteUnlockRequest(requestId: String, minutes: Int, unlockForToday: Boolean) {
+        viewModelScope.launch {
+            val success = repository.approveRemoteUnlockRequest(
+                requestId = requestId,
+                extraMinutes = minutes,
+                unlockForToday = unlockForToday,
+            )
+            showParentOperationResult(
+                success = success,
+                successKorean = "승인이 자녀 기기에 전달되었습니다",
+                failureKorean = "승인을 전달하지 못했습니다. 네트워크 연결을 확인해 주세요",
+                successEnglish = "Approval sent to the child device",
+                failureEnglish = "Could not send the approval. Check the network connection",
+            )
+            evaluatePolicyAlertsAsync()
+        }
+    }
+
+    fun rejectRemoteUnlockRequest(requestId: String) {
+        viewModelScope.launch {
+            val success = repository.rejectRemoteUnlockRequest(requestId)
+            showParentOperationResult(
+                success = success,
+                successKorean = "거절 응답이 자녀 기기에 전달되었습니다",
+                failureKorean = "거절 응답을 전달하지 못했습니다. 네트워크 연결을 확인해 주세요",
+                successEnglish = "Rejection sent to the child device",
+                failureEnglish = "Could not send the rejection. Check the network connection",
+            )
+            evaluatePolicyAlertsAsync()
+        }
+    }
+
+    private suspend fun showParentOperationResult(
+        success: Boolean,
+        successKorean: String,
+        failureKorean: String,
+        successEnglish: String,
+        failureEnglish: String,
+    ) {
+        val korean = repository.appLanguage.first() == AppLanguage.Korean
+        val message = when {
+            success && korean -> successKorean
+            success -> successEnglish
+            korean -> failureKorean
+            else -> failureEnglish
+        }
+        Toast.makeText(getApplication<Application>(), message, Toast.LENGTH_LONG).show()
+    }
+
     fun setSafeModeEnabled(enabled: Boolean) {
         viewModelScope.launch {
             safeModePinStatus.value = SafeModePinStatus.Idle
@@ -971,7 +1291,18 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                 UsageMonitorForegroundService.stop(application)
             } else if (repository.policyEnforcementEnabled.first()) {
                 debugPolicy("safeMode disabled with policy on; starting monitor")
-                UsageMonitorForegroundService.start(application)
+                if (!UsageMonitorForegroundService.start(application)) {
+                    repository.setSafeModeEnabled(true)
+                    repository.addEvent(
+                        EventLogType.Warning,
+                        "Safe mode restored: usage monitor service could not start",
+                    )
+                    Toast.makeText(
+                        application,
+                        "감시 서비스를 시작하지 못해 안전 모드로 복구했습니다",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
             }
         }
     }
@@ -1056,7 +1387,19 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             val application = getApplication<Application>()
             if (enabled) {
                 debugPolicy("policy enabled persisted; starting monitor service now")
-                UsageMonitorForegroundService.start(application)
+                if (!UsageMonitorForegroundService.start(application)) {
+                    repository.setPolicyEnforcementEnabled(false)
+                    repository.addEvent(
+                        EventLogType.Warning,
+                        "Policy enforcement disabled: usage monitor service could not start",
+                    )
+                    Toast.makeText(
+                        application,
+                        "감시 서비스를 시작하지 못해 정책 적용을 취소했습니다",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    return@launch
+                }
                 UsageMonitorForegroundService.scheduleExactRecoveryAlarm(
                     context = application,
                     reason = "policy enabled",
@@ -1088,9 +1431,11 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun setAllowedAppPackages(packageNames: Set<String>) {
-        viewModelScope.launch {
-            repository.setAllowedAppPackages(packageNames)
-        }
+        policyDraftAllowedAppPackages.value = packageNames
+            .map { packageName -> packageName.trim() }
+            .filter { packageName -> packageName.isNotBlank() && packageName !in SafetyGate.neverBlockPackages }
+            .toSet()
+        policySaveStatus.value = PolicySaveStatus.Idle
     }
 
     fun setDailyPolicyExpanded(expanded: Boolean) {
@@ -1123,6 +1468,36 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun setSettingsLanguageExpanded(expanded: Boolean) {
+        viewModelScope.launch {
+            repository.setSettingsLanguageExpanded(expanded)
+        }
+    }
+
+    fun setSettingsNotificationExpanded(expanded: Boolean) {
+        viewModelScope.launch {
+            repository.setSettingsNotificationExpanded(expanded)
+        }
+    }
+
+    fun setSettingsPinExpanded(expanded: Boolean) {
+        viewModelScope.launch {
+            repository.setSettingsPinExpanded(expanded)
+        }
+    }
+
+    fun setSettingsParentManagementExpanded(expanded: Boolean) {
+        viewModelScope.launch {
+            repository.setSettingsParentManagementExpanded(expanded)
+        }
+    }
+
+    fun setSettingsEventLogExpanded(expanded: Boolean) {
+        viewModelScope.launch {
+            repository.setSettingsEventLogExpanded(expanded)
+        }
+    }
+
     fun activateKillSwitch() {
         viewModelScope.launch {
             repository.activateKillSwitch()
@@ -1140,6 +1515,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         installedApps: List<InstalledAppInfo>,
     ): PolicySummary {
         val todayTemporaryUnlockState = temporaryUnlockState.forToday()
+        val nowMillis = System.currentTimeMillis()
         val usageByPackage = todayUsage.associateBy { appUsage -> appUsage.packageName }
         val appNameByPackage = installedApps.associate { app -> app.packageName to app.appName }
         val appLimits = settings.appLimitMap()
@@ -1160,6 +1536,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                         limitMinutes = appLimits[packageName],
                         extraMinutes = allowance?.extraMinutes ?: 0,
                         unlockedForToday = allowance?.unlockedForToday == true,
+                        temporaryRemainingMinutes = allowance?.temporaryRemainingMinutes(nowMillis) ?: 0,
                     )
                 }
                 .sortedWith(
@@ -1188,12 +1565,25 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         } else {
             calculateLimitStatus(totalUsedMinutes, totalLimitMinutes + totalExtraMinutes)
         }
-        val scheduleSummaries = buildScheduleSummaries(settings, allowedAppPackages)
+        val temporaryAllowedApps = buildTemporaryAllowedAppSummaries(
+            temporaryUnlockState = todayTemporaryUnlockState,
+            appNameByPackage = appNameByPackage,
+            nowMillis = nowMillis,
+        )
+        val temporarilyAllowedPackages = temporaryAllowedApps
+            .map { summary -> summary.packageName }
+            .toSet()
+        val scheduleSummaries = buildScheduleSummaries(
+            settings = settings,
+            allowedAppPackages = allowedAppPackages,
+            temporarilyAllowedPackages = temporarilyAllowedPackages,
+        )
         val activeScheduleSummary = scheduleSummaries.firstOrNull { summary -> summary.activeNow }
         val nextScheduleSummary = scheduleSummaries
             .filter { summary -> !summary.activeNow && summary.minutesUntilStart != null }
             .minByOrNull { summary -> summary.minutesUntilStart ?: Int.MAX_VALUE }
-        val allowOnlyAllowedAppCount = (allowedAppPackages - SafetyGate.neverBlockPackages).size
+        val allowOnlyAllowedAppCount = ((allowedAppPackages + temporarilyAllowedPackages) -
+            SafetyGate.neverBlockPackages).size
         val groupStatus = primaryGroup?.status ?: LimitStatus.Normal
         val appLimitSummaries = appLimits.map { (packageName, limitMinutes) ->
                 val usage = usageByPackage[packageName]
@@ -1201,6 +1591,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                 val allowance = todayTemporaryUnlockState.packageAllowances[packageName]
                 val unlockedForToday = allowance?.unlockedForToday == true
                 val extraMinutes = allowance?.extraMinutes ?: 0
+                val temporaryRemainingMinutes = allowance?.temporaryRemainingMinutes(nowMillis) ?: 0
                 AppLimitSummary(
                     appName = usage?.appName ?: appNameByPackage[packageName] ?: packageName,
                     packageName = packageName,
@@ -1208,6 +1599,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                     limitMinutes = limitMinutes,
                     extraMinutes = extraMinutes,
                     unlockedForToday = unlockedForToday,
+                    temporaryRemainingMinutes = temporaryRemainingMinutes,
                     status = if (unlockedForToday) {
                         LimitStatus.Normal
                     } else {
@@ -1242,6 +1634,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             nextScheduleSummary = nextScheduleSummary,
             allowOnlyModeEnabled = settings.allowOnlyModeEnabled,
             allowOnlyAllowedAppCount = allowOnlyAllowedAppCount,
+            temporaryAllowedApps = temporaryAllowedApps,
             warningCount = statuses.count { status -> status == LimitStatus.Warning },
             exceededCount = statuses.count { status -> status == LimitStatus.Exceeded },
         )
@@ -1250,12 +1643,14 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
     private fun buildScheduleSummaries(
         settings: UsagePolicySettings,
         allowedAppPackages: Set<String>,
+        temporarilyAllowedPackages: Set<String>,
     ): List<ScheduleSummary> {
         if (!settings.scheduleBlockingEnabled) {
             return emptyList()
         }
         val now = LocalDateTime.now()
-        val globalUserAllowedPackages = allowedAppPackages - SafetyGate.neverBlockPackages
+        val globalUserAllowedPackages = (allowedAppPackages + temporarilyAllowedPackages) -
+            SafetyGate.neverBlockPackages
         return settings.normalizedScheduleTemplates()
             .map { template ->
                 val activeNow = template.isActiveAt(now)
@@ -1445,9 +1840,15 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
 private const val USAGE_REFRESH_THROTTLE_MILLIS = 1_500L
 private const val USAGE_ACCESS_CHECK_TIMEOUT_MILLIS = 1_500L
 private const val USAGE_QUERY_TIMEOUT_MILLIS = 5_000L
+private const val USAGE_QUERY_RETRY_COUNT = 3
+private const val USAGE_QUERY_RETRY_DELAY_MILLIS = 350L
 private const val USAGE_ACCESS_RETRY_DELAY_MILLIS = 800L
 private const val USAGE_ACCESS_DENIED_CLEAR_THRESHOLD = 3
 private const val INSTALLED_APPS_REFRESH_THROTTLE_MILLIS = 30_000L
+private const val PARENT_SYNC_FOREGROUND_THROTTLE_MILLIS = 5_000L
+private const val PARENT_LISTENER_SYNC_RETRY_COUNT = 3
+private const val PARENT_LISTENER_SYNC_RETRY_DELAY_MILLIS = 2_000L
+private const val PARENT_LISTENER_MAX_RECONNECT_DELAY_MILLIS = 30_000L
 private const val POLICY_MAX_MINUTES = 720
 private const val DAILY_POLICY_MAX_MINUTES = 24 * 60 - 1
 private const val POLICY_MAX_SCHEDULE_MINUTES = 24 * 60 - 5
@@ -1456,6 +1857,21 @@ private const val STATISTICS_TOP_APP_LIMIT = 50
 private const val ENABLED_NOTIFICATION_LISTENERS_SETTING = "enabled_notification_listeners"
 private const val POLICY_DEBUG_TAG = "STM-Foreground"
 private const val MONITOR_STATUS_TODAY_TOLERANCE_MILLIS = 2L * 60L * 1000L
+
+private fun parentListenerRetryDelayMillis(attempt: Long): Long {
+    val multiplier = 1L shl attempt.coerceAtMost(5L).toInt()
+    return (1_000L * multiplier).coerceAtMost(PARENT_LISTENER_MAX_RECONNECT_DELAY_MILLIS)
+}
+
+private fun parentListenerChildIds(state: ParentManagementState): Set<String> {
+    if (!state.paired) {
+        return emptySet()
+    }
+    return (state.linkedChildDevices.map { child -> child.childDeviceId } + state.childDeviceId)
+        .map { childDeviceId -> childDeviceId.trim() }
+        .filter { childDeviceId -> childDeviceId.isNotBlank() }
+        .toSet()
+}
 
 private fun BlockDecision.isWouldBlock(): Boolean {
     return this == BlockDecision.WouldBlockTotalLimit ||
@@ -1736,6 +2152,9 @@ private data class UsageState(
     val notificationAccessReady: Boolean = false,
     val exactAlarmReady: Boolean = false,
     val usageAccessChecking: Boolean = false,
+    val statisticsRefreshing: Boolean = false,
+    val usageLastUpdatedAtMillis: Long = 0L,
+    val statisticsLastUpdatedAtMillis: Long = 0L,
     val todayUsage: List<AppUsageInfo> = emptyList(),
     val dailyUsage: List<DailyUsageInfo> = emptyList(),
     val topAppsSevenDays: List<AppUsageInfo> = emptyList(),
@@ -1751,4 +2170,5 @@ private data class TransientState(
     val pinChangeStatus: PinChangeStatus = PinChangeStatus.Idle,
     val safeModePinStatus: SafeModePinStatus = SafeModePinStatus.Idle,
     val policyDraftSettings: UsagePolicySettings? = null,
+    val policyDraftAllowedAppPackages: Set<String>? = null,
 )

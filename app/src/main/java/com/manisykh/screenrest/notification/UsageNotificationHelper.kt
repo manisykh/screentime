@@ -58,8 +58,19 @@ class UsageNotificationHelper(
             .setAutoCancel(true)
             .build()
 
-        NotificationManagerCompat.from(context)
-            .notify(message.hashCode(), notification)
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        try {
+            NotificationManagerCompat.from(context)
+                .notify(message.hashCode(), notification)
+        } catch (_: SecurityException) {
+            // Permission can be revoked between the readiness check and notify().
+        }
     }
 
     fun canPostNotifications(): Boolean {

@@ -5,7 +5,9 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
@@ -50,6 +52,7 @@ import com.manisykh.screenrest.MainActivity
 import com.manisykh.screenrest.SecurePinTextField
 import com.manisykh.screenrest.SmoothMinuteSlider
 import com.manisykh.screenrest.data.AppLanguage
+import com.manisykh.screenrest.data.ParentRemoteSyncDataSourceFactory
 import com.manisykh.screenrest.data.SettingsRepository
 import com.manisykh.screenrest.data.settingsDataStore
 import com.manisykh.screenrest.formatLimitMinutesLabel
@@ -59,7 +62,12 @@ import com.manisykh.screenrest.ui.theme.ScreenTimeManagerTheme
 import kotlinx.coroutines.launch
 
 class BlockedActivity : ComponentActivity() {
-    private val repository by lazy { SettingsRepository(applicationContext.settingsDataStore) }
+    private val repository by lazy {
+        SettingsRepository(
+            applicationContext.settingsDataStore,
+            ParentRemoteSyncDataSourceFactory.create(applicationContext),
+        )
+    }
     private var previewOnlyActivity: Boolean = true
     private var blockedPackageName: String = ""
 
@@ -75,6 +83,17 @@ class BlockedActivity : ComponentActivity() {
         val showAppDetails = intent.getBooleanExtra(EXTRA_SHOW_APP_DETAILS, true)
         val previewOnly = intent.getBooleanExtra(EXTRA_PREVIEW_ONLY, true)
         previewOnlyActivity = previewOnly
+
+        if (previewOnly) {
+            enableEdgeToEdge()
+        } else {
+            val blockedSystemBarStyle = SystemBarStyle.dark(BLOCK_SCREEN_BACKGROUND_ARGB)
+            enableEdgeToEdge(
+                statusBarStyle = blockedSystemBarStyle,
+                navigationBarStyle = blockedSystemBarStyle,
+            )
+        }
+        window.isNavigationBarContrastEnforced = false
 
         onBackPressedDispatcher.addCallback(
             this,
@@ -193,6 +212,7 @@ class BlockedActivity : ComponentActivity() {
     }
 
     companion object {
+        private val BLOCK_SCREEN_BACKGROUND_ARGB = 0xFF102552.toInt()
         private const val EXTRA_APP_NAME = "extra_app_name"
         private const val EXTRA_PACKAGE_NAME = "extra_package_name"
         private const val EXTRA_REASON = "extra_reason"
@@ -289,16 +309,16 @@ private fun BlockedScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .widthIn(max = 480.dp),
-            shape = RoundedCornerShape(28.dp),
+            shape = RoundedCornerShape(20.dp),
             colors = CardDefaults.cardColors(containerColor = blockStyle.cardColor),
-            border = BorderStroke(if (previewOnly) 1.dp else 2.dp, blockStyle.borderColor),
-            elevation = CardDefaults.cardElevation(defaultElevation = if (previewOnly) 2.dp else 10.dp),
+            border = BorderStroke(1.dp, blockStyle.borderColor),
+            elevation = CardDefaults.cardElevation(defaultElevation = if (previewOnly) 0.dp else 3.dp),
         ) {
             Column(
                 modifier = Modifier
-                    .padding(24.dp)
+                    .padding(20.dp)
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(18.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Surface(
@@ -318,7 +338,7 @@ private fun BlockedScreen(
                     text = blockedTitle,
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
-                    color = Color(0xFF111827),
+                    color = Color(0xFF172033),
                     textAlign = TextAlign.Center,
                 )
                 if (showAppDetails) {
@@ -331,20 +351,20 @@ private fun BlockedScreen(
                         text = appName,
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF111827),
+                        color = Color(0xFF172033),
                         textAlign = TextAlign.Center,
                     )
                     Text(
                         text = text.usedReason(usedMinutes, limitMinutes, localizedReason),
                         style = MaterialTheme.typography.titleMedium,
-                        color = Color(0xFF4B5563),
+                        color = Color(0xFF6D7485),
                         textAlign = TextAlign.Center,
                     )
                 } else {
                     Text(
                         text = text.dailyReason(usedMinutes, limitMinutes),
                         style = MaterialTheme.typography.titleMedium,
-                        color = Color(0xFF4B5563),
+                        color = Color(0xFF6D7485),
                         textAlign = TextAlign.Center,
                     )
                 }
@@ -393,7 +413,7 @@ private fun BlockedScreen(
                             },
                             enabled = parentPin.isNotBlank() && extraMinutes > 0,
                             modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(18.dp),
+                            shape = RoundedCornerShape(14.dp),
                         ) {
                             Text(text.addTime)
                         }
@@ -405,7 +425,7 @@ private fun BlockedScreen(
                             },
                             enabled = parentPin.isNotBlank(),
                             modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(18.dp),
+                            shape = RoundedCornerShape(14.dp),
                         ) {
                             Text(text.unlockToday)
                         }
@@ -445,7 +465,7 @@ private fun BlockedScreen(
                     },
                     enabled = pin.isNotBlank(),
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(18.dp),
+                    shape = RoundedCornerShape(14.dp),
                 ) {
                     Text(text.emergencyUnlock)
                 }
@@ -454,7 +474,7 @@ private fun BlockedScreen(
                     Button(
                         onClick = onOpenManager,
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(18.dp),
+                        shape = RoundedCornerShape(14.dp),
                     ) {
                         Text(text.openManager)
                     }
@@ -463,7 +483,7 @@ private fun BlockedScreen(
                 OutlinedButton(
                     onClick = onClosePreview,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(18.dp),
+                    shape = RoundedCornerShape(14.dp),
                 ) {
                     Text(if (previewOnly) text.close else text.back)
                 }
@@ -503,48 +523,48 @@ private fun blockScreenStyle(
     }
     return when (reason) {
         "total limit exceeded" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF3A1114),
-            cardColor = Color(0xFFFFE6E2),
-            accentColor = Color(0xFFE23A2E),
-            borderColor = Color(0xFF991B1B),
+            backgroundColor = Color(0xFF102552),
+            cardColor = Color(0xFFFFF8F6),
+            accentColor = Color(0xFFC85C58),
+            borderColor = Color(0xFFEECBC8),
         )
         "group limit exceeded" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF2A1A05),
-            cardColor = Color(0xFFFFF4D8),
-            accentColor = Color(0xFFF59E0B),
-            borderColor = Color(0xFFB45309),
+            backgroundColor = Color(0xFF102552),
+            cardColor = Color(0xFFFFFAF0),
+            accentColor = Color(0xFFB98226),
+            borderColor = Color(0xFFE9D7A4),
         )
         "schedule block active" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF1E1235),
-            cardColor = Color(0xFFF0E7FF),
-            accentColor = Color(0xFF7C3AED),
-            borderColor = Color(0xFF5B21B6),
+            backgroundColor = Color(0xFF102552),
+            cardColor = Color(0xFFF7F9FE),
+            accentColor = Color(0xFF3657D8),
+            borderColor = Color(0xFFD9E0F4),
         )
         "allow-only mode active" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF052E2B),
-            cardColor = Color(0xFFE1FBF4),
-            accentColor = Color(0xFF0F766E),
-            borderColor = Color(0xFF0F766E),
+            backgroundColor = Color(0xFF102552),
+            cardColor = Color(0xFFF4FBF9),
+            accentColor = Color(0xFF3C9F8F),
+            borderColor = Color(0xFFCDEAE4),
         )
         "app limit exceeded" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF111827),
-            cardColor = Color(0xFFEAF1FF),
-            accentColor = Color(0xFF1D4ED8),
-            borderColor = Color(0xFF1E3A8A),
+            backgroundColor = Color(0xFF102552),
+            cardColor = Color(0xFFF7F9FE),
+            accentColor = Color(0xFF3657D8),
+            borderColor = Color(0xFFD9E0F4),
         )
         else -> if (showAppDetails) {
             BlockScreenStyle(
-                backgroundColor = Color(0xFF111827),
-                cardColor = Color(0xFFEAF1FF),
-                accentColor = Color(0xFF1D4ED8),
-                borderColor = Color(0xFF1E3A8A),
+                backgroundColor = Color(0xFF102552),
+                cardColor = Color(0xFFF7F9FE),
+                accentColor = Color(0xFF3657D8),
+                borderColor = Color(0xFFD9E0F4),
             )
         } else {
             BlockScreenStyle(
-                backgroundColor = Color(0xFF3A1114),
-                cardColor = Color(0xFFFFE6E2),
-                accentColor = Color(0xFFE23A2E),
-                borderColor = Color(0xFF991B1B),
+                backgroundColor = Color(0xFF102552),
+                cardColor = Color(0xFFFFF8F6),
+                accentColor = Color(0xFFC85C58),
+                borderColor = Color(0xFFEECBC8),
             )
         }
     }
@@ -557,8 +577,9 @@ private fun BlockedExtraTimeControl(
     onValueMinutesChange: (Int) -> Unit,
 ) {
     Surface(
-        shape = RoundedCornerShape(18.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.64f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.64f)),
     ) {
         Column(
             modifier = Modifier

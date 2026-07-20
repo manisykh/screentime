@@ -15,7 +15,19 @@ import androidx.compose.ui.platform.LocalContext
 private val DarkColorScheme = darkColorScheme(
     primary = Primary80,
     secondary = Secondary80,
-    tertiary = Tertiary80
+    tertiary = Tertiary80,
+    background = RestNight,
+    surface = RestNightSoft,
+    surfaceVariant = Color(0xFF233C6E),
+    outlineVariant = Color(0xFF3A527E),
+    primaryContainer = Color(0xFF2F4F9E),
+    onPrimaryContainer = Color(0xFFF0F4FF),
+    secondaryContainer = Color(0xFF1E5F55),
+    tertiaryContainer = Color(0xFF4E3E1F),
+    errorContainer = Color(0xFF633333),
+    onBackground = Color(0xFFF7FAFF),
+    onSurface = Color(0xFFF7FAFF),
+    onSurfaceVariant = Color(0xFFC7D0E2),
 )
 
 private val LightColorScheme = lightColorScheme(
@@ -26,11 +38,11 @@ private val LightColorScheme = lightColorScheme(
     surface = AppSurface,
     surfaceVariant = AppMuted,
     outlineVariant = AppBorder,
-    primaryContainer = Color(0xFFDBEAFE),
-    onPrimaryContainer = Color(0xFF1D4ED8),
-    secondaryContainer = Color(0xFFE7F7ED),
-    tertiaryContainer = Color(0xFFFFF3D8),
-    errorContainer = Color(0xFFFFDAD6),
+    primaryContainer = RestBlueSoft,
+    onPrimaryContainer = RestNight,
+    secondaryContainer = Color(0xFFE6F6F2),
+    tertiaryContainer = RestCream,
+    errorContainer = Color(0xFFFFE8E5),
     onBackground = AppForeground,
     onSurface = AppForeground,
     onSurfaceVariant = AppMutedForeground

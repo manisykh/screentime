@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import com.manisykh.screenrest.worker.DailyRolloverWorker
+import com.manisykh.screenrest.worker.RemoteParentSyncWorker
 import com.manisykh.screenrest.worker.SystemHealthCheckWorker
 import com.manisykh.screenrest.worker.UsageMonitorRecoveryWorker
 import com.manisykh.screenrest.worker.UsagePolicyCheckWorker
@@ -30,6 +31,7 @@ class BootRecoveryReceiver : BroadcastReceiver() {
                 UsagePolicyCheckWorker.schedule(appContext)
                 SystemHealthCheckWorker.scheduleNow(appContext)
                 SystemHealthCheckWorker.schedulePeriodic(appContext)
+                RemoteParentSyncWorker.schedule(appContext)
                 if (
                     intent.action == Intent.ACTION_DATE_CHANGED ||
                     intent.action == Intent.ACTION_TIME_CHANGED ||

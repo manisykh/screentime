@@ -1,5 +1,6 @@
 package com.manisykh.screenrest.blocking
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,6 +10,7 @@ import android.app.Service
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -44,11 +46,14 @@ import androidx.core.content.ContextCompat
 import com.manisykh.screenrest.MainActivity
 import com.manisykh.screenrest.R
 import com.manisykh.screenrest.data.EventLogType
+import com.manisykh.screenrest.data.ParentRemoteSyncDataSourceFactory
 import com.manisykh.screenrest.data.SettingsRepository
 import com.manisykh.screenrest.data.UsagePolicySettings
 import com.manisykh.screenrest.data.activeScheduleAllowedPackages
 import com.manisykh.screenrest.data.isScheduleBlockingNow
 import com.manisykh.screenrest.data.normalizedAppGroups
+import com.manisykh.screenrest.data.RemoteRequestBlockReason
+import com.manisykh.screenrest.data.RemoteUnlockRequestStatus
 import com.manisykh.screenrest.data.settingsDataStore
 import com.manisykh.screenrest.formatLimitMinutesLabel
 import com.manisykh.screenrest.notification.ScreenTimeNotificationListenerService
@@ -78,7 +83,12 @@ import java.util.Calendar
 
 class UsageMonitorForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val repository by lazy { SettingsRepository(applicationContext.settingsDataStore) }
+    private val repository by lazy {
+        SettingsRepository(
+            applicationContext.settingsDataStore,
+            ParentRemoteSyncDataSourceFactory.create(applicationContext),
+        )
+    }
     private val usageRepository by lazy { UsageStatsRepository(applicationContext) }
     private var monitorJob: Job? = null
     @Volatile
@@ -90,6 +100,8 @@ class UsageMonitorForegroundService : Service() {
     private var lastBlockedActivityPackageName: String? = null
     private var lastLoggedBlockPackageName: String? = null
     private var lastLoggedBlockAt: Long = 0L
+    private var lastRemoteParentSyncAt: Long = 0L
+    private var remoteParentFastSyncUntilElapsed: Long = 0L
     private var activeForegroundPackageName: String? = null
     private var activeForegroundStartedAtElapsed: Long = 0L
     private var activeForegroundBaselineUsageMillis: Long? = null
@@ -103,6 +115,7 @@ class UsageMonitorForegroundService : Service() {
     private var blockEnforcementGuardPackageName: String? = null
     private var blockForegroundEvictionJob: Job? = null
     private var blockForegroundEvictionPackageName: String? = null
+    private var remoteParentRequestMonitorJob: Job? = null
     @Volatile
     private var latestRequestedForegroundPackageName: String? = null
     private var lastDebugMonitorSummary: String = ""
@@ -218,6 +231,7 @@ class UsageMonitorForegroundService : Service() {
         cancelBlockEnforcementGuard()
         removeBlockingOverlay()
         monitorJob?.cancel()
+        remoteParentRequestMonitorJob?.cancel()
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -255,8 +269,17 @@ class UsageMonitorForegroundService : Service() {
             while (isActive) {
                 runCatching {
                     evaluateCurrentForegroundApp()
-                }.onFailure {
-                    repository.addEvent(EventLogType.Safety, "Usage monitor recovered from evaluation error")
+                    syncRemoteParentStateIfNeeded()
+                }.onFailure { error ->
+                    Log.e(FOREGROUND_DEBUG_TAG, "Usage monitor evaluation failed", error)
+                    runCatching {
+                        repository.addEvent(
+                            EventLogType.Safety,
+                            "Usage monitor recovered from evaluation error: ${error.javaClass.simpleName}",
+                        )
+                    }.onFailure { logError ->
+                        Log.e(FOREGROUND_DEBUG_TAG, "Failed to persist usage monitor error", logError)
+                    }
                 }
                 delay(MONITOR_INTERVAL_MILLIS)
             }
@@ -264,10 +287,24 @@ class UsageMonitorForegroundService : Service() {
     }
 
     private fun ensureMonitorLoopRunning() {
-        if (monitorJob == null) {
+        if (monitorJob?.isActive != true) {
             debugMonitor("monitor loop missing; restarting from onStartCommand")
             startMonitorLoop()
         }
+    }
+
+    private suspend fun syncRemoteParentStateIfNeeded() {
+        val now = SystemClock.elapsedRealtime()
+        val interval = if (now < remoteParentFastSyncUntilElapsed) {
+            REMOTE_PARENT_FAST_SYNC_INTERVAL_MILLIS
+        } else {
+            REMOTE_PARENT_SYNC_INTERVAL_MILLIS
+        }
+        if (now - lastRemoteParentSyncAt < interval) {
+            return
+        }
+        lastRemoteParentSyncAt = now
+        repository.syncParentDevice()
     }
 
     private suspend fun evaluateCurrentForegroundApp() {
@@ -1430,9 +1467,9 @@ class UsageMonitorForegroundService : Service() {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(22), dp(24), dp(22), dp(22))
+            setPadding(dp(18), dp(18), dp(18), dp(16))
             background = GradientDrawable().apply {
-                cornerRadius = dp(28).toFloat()
+                cornerRadius = dp(24).toFloat()
                 setColor(style.cardColor)
                 setStroke(dp(2), style.borderColor)
             }
@@ -1444,8 +1481,8 @@ class UsageMonitorForegroundService : Service() {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 Gravity.CENTER,
             ).apply {
-                val horizontalMargin = dp(32)
-                val verticalMargin = dp(18)
+                val horizontalMargin = dp(20)
+                val verticalMargin = dp(10)
                 leftMargin = horizontalMargin
                 rightMargin = horizontalMargin
                 topMargin = verticalMargin
@@ -1453,12 +1490,12 @@ class UsageMonitorForegroundService : Service() {
             },
         )
         root.post {
-            val horizontalMargin = dp(32)
+            val horizontalMargin = dp(20)
             val availableWidth = root.width - (horizontalMargin * 2)
             if (availableWidth > 0) {
                 val minimumWidth = dp(280).coerceAtMost(availableWidth)
                 val targetWidth = availableWidth
-                    .coerceAtMost(dp(480))
+                    .coerceAtMost(dp(440))
                     .coerceAtLeast(minimumWidth)
                 (scrollView.layoutParams as? FrameLayout.LayoutParams)?.let { params ->
                     params.width = targetWidth
@@ -1478,9 +1515,9 @@ class UsageMonitorForegroundService : Service() {
             ),
         )
 
-        card.addView(blockOverlayText(strings.titleFor(decision.result.decision), 24, Color.rgb(17, 24, 39), true))
+        card.addView(blockOverlayText(strings.titleFor(decision.result.decision), 21, Color.rgb(17, 24, 39), true))
         if (isDailyLimitBlock) {
-            card.addView(blockOverlayText(strings.dailyTime, 20, Color.rgb(17, 24, 39), true))
+            card.addView(blockOverlayText(strings.dailyTime, 18, Color.rgb(17, 24, 39), true))
         } else {
             val iconDrawable = runCatching {
                 packageManager.getApplicationIcon(decision.result.packageName)
@@ -1491,18 +1528,18 @@ class UsageMonitorForegroundService : Service() {
                         setImageDrawable(iconDrawable)
                         contentDescription = decision.result.appName
                     },
-                    LinearLayout.LayoutParams(dp(72), dp(72)).apply {
-                        topMargin = dp(12)
-                        bottomMargin = dp(8)
+                    LinearLayout.LayoutParams(dp(56), dp(56)).apply {
+                        topMargin = dp(8)
+                        bottomMargin = dp(4)
                     },
                 )
             }
-            card.addView(blockOverlayText(decision.result.appName, 20, Color.rgb(17, 24, 39), true))
+            card.addView(blockOverlayText(decision.result.appName, 18, Color.rgb(17, 24, 39), true))
         }
         card.addView(
             blockOverlayText(
                 decision.toOverlayUsageText(),
-                16,
+                14,
                 Color.rgb(107, 114, 128),
                 false,
             ),
@@ -1513,14 +1550,14 @@ class UsageMonitorForegroundService : Service() {
             adminInput.container,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(52),
+                dp(46),
             ).apply {
-                topMargin = dp(18)
+                topMargin = dp(10)
             },
         )
 
         var extraMinutes = 5
-        val extraMinutesText = blockOverlayText(strings.extraTimeLabel(extraMinutes), 15, style.accentColor, true)
+        val extraMinutesText = blockOverlayText(strings.extraTimeLabel(extraMinutes), 14, style.accentColor, true)
         card.addView(extraMinutesText)
         card.addView(
             SeekBar(this).apply {
@@ -1545,7 +1582,7 @@ class UsageMonitorForegroundService : Service() {
             ),
         )
 
-        val statusText = blockOverlayText("", 14, Color.rgb(229, 91, 74), true)
+        val statusText = blockOverlayText("", 13, Color.rgb(229, 91, 74), true)
         card.addView(statusText)
         card.addView(blockOverlayButton(strings.addTime) {
             val pin = adminInput.input.text?.toString().orEmpty()
@@ -1566,15 +1603,23 @@ class UsageMonitorForegroundService : Service() {
                 strings = strings,
             )
         })
+        card.addView(blockOverlayButton(strings.requestParent, outline = true) {
+            requestParentApproval(
+                decision = decision,
+                extraMinutes = extraMinutes,
+                statusText = statusText,
+                strings = strings,
+            )
+        })
 
         val emergencyInput = blockOverlayPinInput(strings.emergencyPin, scrollView, strings)
         card.addView(
             emergencyInput.container,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(52),
+                dp(46),
             ).apply {
-                topMargin = dp(10)
+                topMargin = dp(6)
             },
         )
 
@@ -1610,6 +1655,109 @@ class UsageMonitorForegroundService : Service() {
             sendHomeIntent(force = true)
         })
         return root
+    }
+
+    private fun requestParentApproval(
+        decision: MonitorDecision,
+        extraMinutes: Int,
+        statusText: TextView,
+        strings: BlockOverlayStrings,
+    ) {
+        serviceScope.launch {
+            val created = repository.createRemoteUnlockRequest(
+                blockReason = decision.result.decision.toRemoteRequestBlockReason(),
+                targetPackageName = decision.result.packageName,
+                targetAppName = decision.result.appName,
+                targetGroupName = decision.targetGroupName.orEmpty(),
+                scheduleName = "",
+                usedMillis = decision.usedMillis,
+                limitMillis = decision.limitMillis,
+                alreadyGrantedExtraMinutes = decision.extraMinutes,
+                unlockedForToday = decision.unlockedForToday,
+                requestedMinutes = extraMinutes,
+            )
+            withContext(Dispatchers.Main) {
+                if (created) {
+                    remoteParentFastSyncUntilElapsed = SystemClock.elapsedRealtime() + REMOTE_PARENT_FAST_SYNC_WINDOW_MILLIS
+                    statusText.setTextColor(Color.rgb(37, 99, 235))
+                    statusText.text = strings.requestWaiting
+                    remoteParentRequestMonitorJob?.cancel()
+                    remoteParentRequestMonitorJob = serviceScope.launch {
+                        monitorRemoteParentRequestStatus(decision, statusText, strings)
+                    }
+                } else {
+                    statusText.setTextColor(Color.rgb(229, 91, 74))
+                    statusText.text = strings.requestPublishFailed
+                }
+            }
+        }
+    }
+
+    private suspend fun monitorRemoteParentRequestStatus(
+        decision: MonitorDecision,
+        statusText: TextView,
+        strings: BlockOverlayStrings,
+    ) {
+        val startedAt = SystemClock.elapsedRealtime()
+        val deadline = startedAt + REMOTE_PARENT_REQUEST_STATUS_WINDOW_MILLIS
+        val blockReason = decision.result.decision.toRemoteRequestBlockReason()
+        while (serviceScope.isActive && SystemClock.elapsedRealtime() < deadline) {
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            delay(
+                if (elapsed < REMOTE_PARENT_FAST_SYNC_WINDOW_MILLIS) {
+                    REMOTE_PARENT_FAST_SYNC_INTERVAL_MILLIS
+                } else {
+                    REMOTE_PARENT_SYNC_INTERVAL_MILLIS
+                },
+            )
+            repository.syncParentDevice()
+            val now = System.currentTimeMillis()
+            val request = repository.parentManagementState.first()
+                .remoteUnlockRequests
+                .sortedByDescending { item -> item.createdAtMillis }
+                .firstOrNull { item ->
+                    item.blockReason == blockReason &&
+                        item.targetPackageName == decision.result.packageName &&
+                        item.targetGroupName == decision.targetGroupName.orEmpty()
+                }
+            val status = when {
+                request == null -> RemoteUnlockRequestStatus.Pending
+                request.status == RemoteUnlockRequestStatus.Pending && request.expiresAtMillis < now ->
+                    RemoteUnlockRequestStatus.Expired
+                else -> request.status
+            }
+            withContext(Dispatchers.Main) {
+                when (status) {
+                    RemoteUnlockRequestStatus.Pending -> {
+                        statusText.setTextColor(Color.rgb(37, 99, 235))
+                        statusText.text = strings.requestWaiting
+                    }
+                    RemoteUnlockRequestStatus.Approved -> {
+                        statusText.setTextColor(Color.rgb(22, 101, 52))
+                        statusText.text = strings.requestApproved
+                        cancelBlockEnforcementGuard()
+                        clearActiveForegroundSession()
+                        lastBlockedActivityPackageName = null
+                        removeBlockingOverlay()
+                    }
+                    RemoteUnlockRequestStatus.Rejected -> {
+                        statusText.setTextColor(Color.rgb(229, 91, 74))
+                        statusText.text = strings.requestRejected
+                    }
+                    RemoteUnlockRequestStatus.Expired -> {
+                        statusText.setTextColor(Color.rgb(180, 83, 9))
+                        statusText.text = strings.requestExpired
+                    }
+                    RemoteUnlockRequestStatus.Failed -> {
+                        statusText.setTextColor(Color.rgb(229, 91, 74))
+                        statusText.text = strings.requestFailed
+                    }
+                }
+            }
+            if (status != RemoteUnlockRequestStatus.Pending) {
+                break
+            }
+        }
     }
 
     private fun applyParentExtraTime(
@@ -1849,6 +1997,14 @@ class UsageMonitorForegroundService : Service() {
     private fun updateMonitorNotification(title: String, text: String) {
         debugMonitorState("NOTIFICATION update title=$title text=$text")
         val notification = buildMonitorNotification(title = title, text = text)
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            debugMonitor("NOTIFICATION skipped: permission missing")
+            return
+        }
         runCatching {
             NotificationManagerCompat.from(this).notify(MONITOR_NOTIFICATION_ID, notification)
             debugMonitorState("NOTIFICATION posted id=$MONITOR_NOTIFICATION_ID title=$title")
@@ -1992,6 +2148,21 @@ class UsageMonitorForegroundService : Service() {
         }
     }
 
+    private fun BlockDecision.toRemoteRequestBlockReason(): RemoteRequestBlockReason {
+        return when (this) {
+            BlockDecision.WouldBlockTotalLimit -> RemoteRequestBlockReason.DailyLimit
+            BlockDecision.WouldBlockSchedule -> RemoteRequestBlockReason.ScheduleBlock
+            BlockDecision.WouldBlockAllowOnly -> RemoteRequestBlockReason.AllowOnlyMode
+            BlockDecision.WouldBlockGroupLimit -> RemoteRequestBlockReason.AppGroupLimit
+            BlockDecision.WouldBlockAppLimit,
+            BlockDecision.AllowedSafeMode,
+            BlockDecision.AllowedPolicyDisabled,
+            BlockDecision.AllowedWhitelist,
+            BlockDecision.AllowedNoLimit,
+            BlockDecision.AllowedUnderLimit -> RemoteRequestBlockReason.AppLimit
+        }
+    }
+
     private fun BlockDecision.toBlockCategory(): String {
         return when (this) {
             BlockDecision.WouldBlockAppLimit -> "APP_LIMIT"
@@ -2085,6 +2256,15 @@ class UsageMonitorForegroundService : Service() {
                 extraTime = "추가 시간",
                 addTime = "시간 추가",
                 unlockToday = "오늘만 해제",
+                requestParent = "부모에게 요청",
+                requestSent = "부모에게 요청을 보냈습니다",
+                requestWaiting = "부모에게 요청됨 · 승인 대기 중",
+                requestPublishFailed = "요청을 보내지 못했습니다 · 연결과 네트워크를 확인하세요",
+                requestApproved = "승인됨 · 차단을 해제합니다",
+                requestRejected = "부모가 요청을 거절했습니다",
+                requestExpired = "요청이 만료되었습니다",
+                requestFailed = "요청 처리에 실패했습니다",
+                parentNotLinked = "부모 기기가 연결되어 있지 않습니다",
                 emergencyPin = "긴급 PIN",
                 emergencyUnlock = "긴급 해제",
                 openManager = "관리 앱 열기",
@@ -2110,6 +2290,15 @@ class UsageMonitorForegroundService : Service() {
                 extraTime = "Extra time",
                 addTime = "Add time",
                 unlockToday = "Unlock for today",
+                requestParent = "Ask parent",
+                requestSent = "Request sent to parent",
+                requestWaiting = "Requested · waiting for approval",
+                requestPublishFailed = "Request failed · check the connection and network",
+                requestApproved = "Approved · unlocking",
+                requestRejected = "Parent rejected the request",
+                requestExpired = "Request expired",
+                requestFailed = "Request failed",
+                parentNotLinked = "Parent device is not linked",
                 emergencyPin = "Emergency PIN",
                 emergencyUnlock = "Emergency Unlock",
                 openManager = "Open Manager",
@@ -2151,7 +2340,7 @@ class UsageMonitorForegroundService : Service() {
             if (bold) {
                 typeface = Typeface.DEFAULT_BOLD
             }
-            setPadding(0, dp(6), 0, dp(6))
+            setPadding(0, dp(4), 0, dp(4))
         }
     }
 
@@ -2163,12 +2352,12 @@ class UsageMonitorForegroundService : Service() {
     ): Button {
         return Button(this).apply {
             this.text = text
-            textSize = 16f
+            textSize = 14.5f
             isAllCaps = false
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(if (primary || outline) Color.rgb(37, 99, 235) else Color.rgb(17, 24, 39))
             background = GradientDrawable().apply {
-                cornerRadius = dp(16).toFloat()
+                cornerRadius = dp(14).toFloat()
                 setColor(if (primary) Color.rgb(37, 99, 235) else Color.rgb(229, 231, 235))
                 if (outline) {
                     setColor(Color.TRANSPARENT)
@@ -2178,12 +2367,12 @@ class UsageMonitorForegroundService : Service() {
             if (primary) {
                 setTextColor(Color.WHITE)
             }
-            minHeight = dp(48)
+            minHeight = dp(42)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(48),
+                dp(42),
             ).apply {
-                topMargin = dp(8)
+                topMargin = dp(6)
             }
             setOnClickListener { onClick() }
         }
@@ -2204,11 +2393,11 @@ class UsageMonitorForegroundService : Service() {
             transformationMethod = PasswordTransformationMethod.getInstance()
             imeOptions = EditorInfo.IME_ACTION_DONE
             setSingleLine(true)
-            textSize = 16f
+            textSize = 15f
             isFocusable = true
             isFocusableInTouchMode = true
             background = null
-            setPadding(dp(14), 0, dp(8), 0)
+            setPadding(dp(12), 0, dp(6), 0)
             setOnFocusChangeListener { view, hasFocus ->
                 if (hasFocus) {
                     revealOverlayInput(scrollView, view)
@@ -2224,7 +2413,7 @@ class UsageMonitorForegroundService : Service() {
         val toggleButton = TextView(this).apply {
             text = strings.showPin
             gravity = Gravity.CENTER
-            textSize = 13f
+            textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.rgb(37, 99, 235))
             isClickable = true
@@ -2271,8 +2460,8 @@ class UsageMonitorForegroundService : Service() {
             addView(
                 toggleButton,
                 LinearLayout.LayoutParams(
-                    dp(62),
-                    dp(36),
+                    dp(58),
+                    dp(32),
                 ),
             )
         }
@@ -2370,6 +2559,15 @@ class UsageMonitorForegroundService : Service() {
         val extraTime: String,
         val addTime: String,
         val unlockToday: String,
+        val requestParent: String,
+        val requestSent: String,
+        val requestWaiting: String,
+        val requestPublishFailed: String,
+        val requestApproved: String,
+        val requestRejected: String,
+        val requestExpired: String,
+        val requestFailed: String,
+        val parentNotLinked: String,
         val emergencyPin: String,
         val emergencyUnlock: String,
         val openManager: String,
@@ -2418,15 +2616,22 @@ class UsageMonitorForegroundService : Service() {
         private const val BLOCK_ACTIVITY_FRONT_CHECK_DELAY_MILLIS = 1_000L
         private const val DEBUG_LOG_REPEAT_THROTTLE_MILLIS = 1_000L
         private const val DEBUG_USAGE_ADJUST_LOG_THRESHOLD_MILLIS = 1_000L
-        private const val MONITOR_STATUS_WRITE_INTERVAL_MILLIS = 1_000L
+        private const val MONITOR_STATUS_WRITE_INTERVAL_MILLIS = 5_000L
         private const val USAGE_MAP_CACHE_MILLIS = 1_000L
+        private const val REMOTE_PARENT_SYNC_INTERVAL_MILLIS = 15_000L
+        private const val REMOTE_PARENT_FAST_SYNC_INTERVAL_MILLIS = 2_000L
+        private const val REMOTE_PARENT_FAST_SYNC_WINDOW_MILLIS = 2L * 60L * 1_000L
+        private const val REMOTE_PARENT_REQUEST_STATUS_WINDOW_MILLIS = 10L * 60L * 1_000L
         private const val FOREGROUND_DEBUG_TAG = "STM-Foreground"
 
-        fun start(context: Context) {
+        fun start(context: Context): Boolean {
             val intent = Intent(context, UsageMonitorForegroundService::class.java)
-            runCatching {
+            return runCatching {
                 ContextCompat.startForegroundService(context, intent)
-            }
+                true
+            }.onFailure { error ->
+                Log.e(FOREGROUND_DEBUG_TAG, "Unable to start usage monitor foreground service", error)
+            }.getOrDefault(false)
         }
 
         fun stop(context: Context) {

@@ -6,6 +6,7 @@ import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.Manifest
 import android.util.LruCache
@@ -15,6 +16,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -85,13 +90,14 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldColors
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -137,12 +143,16 @@ import com.manisykh.screenrest.data.AppGroupPolicy
 import com.manisykh.screenrest.data.EventLogEntry
 import com.manisykh.screenrest.data.ForegroundDetectionStatus
 import com.manisykh.screenrest.data.ParentManagementState
-import com.manisykh.screenrest.data.RemoteParentCommand
-import com.manisykh.screenrest.data.RemoteParentCommandStatus
-import com.manisykh.screenrest.data.RemoteParentCommandType
+import com.manisykh.screenrest.data.ParentDeviceRole
+import com.manisykh.screenrest.data.LinkedChildDevice
+import com.manisykh.screenrest.data.LinkedParentDevice
+import com.manisykh.screenrest.data.RemoteRequestBlockReason
+import com.manisykh.screenrest.data.RemoteUnlockRequest
+import com.manisykh.screenrest.data.RemoteUnlockRequestStatus
 import com.manisykh.screenrest.data.ScheduleTemplatePolicy
 import com.manisykh.screenrest.data.SystemHealthStatus
 import com.manisykh.screenrest.data.TemporaryUnlockState
+import com.manisykh.screenrest.data.temporaryRemainingMinutes
 import com.manisykh.screenrest.data.UsagePolicySettings
 import com.manisykh.screenrest.data.UsageMonitorStatus
 import com.manisykh.screenrest.data.activeScheduleTemplate
@@ -171,7 +181,9 @@ import com.manisykh.screenrest.ui.safety.SafeModeUiState
 import com.manisykh.screenrest.ui.safety.SafeModePinStatus
 import com.manisykh.screenrest.ui.safety.ScheduleSummary
 import com.manisykh.screenrest.ui.safety.SafeModeViewModel
+import com.manisykh.screenrest.ui.safety.TemporaryAllowedAppSummary
 import com.manisykh.screenrest.ui.safety.TopAppsUsageSet
+import com.manisykh.screenrest.ui.safety.buildTemporaryAllowedAppSummaries
 import com.manisykh.screenrest.ui.safety.appLimitMap
 import com.manisykh.screenrest.ui.safety.toAppLimitRules
 import com.manisykh.screenrest.ui.theme.ScreenTimeManagerTheme
@@ -184,6 +196,7 @@ import com.manisykh.screenrest.usage.InstalledAppInfo
 import com.manisykh.screenrest.worker.SystemHealthCheckWorker
 import com.manisykh.screenrest.worker.UsageMonitorRecoveryWorker
 import com.manisykh.screenrest.worker.UsagePolicyCheckWorker
+import com.manisykh.screenrest.worker.RemoteParentSyncWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
@@ -202,6 +215,7 @@ import kotlin.math.roundToInt
 class MainActivity : ComponentActivity() {
     private val safeModeViewModel: SafeModeViewModel by viewModels()
     private val suppressPermissionSetupAutoDialog = mutableStateOf(false)
+    private var stoppedAtElapsedRealtime: Long = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -210,12 +224,13 @@ class MainActivity : ComponentActivity() {
         UsagePolicyCheckWorker.schedule(this)
         SystemHealthCheckWorker.scheduleNow(this)
         SystemHealthCheckWorker.schedulePeriodic(this)
+        RemoteParentSyncWorker.schedule(this)
         BootRecoveryReceiver.scheduleDailyRolloverAlarm(this)
         UsageMonitorRecoveryWorker.schedulePeriodic(this)
         enableEdgeToEdge()
         setContent {
             ScreenTimeManagerTheme {
-                val uiState by safeModeViewModel.uiState.collectAsState()
+                val uiState by safeModeViewModel.uiState.collectAsStateWithLifecycle()
                 LaunchedEffect(
                     uiState.safeModeEnabled,
                     uiState.policyEnforcementEnabled,
@@ -272,19 +287,32 @@ class MainActivity : ComponentActivity() {
                             onUpdateEmergencyPin = safeModeViewModel::updateEmergencyPin,
                             onPinInputChanged = safeModeViewModel::clearPinChangeStatus,
                             onPairParentAccount = safeModeViewModel::pairParentAccount,
+                            onParentProfileNameChanged = safeModeViewModel::setParentProfileName,
+                            onParentDeviceRoleChanged = safeModeViewModel::setParentDeviceRole,
+                            onGenerateChildPairingCode = safeModeViewModel::generateChildPairingCode,
+                            onRegisterChildPairingCode = safeModeViewModel::registerChildPairingCode,
                             onUnlinkParentAccount = safeModeViewModel::unlinkParentAccount,
+                            onUnlinkLinkedChildDevice = safeModeViewModel::unlinkLinkedChildDevice,
+                            onUnlinkLinkedParentDevice = safeModeViewModel::unlinkLinkedParentDevice,
                             onSyncParentDevice = safeModeViewModel::syncParentDevice,
                             onClearRemoteParentCommands = safeModeViewModel::clearRemoteParentCommands,
                             onRemoteAppExtraTime = safeModeViewModel::applyRemoteAppExtraTime,
                             onRemoteAppUnlockToday = safeModeViewModel::applyRemoteAppUnlockToday,
                             onRemoteTotalExtraTime = safeModeViewModel::applyRemoteTotalExtraTime,
                             onRemoteTotalUnlockToday = safeModeViewModel::applyRemoteTotalUnlockToday,
+                            onApproveRemoteUnlockRequest = safeModeViewModel::approveRemoteUnlockRequest,
+                            onRejectRemoteUnlockRequest = safeModeViewModel::rejectRemoteUnlockRequest,
                             onClearEventLog = safeModeViewModel::clearEventLog,
                             onDailyPolicyExpandedChange = safeModeViewModel::setDailyPolicyExpanded,
                             onAppGroupsExpandedChange = safeModeViewModel::setAppGroupsExpanded,
                             onAppLimitsExpandedChange = safeModeViewModel::setAppLimitsExpanded,
                             onScheduleBlockingExpandedChange = safeModeViewModel::setScheduleBlockingExpanded,
                             onAllowOnlyModeExpandedChange = safeModeViewModel::setAllowOnlyModeExpanded,
+                            onSettingsLanguageExpandedChange = safeModeViewModel::setSettingsLanguageExpanded,
+                            onSettingsNotificationExpandedChange = safeModeViewModel::setSettingsNotificationExpanded,
+                            onSettingsPinExpandedChange = safeModeViewModel::setSettingsPinExpanded,
+                            onSettingsParentManagementExpandedChange = safeModeViewModel::setSettingsParentManagementExpanded,
+                            onSettingsEventLogExpandedChange = safeModeViewModel::setSettingsEventLogExpanded,
                             suppressPermissionSetupAutoDialog = this@MainActivity.suppressPermissionSetupAutoDialog.value,
                             modifier = Modifier
                                 .padding(innerPadding)
@@ -308,6 +336,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val forceRefresh = stoppedAtElapsedRealtime > 0L &&
+            nowElapsed - stoppedAtElapsedRealtime >= FOREGROUND_FORCE_REFRESH_AFTER_MILLIS
+        stoppedAtElapsedRealtime = 0L
         val currentUiState = safeModeViewModel.uiState.value
         if (
             !currentUiState.safeModeEnabled &&
@@ -315,10 +347,11 @@ class MainActivity : ComponentActivity() {
         ) {
             UsageMonitorForegroundService.managerVisible(this)
         }
-        safeModeViewModel.refreshForForeground(force = false)
+        safeModeViewModel.refreshForForeground(force = forceRefresh)
     }
 
     override fun onStop() {
+        stoppedAtElapsedRealtime = SystemClock.elapsedRealtime()
         val currentUiState = safeModeViewModel.uiState.value
         if (!currentUiState.safeModeEnabled && currentUiState.policyEnforcementEnabled) {
             UsageMonitorForegroundService.start(this)
@@ -451,19 +484,32 @@ fun ScreenTimeManagerScreen(
     onUpdateEmergencyPin: (String, String) -> Unit,
     onPinInputChanged: () -> Unit,
     onPairParentAccount: (String, String, String) -> Unit,
+    onParentProfileNameChanged: (String) -> Unit,
+    onParentDeviceRoleChanged: (ParentDeviceRole, String) -> Unit,
+    onGenerateChildPairingCode: (String) -> Unit,
+    onRegisterChildPairingCode: (String, String, String) -> Unit,
     onUnlinkParentAccount: (String) -> Unit,
+    onUnlinkLinkedChildDevice: (String, String) -> Unit,
+    onUnlinkLinkedParentDevice: (String, String) -> Unit,
     onSyncParentDevice: () -> Unit,
     onClearRemoteParentCommands: (String) -> Unit,
     onRemoteAppExtraTime: (String, String, Int) -> Unit,
     onRemoteAppUnlockToday: (String, String) -> Unit,
     onRemoteTotalExtraTime: (Int) -> Unit,
     onRemoteTotalUnlockToday: () -> Unit,
+    onApproveRemoteUnlockRequest: (String, Int, Boolean) -> Unit,
+    onRejectRemoteUnlockRequest: (String) -> Unit,
     onClearEventLog: () -> Unit,
     onDailyPolicyExpandedChange: (Boolean) -> Unit,
     onAppGroupsExpandedChange: (Boolean) -> Unit,
     onAppLimitsExpandedChange: (Boolean) -> Unit,
     onScheduleBlockingExpandedChange: (Boolean) -> Unit,
     onAllowOnlyModeExpandedChange: (Boolean) -> Unit,
+    onSettingsLanguageExpandedChange: (Boolean) -> Unit,
+    onSettingsNotificationExpandedChange: (Boolean) -> Unit,
+    onSettingsPinExpandedChange: (Boolean) -> Unit,
+    onSettingsParentManagementExpandedChange: (Boolean) -> Unit,
+    onSettingsEventLogExpandedChange: (Boolean) -> Unit,
     suppressPermissionSetupAutoDialog: Boolean,
     modifier: Modifier = Modifier,
 ) {
@@ -472,6 +518,7 @@ fun ScreenTimeManagerScreen(
     var tabTransitionDirection by remember { mutableStateOf(1) }
     var emergencyPin by remember { mutableStateOf("") }
     var policyAdminPin by remember { mutableStateOf("") }
+    var pendingParentManagementAction by remember { mutableStateOf<ParentManagementPendingAction?>(null) }
     var showPolicySaveDialog by remember { mutableStateOf(false) }
     var permissionSetupDismissedThisSession by remember { mutableStateOf(false) }
     var permissionSetupGateReady by remember { mutableStateOf(false) }
@@ -488,9 +535,16 @@ fun ScreenTimeManagerScreen(
     val hasPolicySaveProblem = uiState.policyBudgetValidation.hasOverflow ||
         uiState.policySaveStatus == PolicySaveStatus.InvalidAdminPin ||
         uiState.policySaveStatus == PolicySaveStatus.BudgetExceeded
+    val hasPendingParentManagementAction = pendingParentManagementAction != null
+    val hasSaveChanges = uiState.policyDraftHasChanges || hasPendingParentManagementAction
+    val saveBudgetValidation = if (uiState.policyDraftHasChanges) {
+        uiState.policyBudgetValidation
+    } else {
+        PolicyBudgetValidation()
+    }
     val screenBackground by animateColorAsState(
         targetValue = when {
-            hasPolicySaveProblem || uiState.policyDraftHasChanges -> AppOver.copy(alpha = 0.045f)
+            hasPolicySaveProblem || hasSaveChanges -> AppOver.copy(alpha = 0.045f)
             uiState.policySaveStatus == PolicySaveStatus.Saved -> AppSafe.copy(alpha = 0.06f)
             else -> MaterialTheme.colorScheme.background
         },
@@ -541,6 +595,21 @@ fun ScreenTimeManagerScreen(
     LaunchedEffect(selectedTab) {
         if (selectedTab == ScreenTab.Stats) {
             onRefreshStatistics()
+        }
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val resumedSelectedTab by rememberUpdatedState(selectedTab)
+    val resumedRefreshStatistics by rememberUpdatedState(onRefreshStatistics)
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && resumedSelectedTab == ScreenTab.Stats) {
+                resumedRefreshStatistics()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
 
@@ -701,14 +770,29 @@ fun ScreenTimeManagerScreen(
                             onUpdateEmergencyPin = onUpdateEmergencyPin,
                             onPinInputChanged = onPinInputChanged,
                             onPairParentAccount = onPairParentAccount,
+                            onParentProfileNameChanged = onParentProfileNameChanged,
+                            onParentDeviceRoleChanged = onParentDeviceRoleChanged,
+                            onGenerateChildPairingCode = onGenerateChildPairingCode,
+                            onRegisterChildPairingCode = onRegisterChildPairingCode,
                             onUnlinkParentAccount = onUnlinkParentAccount,
+                            onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
+                            onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
                             onSyncParentDevice = onSyncParentDevice,
+                            pendingParentManagementAction = pendingParentManagementAction,
+                            onPendingParentManagementActionChanged = { pendingParentManagementAction = it },
                             onClearRemoteParentCommands = onClearRemoteParentCommands,
                             onRemoteAppExtraTime = onRemoteAppExtraTime,
                             onRemoteAppUnlockToday = onRemoteAppUnlockToday,
                             onRemoteTotalExtraTime = onRemoteTotalExtraTime,
                             onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
+                            onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
+                            onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
                             onClearEventLog = onClearEventLog,
+                            onSettingsLanguageExpandedChange = onSettingsLanguageExpandedChange,
+                            onSettingsNotificationExpandedChange = onSettingsNotificationExpandedChange,
+                            onSettingsPinExpandedChange = onSettingsPinExpandedChange,
+                            onSettingsParentManagementExpandedChange = onSettingsParentManagementExpandedChange,
+                            onSettingsEventLogExpandedChange = onSettingsEventLogExpandedChange,
                         )
                     }
                 }
@@ -720,8 +804,8 @@ fun ScreenTimeManagerScreen(
                 selectedTab = selectedTab,
                 text = text,
                 policySaveStatus = uiState.policySaveStatus,
-                hasPolicyChanges = uiState.policyDraftHasChanges,
-                budgetValidation = uiState.policyBudgetValidation,
+                hasPolicyChanges = hasSaveChanges,
+                budgetValidation = saveBudgetValidation,
                 onTabSelected = { tab -> selectTab(tab) },
                 onRequestSavePolicy = { showPolicySaveDialog = true },
                 modifier = Modifier
@@ -736,16 +820,42 @@ fun ScreenTimeManagerScreen(
                 adminPin = policyAdminPin,
                 text = text,
                 policySaveStatus = uiState.policySaveStatus,
-                hasPolicyChanges = uiState.policyDraftHasChanges,
-                budgetValidation = uiState.policyBudgetValidation,
+                hasPolicyChanges = hasSaveChanges,
+                budgetValidation = saveBudgetValidation,
                 onAdminPinChanged = { policyAdminPin = it },
                 onResetPolicyDraft = onResetPolicyDraft,
+                onResetParentManagementAction = { pendingParentManagementAction = null },
                 onDismiss = {
                     showPolicySaveDialog = false
                     policyAdminPin = ""
                 },
                 onSave = {
-                    onSaveUsagePolicy(policyAdminPin)
+                    if (uiState.policyDraftHasChanges) {
+                        onSaveUsagePolicy(policyAdminPin)
+                    }
+                    pendingParentManagementAction?.let { action ->
+                        when (action) {
+                            is ParentManagementPendingAction.ChangeRole -> {
+                                onParentDeviceRoleChanged(action.role, policyAdminPin)
+                            }
+                            ParentManagementPendingAction.GenerateChildPairingCode -> {
+                                onGenerateChildPairingCode(policyAdminPin)
+                            }
+                            is ParentManagementPendingAction.RegisterChildDevice -> {
+                                onRegisterChildPairingCode(action.pairingCode, "", policyAdminPin)
+                            }
+                            ParentManagementPendingAction.UnlinkParentAccount -> {
+                                onUnlinkParentAccount(policyAdminPin)
+                            }
+                            is ParentManagementPendingAction.UnlinkLinkedChild -> {
+                                onUnlinkLinkedChildDevice(action.childDeviceId, policyAdminPin)
+                            }
+                            is ParentManagementPendingAction.UnlinkLinkedParent -> {
+                                onUnlinkLinkedParentDevice(action.parentUid, policyAdminPin)
+                            }
+                        }
+                        pendingParentManagementAction = null
+                    }
                     policyAdminPin = ""
                     showPolicySaveDialog = false
                 },
@@ -823,15 +933,15 @@ private fun PermissionSetupDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .widthIn(max = 520.dp),
-            shape = RoundedCornerShape(28.dp),
+            shape = RoundedCornerShape(20.dp),
             color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 8.dp,
-            shadowElevation = 12.dp,
+            tonalElevation = 2.dp,
+            shadowElevation = 3.dp,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
-                modifier = Modifier.padding(22.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -946,6 +1056,7 @@ fun PolicySaveDialog(
     budgetValidation: PolicyBudgetValidation,
     onAdminPinChanged: (String) -> Unit,
     onResetPolicyDraft: () -> Unit,
+    onResetParentManagementAction: () -> Unit = {},
     onDismiss: () -> Unit,
     onSave: () -> Unit,
 ) {
@@ -973,15 +1084,15 @@ fun PolicySaveDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .widthIn(max = 420.dp),
-            shape = RoundedCornerShape(28.dp),
+            shape = RoundedCornerShape(20.dp),
             color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp,
-            shadowElevation = 12.dp,
+            tonalElevation = 2.dp,
+            shadowElevation = 3.dp,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
-                modifier = Modifier.padding(22.dp),
-                verticalArrangement = Arrangement.spacedBy(18.dp),
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SectionTitle(text.savePolicy, Modifier.weight(1f))
@@ -1038,6 +1149,7 @@ fun PolicySaveDialog(
                         onClick = {
                             focusManager.clearFocus()
                             onResetPolicyDraft()
+                            onResetParentManagementAction()
                             onDismiss()
                         },
                         enabled = hasPolicyChanges,
@@ -1063,7 +1175,7 @@ fun PolicySaveDialog(
                         onSave()
                     },
                     enabled = canSave,
-                    shape = RoundedCornerShape(22.dp),
+                    shape = RoundedCornerShape(14.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(54.dp),
@@ -1111,15 +1223,15 @@ fun SafetyAdminPinDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .widthIn(max = 420.dp),
-            shape = RoundedCornerShape(28.dp),
+            shape = RoundedCornerShape(20.dp),
             color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp,
-            shadowElevation = 12.dp,
+            tonalElevation = 2.dp,
+            shadowElevation = 3.dp,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
-                modifier = Modifier.padding(22.dp),
-                verticalArrangement = Arrangement.spacedBy(18.dp),
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SectionTitle(title, Modifier.weight(1f))
@@ -1217,12 +1329,12 @@ fun Header(
     ) {
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
             Text(
-                "ScreenRest",
+                text.appTitle,
                 style = MaterialTheme.typography.headlineLarge,
                 fontWeight = FontWeight.Bold,
             )
             Text(
-                "Manager \u00B7 Today",
+                text.appSubtitle,
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1260,10 +1372,10 @@ private fun BottomTabBar(
 ) {
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(30.dp),
+        shape = RoundedCornerShape(20.dp),
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.98f),
-        tonalElevation = 4.dp,
-        shadowElevation = 8.dp,
+        tonalElevation = 1.dp,
+        shadowElevation = 2.dp,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Row(
@@ -1327,8 +1439,8 @@ private fun BottomSaveAction(
         } else {
             Color.Transparent
         }
-        LimitStatus.Warning -> Color(0xFFFFF1D6).copy(alpha = activeAlpha)
-        LimitStatus.Exceeded -> AppOver.copy(alpha = 0.12f * activeAlpha)
+        LimitStatus.Warning -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = activeAlpha)
+        LimitStatus.Exceeded -> AppOver.copy(alpha = 0.10f * activeAlpha)
     }
     val contentColor = when (status) {
         LimitStatus.Normal -> if (policySaveStatus == PolicySaveStatus.Saved) AppSafe else MaterialTheme.colorScheme.onSurfaceVariant
@@ -1347,10 +1459,10 @@ private fun BottomSaveAction(
     }
     Surface(
         onClick = onClick,
-        modifier = modifier.height(58.dp),
-        shape = RoundedCornerShape(24.dp),
+        modifier = modifier.height(56.dp),
+        shape = RoundedCornerShape(14.dp),
         color = containerColor,
-        border = BorderStroke(1.4.dp, borderColor),
+        border = BorderStroke(1.dp, borderColor),
     ) {
         Column(
             modifier = Modifier
@@ -1393,9 +1505,9 @@ private fun BottomTabItem(
     val contentColor = if (selected) activeColor else inactiveColor
     Surface(
         onClick = onClick,
-        modifier = modifier.height(58.dp),
-        shape = RoundedCornerShape(24.dp),
-        color = if (selected) activeColor.copy(alpha = 0.12f) else Color.Transparent,
+        modifier = modifier.height(56.dp),
+        shape = RoundedCornerShape(14.dp),
+        color = if (selected) activeColor.copy(alpha = 0.10f) else Color.Transparent,
     ) {
         Column(
             modifier = Modifier.fillMaxSize(),
@@ -1556,15 +1668,16 @@ private fun AppStrings.tabLabel(tab: ScreenTab): String {
 fun ChoiceButton(label: String, selected: Boolean, onClick: () -> Unit) {
     Surface(
         onClick = onClick,
-        shape = RoundedCornerShape(7.dp),
-        color = if (selected) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(12.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.30f) else MaterialTheme.colorScheme.outlineVariant),
     ) {
         Text(
             text = label,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
             style = MaterialTheme.typography.labelLarge,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -1586,6 +1699,7 @@ fun OverviewContent(
             UsageStatsSection(
                 hasUsageAccess = uiState.hasUsageAccess,
                 usageAccessChecking = uiState.usageAccessChecking,
+                lastUpdatedAtMillis = uiState.usageLastUpdatedAtMillis,
                 todayUsage = uiState.todayUsage,
                 policySummary = uiState.policySummary,
                 text = text,
@@ -1611,6 +1725,8 @@ fun StatisticsContent(
             StatisticsSummaryCard(
                 dailyUsage = dailyUsage,
                 todayUsage = todayUsage,
+                lastUpdatedAtMillis = uiState.statisticsLastUpdatedAtMillis,
+                refreshing = uiState.statisticsRefreshing,
                 text = text,
             )
             DailyTrendCard(
@@ -1636,19 +1752,29 @@ fun StatisticsContent(
 private fun StatisticsSummaryCard(
     dailyUsage: List<DailyUsageInfo>,
     todayUsage: List<AppUsageInfo>,
+    lastUpdatedAtMillis: Long,
+    refreshing: Boolean,
     text: AppStrings,
 ) {
     val todayTotalMillis = todayUsage.sumOf { appUsage -> appUsage.totalTimeMillis }
-    val averageMillis = if (dailyUsage.isNotEmpty()) {
-        dailyUsage.sumOf { usage -> usage.totalTimeMillis } / dailyUsage.size
+    val recordedDailyUsage = dailyUsage.filter { usage -> usage.hasRecordedData }
+    val averageMillis = if (recordedDailyUsage.isNotEmpty()) {
+        recordedDailyUsage.sumOf { usage -> usage.totalTimeMillis } / recordedDailyUsage.size
     } else {
         todayTotalMillis
     }
-    val peakUsage = dailyUsage.maxByOrNull { usage -> usage.totalTimeMillis }
+    val peakUsage = recordedDailyUsage.maxByOrNull { usage -> usage.totalTimeMillis }
     val topApp = todayUsage.firstOrNull()
 
     SimpleCard {
-        SectionTitle(text.statistics)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SectionTitle(text.statistics, Modifier.weight(1f))
+            Text(
+                if (refreshing) text.updating else usageLastUpdatedLabel(lastUpdatedAtMillis, text),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1759,7 +1885,11 @@ private fun DailyUsageBar(
         label = "dailyUsageBar",
     )
     val isToday = isToday(usage.dayStartMillis)
-    val barColor = usageIntensityColor(fraction)
+    val barColor = if (usage.hasRecordedData) {
+        usageIntensityColor(fraction)
+    } else {
+        MaterialTheme.colorScheme.outlineVariant
+    }
     val labelColor = if (isToday) {
         MaterialTheme.colorScheme.primary
     } else {
@@ -1773,7 +1903,7 @@ private fun DailyUsageBar(
         verticalArrangement = Arrangement.Bottom,
     ) {
         Text(
-            formatDuration(usage.totalTimeMillis),
+            if (usage.hasRecordedData) formatDuration(usage.totalTimeMillis) else "—",
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Bold,
             color = labelColor,
@@ -2122,14 +2252,16 @@ fun StatusBadge(label: String, status: LimitStatus) {
         LimitStatus.Exceeded -> AppOver.copy(alpha = 0.18f)
     }
     Surface(
-        shape = RoundedCornerShape(8.dp),
+        shape = RoundedCornerShape(999.dp),
         color = color,
+        border = BorderStroke(1.dp, status.semanticColor().copy(alpha = 0.22f)),
     ) {
         Text(
             text = label,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
             style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.SemiBold,
+            color = status.semanticColor(),
         )
     }
 }
@@ -2138,10 +2270,11 @@ fun StatusBadge(label: String, status: LimitStatus) {
 fun MetricTile(label: String, value: String, modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier,
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.64f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.64f)),
     ) {
-        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
             Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -2202,7 +2335,22 @@ fun formatLimitWithAllowance(
     }
 }
 
-private val GaugeTrackColor = Color(0xFFE5E7EB)
+fun formatLimitWithTemporaryAllowance(
+    limitMinutes: Int,
+    extraMinutes: Int,
+    unlockedForToday: Boolean,
+    temporaryRemainingMinutes: Int,
+    text: AppStrings,
+): String {
+    return when {
+        unlockedForToday -> text.unlockedToday
+        temporaryRemainingMinutes > 0 ->
+            "${formatLimitMinutesLabel(temporaryRemainingMinutes)} ${text.temporaryAllowances}"
+        else -> formatLimitWithAllowance(limitMinutes, extraMinutes, false, text)
+    }
+}
+
+private val GaugeTrackColor = Color(0xFFE6EAF2)
 
 @Composable
 fun GaugeBar(
@@ -2474,14 +2622,29 @@ fun SettingsContent(
     onUpdateEmergencyPin: (String, String) -> Unit,
     onPinInputChanged: () -> Unit,
     onPairParentAccount: (String, String, String) -> Unit,
+    onParentProfileNameChanged: (String) -> Unit,
+    onParentDeviceRoleChanged: (ParentDeviceRole, String) -> Unit,
+    onGenerateChildPairingCode: (String) -> Unit,
+    onRegisterChildPairingCode: (String, String, String) -> Unit,
     onUnlinkParentAccount: (String) -> Unit,
+    onUnlinkLinkedChildDevice: (String, String) -> Unit,
+    onUnlinkLinkedParentDevice: (String, String) -> Unit,
     onSyncParentDevice: () -> Unit,
+    pendingParentManagementAction: ParentManagementPendingAction?,
+    onPendingParentManagementActionChanged: (ParentManagementPendingAction?) -> Unit,
     onClearRemoteParentCommands: (String) -> Unit,
     onRemoteAppExtraTime: (String, String, Int) -> Unit,
     onRemoteAppUnlockToday: (String, String) -> Unit,
     onRemoteTotalExtraTime: (Int) -> Unit,
     onRemoteTotalUnlockToday: () -> Unit,
+    onApproveRemoteUnlockRequest: (String, Int, Boolean) -> Unit,
+    onRejectRemoteUnlockRequest: (String) -> Unit,
     onClearEventLog: () -> Unit,
+    onSettingsLanguageExpandedChange: (Boolean) -> Unit,
+    onSettingsNotificationExpandedChange: (Boolean) -> Unit,
+    onSettingsPinExpandedChange: (Boolean) -> Unit,
+    onSettingsParentManagementExpandedChange: (Boolean) -> Unit,
+    onSettingsEventLogExpandedChange: (Boolean) -> Unit,
 ) {
     var currentAdminPin by remember { mutableStateOf("") }
     var newAdminPin by remember { mutableStateOf("") }
@@ -2500,8 +2663,14 @@ fun SettingsContent(
             onOpenExactAlarmSettings = onOpenExactAlarmSettings,
         )
 
-        SimpleCard {
-            SectionTitle(text.language)
+        CollapsiblePolicyCard(
+            title = text.language,
+            description = text.language,
+            icon = PolicySectionIcon.Language,
+            expanded = uiState.settingsLanguageExpanded,
+            onExpandedChange = onSettingsLanguageExpandedChange,
+            text = text,
+        ) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ChoiceButton(
                     label = text.korean,
@@ -2516,8 +2685,14 @@ fun SettingsContent(
             }
         }
 
-        SimpleCard {
-            SectionTitle(text.notificationSettings)
+        CollapsiblePolicyCard(
+            title = text.notificationSettings,
+            description = text.limitNotificationsDescription,
+            icon = PolicySectionIcon.Notifications,
+            expanded = uiState.settingsNotificationExpanded,
+            onExpandedChange = onSettingsNotificationExpandedChange,
+            text = text,
+        ) {
             NotificationPreferenceRow(
                 title = text.warningNotifications,
                 description = text.warningNotificationsDescription,
@@ -2532,8 +2707,14 @@ fun SettingsContent(
             )
         }
 
-        SimpleCard {
-            SectionTitle(text.pinSettings)
+        CollapsiblePolicyCard(
+            title = text.pinSettings,
+            description = text.adminPinRole,
+            icon = PolicySectionIcon.Pin,
+            expanded = uiState.settingsPinExpanded,
+            onExpandedChange = onSettingsPinExpandedChange,
+            text = text,
+        ) {
             PinChangeFields(
                 currentPin = currentAdminPin,
                 newPin = newAdminPin,
@@ -2592,28 +2773,58 @@ fun SettingsContent(
             )
         }
 
-        ParentManagementSection(
-            parentState = uiState.parentManagementState,
-            installedApps = uiState.installedApps,
-            policySummary = uiState.policySummary,
+        CollapsiblePolicyCard(
+            title = text.parentManagement,
+            description = text.parentManagementDescription,
+            icon = PolicySectionIcon.ParentManagement,
+            expanded = uiState.settingsParentManagementExpanded,
+            onExpandedChange = onSettingsParentManagementExpandedChange,
             text = text,
-            onPairParentAccount = onPairParentAccount,
-            onUnlinkParentAccount = onUnlinkParentAccount,
-            onSyncParentDevice = onSyncParentDevice,
-            onClearRemoteParentCommands = onClearRemoteParentCommands,
-            onRemoteAppExtraTime = onRemoteAppExtraTime,
-            onRemoteAppUnlockToday = onRemoteAppUnlockToday,
-            onRemoteTotalExtraTime = onRemoteTotalExtraTime,
-            onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
-        )
+        ) {
+            ParentManagementSection(
+                parentState = uiState.parentManagementState,
+                installedApps = uiState.installedApps,
+                policySummary = uiState.policySummary,
+                text = text,
+                onPairParentAccount = onPairParentAccount,
+                onParentProfileNameChanged = onParentProfileNameChanged,
+                onParentDeviceRoleChanged = onParentDeviceRoleChanged,
+                onGenerateChildPairingCode = onGenerateChildPairingCode,
+                onRegisterChildPairingCode = onRegisterChildPairingCode,
+                onUnlinkParentAccount = onUnlinkParentAccount,
+                onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
+                onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
+                onSyncParentDevice = onSyncParentDevice,
+                pendingParentManagementAction = pendingParentManagementAction,
+                onPendingParentManagementActionChanged = onPendingParentManagementActionChanged,
+                onClearRemoteParentCommands = onClearRemoteParentCommands,
+                onRemoteAppExtraTime = onRemoteAppExtraTime,
+                onRemoteAppUnlockToday = onRemoteAppUnlockToday,
+                onRemoteTotalExtraTime = onRemoteTotalExtraTime,
+                onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
+                onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
+                onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
+                wrapInCard = false,
+            )
+        }
     }
 
     val logs: @Composable ColumnScope.() -> Unit = {
-        EventLogSection(
-            eventLog = uiState.eventLog,
+        CollapsiblePolicyCard(
+            title = text.eventLog,
+            description = text.eventLog,
+            icon = PolicySectionIcon.EventLog,
+            expanded = uiState.settingsEventLogExpanded,
+            onExpandedChange = onSettingsEventLogExpandedChange,
             text = text,
-            onClearEventLog = onClearEventLog,
-        )
+        ) {
+            EventLogSection(
+                eventLog = uiState.eventLog,
+                text = text,
+                onClearEventLog = onClearEventLog,
+                wrapInCard = false,
+            )
+        }
     }
 
     AdaptiveTwoPane(
@@ -2809,43 +3020,72 @@ fun ParentManagementSection(
     policySummary: PolicySummary,
     text: AppStrings,
     onPairParentAccount: (String, String, String) -> Unit,
+    onParentProfileNameChanged: (String) -> Unit,
+    onParentDeviceRoleChanged: (ParentDeviceRole, String) -> Unit,
+    onGenerateChildPairingCode: (String) -> Unit,
+    onRegisterChildPairingCode: (String, String, String) -> Unit,
     onUnlinkParentAccount: (String) -> Unit,
+    onUnlinkLinkedChildDevice: (String, String) -> Unit,
+    onUnlinkLinkedParentDevice: (String, String) -> Unit,
     onSyncParentDevice: () -> Unit,
+    pendingParentManagementAction: ParentManagementPendingAction?,
+    onPendingParentManagementActionChanged: (ParentManagementPendingAction?) -> Unit,
     onClearRemoteParentCommands: (String) -> Unit,
     onRemoteAppExtraTime: (String, String, Int) -> Unit,
     onRemoteAppUnlockToday: (String, String) -> Unit,
     onRemoteTotalExtraTime: (Int) -> Unit,
     onRemoteTotalUnlockToday: () -> Unit,
+    onApproveRemoteUnlockRequest: (String, Int, Boolean) -> Unit,
+    onRejectRemoteUnlockRequest: (String) -> Unit,
+    wrapInCard: Boolean = true,
 ) {
-    var parentAccount by remember(parentState.parentAccountId) {
-        mutableStateOf(parentState.parentAccountId.ifBlank { "parent@example.com" })
-    }
-    var childDeviceName by remember(parentState.childDeviceName) {
-        mutableStateOf(parentState.childDeviceName.ifBlank { "Tablet" })
-    }
-    var adminPin by remember { mutableStateOf("") }
-    var selectedScope by remember { mutableStateOf(RemoteCommandScope.App) }
-    var selectedPackageName by remember { mutableStateOf("") }
-    var extraMinutes by remember { mutableStateOf(5) }
-
-    val limitedPackageNames = policySummary.appLimitSummaries.map { summary -> summary.packageName }.toSet()
-    val candidateApps = installedApps
-        .filter { app -> app.packageName !in SafetyGate.neverBlockPackages }
-        .sortedWith(
-            compareByDescending<InstalledAppInfo> { app -> app.packageName in limitedPackageNames }
-                .thenBy { app -> app.appName.lowercase() },
+    var profileName by remember(parentState.localProfileName, parentState.deviceRole) {
+        mutableStateOf(
+            parentState.localProfileName.ifBlank {
+                if (parentState.deviceRole == ParentDeviceRole.Parent) {
+                    parentState.parentAccountId.ifBlank { "Parent device" }
+                } else {
+                    parentState.childDeviceName.ifBlank { "Child device" }
+                }
+            },
         )
-        .take(24)
-    val selectedApp = candidateApps.firstOrNull { app -> app.packageName == selectedPackageName }
-        ?: candidateApps.firstOrNull()
+    }
+    var profileSaveRequested by rememberSaveable { mutableStateOf(false) }
+    var profileSaveAcknowledged by rememberSaveable { mutableStateOf(false) }
+    var selectedRoleDraft by remember { mutableStateOf(parentState.deviceRole) }
+    var childPairingCodeInput by remember { mutableStateOf("") }
+    val roleContainerColor = when (parentState.deviceRole) {
+        ParentDeviceRole.Child -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.18f)
+        ParentDeviceRole.Parent -> AppSafe.copy(alpha = 0.12f)
+    }
+    val roleBorderColor = when (parentState.deviceRole) {
+        ParentDeviceRole.Child -> MaterialTheme.colorScheme.primary.copy(alpha = 0.20f)
+        ParentDeviceRole.Parent -> AppSafe.copy(alpha = 0.28f)
+    }
 
-    LaunchedEffect(candidateApps) {
-        if (selectedPackageName.isBlank() || candidateApps.none { app -> app.packageName == selectedPackageName }) {
-            selectedPackageName = candidateApps.firstOrNull()?.packageName.orEmpty()
+    LaunchedEffect(parentState.deviceRole) {
+        selectedRoleDraft = parentState.deviceRole
+    }
+    LaunchedEffect(parentState.deviceRole, pendingParentManagementAction) {
+        val action = pendingParentManagementAction
+        selectedRoleDraft = if (action is ParentManagementPendingAction.ChangeRole) {
+            action.role
+        } else {
+            parentState.deviceRole
+        }
+    }
+    LaunchedEffect(parentState.localProfileName, profileSaveRequested, profileName) {
+        if (
+            profileSaveRequested &&
+            profileName.trim().isNotBlank() &&
+            parentState.localProfileName == profileName.trim()
+        ) {
+            profileSaveAcknowledged = true
+            profileSaveRequested = false
         }
     }
 
-    SimpleCard {
+    OptionalSimpleCard(wrapInCard = wrapInCard) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             SectionTitle(text.parentManagement, Modifier.weight(1f))
             StatusBadge(
@@ -2858,6 +3098,22 @@ fun ParentManagementSection(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        if (parentState.deviceRole == ParentDeviceRole.Parent) {
+            RemoteUnlockRequestList(
+                requests = parentState.remoteUnlockRequests,
+                text = text,
+                onApproveExtraTime = { request, minutes ->
+                    onApproveRemoteUnlockRequest(request.id, minutes, false)
+                },
+                onApproveUnlockToday = { request ->
+                    onApproveRemoteUnlockRequest(request.id, 0, true)
+                },
+                onReject = { request ->
+                    onRejectRemoteUnlockRequest(request.id)
+                },
+            )
+        }
 
         Surface(
             shape = RoundedCornerShape(18.dp),
@@ -2872,55 +3128,247 @@ fun ParentManagementSection(
             }
         }
 
-        OutlinedTextField(
-            value = parentAccount,
-            onValueChange = { parentAccount = it },
-            label = { Text(text.parentAccount) },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            shape = RoundedCornerShape(18.dp),
-        )
-        OutlinedTextField(
-            value = childDeviceName,
-            onValueChange = { childDeviceName = it },
-            label = { Text(text.childDeviceName) },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            shape = RoundedCornerShape(18.dp),
-        )
-        SecurePinTextField(
-            value = adminPin,
-            onValueChange = { adminPin = it },
-            label = text.adminPin,
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.NumberPassword,
-                imeAction = ImeAction.Done,
-            ),
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(18.dp),
-        )
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = roleContainerColor,
+            border = BorderStroke(1.dp, roleBorderColor),
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    text.parentDeviceRole,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ChoiceButton(
+                        label = text.childDeviceMode,
+                        selected = selectedRoleDraft == ParentDeviceRole.Child,
+                        onClick = {
+                            selectedRoleDraft = ParentDeviceRole.Child
+                            onPendingParentManagementActionChanged(
+                                if (ParentDeviceRole.Child == parentState.deviceRole) {
+                                    null
+                                } else {
+                                    ParentManagementPendingAction.ChangeRole(ParentDeviceRole.Child)
+                                },
+                            )
+                        },
+                    )
+                    ChoiceButton(
+                        label = text.parentDeviceMode,
+                        selected = selectedRoleDraft == ParentDeviceRole.Parent,
+                        onClick = {
+                            selectedRoleDraft = ParentDeviceRole.Parent
+                            onPendingParentManagementActionChanged(
+                                if (ParentDeviceRole.Parent == parentState.deviceRole) {
+                                    null
+                                } else {
+                                    ParentManagementPendingAction.ChangeRole(ParentDeviceRole.Parent)
+                                },
+                            )
+                        },
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedTextField(
+                        value = profileName,
+                        onValueChange = {
+                            profileName = it
+                            profileSaveRequested = false
+                            profileSaveAcknowledged = false
+                        },
+                        label = { Text(text.profileName) },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        shape = RoundedCornerShape(18.dp),
+                    )
+                    Button(
+                        onClick = {
+                            profileSaveRequested = true
+                            profileSaveAcknowledged = false
+                            onParentProfileNameChanged(profileName)
+                        },
+                        enabled = profileName.isNotBlank(),
+                        shape = RoundedCornerShape(16.dp),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                    ) {
+                        Text(
+                            if (profileSaveAcknowledged) text.profileSaved else text.savePolicy,
+                            maxLines = 1,
+                        )
+                    }
+                }
+                if (profileSaveAcknowledged) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        color = AppSafe.copy(alpha = 0.12f),
+                        border = BorderStroke(1.dp, AppSafe.copy(alpha = 0.26f)),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                text.profileSaved,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = AppSafe,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                text.profileSyncHint,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                if (parentState.deviceRole == ParentDeviceRole.Child) {
+                    ParentLinkDetailRow(
+                        text.childPairingCode,
+                        parentState.pairingCode.ifBlank { "-" },
+                    )
+                    LinkedParentDeviceList(
+                        parents = parentState.linkedParentDevices,
+                        text = text,
+                        onUnlink = { parentUid ->
+                            onPendingParentManagementActionChanged(
+                                ParentManagementPendingAction.UnlinkLinkedParent(parentUid),
+                            )
+                        },
+                    )
+                    Text(
+                        text.childPairingCodeHint,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(
+                        onClick = {
+                            onPendingParentManagementActionChanged(
+                                ParentManagementPendingAction.GenerateChildPairingCode,
+                            )
+                        },
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(text.generatePairingCode, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                } else {
+                    OutlinedTextField(
+                        value = childPairingCodeInput,
+                        onValueChange = { value ->
+                            childPairingCodeInput = value
+                                .uppercase()
+                                .filter { char -> char.isLetterOrDigit() }
+                                .removePrefix("SR")
+                                .take(6)
+                        },
+                        label = { Text(text.childPairingCode) },
+                        leadingIcon = {
+                            Text(
+                                "SR-",
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(18.dp),
+                    )
+                    Button(
+                        onClick = {
+                            onPendingParentManagementActionChanged(
+                                ParentManagementPendingAction.RegisterChildDevice("SR-$childPairingCodeInput"),
+                            )
+                        },
+                        enabled = childPairingCodeInput.isNotBlank(),
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(text.registerChildDevice, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    ParentLinkDetailRow(
+                        text.linkedChildDevices,
+                        parentState.linkedChildDevices
+                            .ifEmpty {
+                                parentState.linkedChildPairingCodes.map { code ->
+                                    LinkedChildDevice(
+                                        childDeviceId = code,
+                                        childDeviceName = code,
+                                        pairingCode = code,
+                                    )
+                                }
+                            }
+                            .size
+                            .toString(),
+                    )
+                    LinkedChildDeviceList(
+                        children = parentState.linkedChildDevices,
+                        text = text,
+                        onUnlink = { childDeviceId ->
+                            onPendingParentManagementActionChanged(
+                                ParentManagementPendingAction.UnlinkLinkedChild(childDeviceId),
+                            )
+                        },
+                    )
+                }
+            }
+        }
+
+        pendingParentManagementAction?.let { action ->
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.18f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.18f)),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        action.parentManagementActionTitle(text),
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    TextButton(
+                        onClick = {
+                            onPendingParentManagementActionChanged(null)
+                        },
+                        shape = RoundedCornerShape(14.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                    ) {
+                        Text(text.cancel, maxLines = 1)
+                    }
+                }
+            }
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Button(
-                onClick = {
-                    onPairParentAccount(parentAccount, childDeviceName, adminPin)
-                    adminPin = ""
-                },
-                enabled = parentAccount.isNotBlank() && adminPin.length >= 4,
-                shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.weight(1f),
-            ) {
-                Text(text.connectParent, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
             OutlinedButton(
                 onClick = {
-                    onUnlinkParentAccount(adminPin)
-                    adminPin = ""
+                    onPendingParentManagementActionChanged(ParentManagementPendingAction.UnlinkParentAccount)
                 },
-                enabled = parentState.paired && adminPin.length >= 4,
+                enabled = parentState.paired,
                 shape = RoundedCornerShape(18.dp),
                 modifier = Modifier.weight(1f),
             ) {
@@ -2930,7 +3378,7 @@ fun ParentManagementSection(
                 onClick = onSyncParentDevice,
                 enabled = parentState.paired,
                 shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.weight(0.82f),
+                modifier = Modifier.weight(1f),
             ) {
                 Text(text.syncNow, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
@@ -2941,66 +3389,171 @@ fun ParentManagementSection(
             text.lastSync,
             if (parentState.lastSyncMillis > 0L) formatClockTime(parentState.lastSyncMillis) else "-",
         )
+    }
+}
 
-        Surface(
-            shape = RoundedCornerShape(20.dp),
-            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.28f),
+sealed class ParentManagementPendingAction {
+    data class ChangeRole(val role: ParentDeviceRole) : ParentManagementPendingAction()
+    object GenerateChildPairingCode : ParentManagementPendingAction()
+    data class RegisterChildDevice(val pairingCode: String) : ParentManagementPendingAction()
+    object UnlinkParentAccount : ParentManagementPendingAction()
+    data class UnlinkLinkedChild(val childDeviceId: String) : ParentManagementPendingAction()
+    data class UnlinkLinkedParent(val parentUid: String) : ParentManagementPendingAction()
+}
+
+private fun ParentManagementPendingAction.parentManagementActionTitle(text: AppStrings): String {
+    return when (this) {
+        is ParentManagementPendingAction.ChangeRole -> "${text.parentDeviceRole} ${text.savePolicy}"
+        ParentManagementPendingAction.GenerateChildPairingCode -> text.generatePairingCode
+        is ParentManagementPendingAction.RegisterChildDevice -> text.registerChildDevice
+        ParentManagementPendingAction.UnlinkParentAccount,
+        is ParentManagementPendingAction.UnlinkLinkedChild,
+        is ParentManagementPendingAction.UnlinkLinkedParent -> text.unlinkParent
+    }
+}
+
+@Composable
+private fun RemoteUnlockRequestList(
+    requests: List<RemoteUnlockRequest>,
+    text: AppStrings,
+    onApproveExtraTime: (RemoteUnlockRequest, Int) -> Unit,
+    onApproveUnlockToday: (RemoteUnlockRequest) -> Unit,
+    onReject: (RemoteUnlockRequest) -> Unit,
+) {
+    val now = System.currentTimeMillis()
+    val activeRequestCount = requests.count { request ->
+        request.status == RemoteUnlockRequestStatus.Pending && request.expiresAtMillis >= now
+    }
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.30f),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Column(
-                modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text.remoteTestMode,
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    LimitTimeChip(formatLimitMinutesLabel(extraMinutes))
-                }
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (parentState.paired) text.parentLinkHint else text.parentCommandRequiresLink,
-                    style = MaterialTheme.typography.bodySmall,
+                    text.remoteRequests,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                StatusBadge(
+                    label = activeRequestCount.toString(),
+                    status = if (activeRequestCount > 0) {
+                        LimitStatus.Warning
+                    } else {
+                        LimitStatus.Normal
+                    },
+                )
+            }
+            if (requests.isEmpty()) {
+                Text(
+                    text.noRemoteRequests,
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ChoiceButton(
-                        label = text.remoteAppTarget,
-                        selected = selectedScope == RemoteCommandScope.App,
-                        onClick = { selectedScope = RemoteCommandScope.App },
+            } else {
+                requests
+                    .sortedWith(
+                        compareByDescending<RemoteUnlockRequest> { request ->
+                            request.status == RemoteUnlockRequestStatus.Pending && request.expiresAtMillis >= now
+                        }.thenByDescending { request -> request.createdAtMillis },
                     )
-                    ChoiceButton(
-                        label = text.remoteDailyLimit,
-                        selected = selectedScope == RemoteCommandScope.Total,
-                        onClick = { selectedScope = RemoteCommandScope.Total },
-                    )
-                }
-                if (selectedScope == RemoteCommandScope.App) {
-                    if (candidateApps.isEmpty()) {
-                        Text(
-                            text.noSelectableApps,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    .take(5)
+                    .forEach { request ->
+                        RemoteUnlockRequestRow(
+                            request = request,
+                            now = now,
+                            text = text,
+                            onApproveExtraTime = onApproveExtraTime,
+                            onApproveUnlockToday = onApproveUnlockToday,
+                            onReject = onReject,
                         )
-                    } else {
-                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(candidateApps, key = { app -> app.packageName }) { app ->
-                                ChoiceButton(
-                                    label = app.appName,
-                                    selected = app.packageName == selectedApp?.packageName,
-                                    onClick = { selectedPackageName = app.packageName },
-                                )
-                            }
-                        }
                     }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteUnlockRequestRow(
+    request: RemoteUnlockRequest,
+    now: Long,
+    text: AppStrings,
+    onApproveExtraTime: (RemoteUnlockRequest, Int) -> Unit,
+    onApproveUnlockToday: (RemoteUnlockRequest) -> Unit,
+    onReject: (RemoteUnlockRequest) -> Unit,
+) {
+    var selectedMinutes by remember(request.id, request.requestedMinutes) {
+        mutableStateOf(request.requestedMinutes.coerceAtLeast(1))
+    }
+    var showExtraTimePicker by remember(request.id) { mutableStateOf(false) }
+    val expired = request.expiresAtMillis < now && request.status == RemoteUnlockRequestStatus.Pending
+    val active = request.status == RemoteUnlockRequestStatus.Pending && !expired
+    val status = when {
+        active -> LimitStatus.Warning
+        request.status == RemoteUnlockRequestStatus.Approved -> LimitStatus.Normal
+        else -> LimitStatus.Exceeded
+    }
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.90f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.70f)),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        request.remoteRequestTitle(text),
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        request.remoteRequestDetail(text),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(1, 5, 15, 30, 60).forEach { minutes ->
-                        ChoiceButton(
-                            label = formatLimitMinutesLabel(minutes),
-                            selected = extraMinutes == minutes,
-                            onClick = { extraMinutes = minutes },
+                StatusBadge(
+                    label = if (expired) RemoteUnlockRequestStatus.Expired.name.lowercase() else request.status.name.lowercase(),
+                    status = status,
+                )
+            }
+            if (active) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text.remoteExtraTime,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Surface(
+                        onClick = { showExtraTimePicker = true },
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.50f),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)),
+                    ) {
+                        Text(
+                            formatLimitMinutesLabel(selectedMinutes),
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
                         )
                     }
                 }
@@ -3009,57 +3562,80 @@ fun ParentManagementSection(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Button(
-                        onClick = {
-                            if (selectedScope == RemoteCommandScope.Total) {
-                                onRemoteTotalExtraTime(extraMinutes)
-                            } else {
-                                selectedApp?.let { app ->
-                                    onRemoteAppExtraTime(app.packageName, app.appName, extraMinutes)
-                                }
-                            }
-                        },
-                        enabled = parentState.paired && (selectedScope == RemoteCommandScope.Total || selectedApp != null),
-                        shape = RoundedCornerShape(18.dp),
+                        onClick = { onApproveExtraTime(request, selectedMinutes) },
+                        shape = RoundedCornerShape(14.dp),
                         modifier = Modifier.weight(1f),
                     ) {
                         Text(text.remoteAddTime, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     OutlinedButton(
-                        onClick = {
-                            if (selectedScope == RemoteCommandScope.Total) {
-                                onRemoteTotalUnlockToday()
-                            } else {
-                                selectedApp?.let { app ->
-                                    onRemoteAppUnlockToday(app.packageName, app.appName)
-                                }
-                            }
-                        },
-                        enabled = parentState.paired && (selectedScope == RemoteCommandScope.Total || selectedApp != null),
-                        shape = RoundedCornerShape(18.dp),
+                        onClick = { onApproveUnlockToday(request) },
+                        shape = RoundedCornerShape(14.dp),
                         modifier = Modifier.weight(1f),
                     ) {
                         Text(text.remoteUnlockToday, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
+                    TextButton(
+                        onClick = { onReject(request) },
+                        modifier = Modifier.weight(0.72f),
+                    ) {
+                        Text(text.reject, maxLines = 1)
+                    }
                 }
             }
         }
-
-        RemoteCommandHistory(
-            commands = parentState.remoteCommands,
-            adminPin = adminPin,
+    }
+    if (showExtraTimePicker) {
+        DurationPickerSheet(
+            title = text.remoteExtraTime,
+            valueMinutes = selectedMinutes,
+            minMinutes = 1,
+            maxMinutes = REMOTE_PARENT_MAX_EXTRA_MINUTES,
+            includeMaxPreset = false,
             text = text,
-            onAdminPinChanged = { adminPin = it },
-            onClearRemoteParentCommands = {
-                onClearRemoteParentCommands(adminPin)
-                adminPin = ""
+            onDismiss = { showExtraTimePicker = false },
+            onApply = { minutes ->
+                selectedMinutes = minutes.coerceIn(1, REMOTE_PARENT_MAX_EXTRA_MINUTES)
+                showExtraTimePicker = false
             },
         )
     }
 }
 
-private enum class RemoteCommandScope {
-    App,
-    Total,
+private fun RemoteUnlockRequest.remoteRequestTitle(text: AppStrings): String {
+    val target = if (blockReason == RemoteRequestBlockReason.DailyLimit) {
+        text.remoteDailyLimit
+    } else {
+        targetAppName.ifBlank {
+            targetGroupName.ifBlank {
+                scheduleName.ifBlank {
+                    targetPackageName
+                }
+            }
+        }
+    }
+    return "${blockReason.remoteLabel(text)} - $target"
+}
+
+private fun RemoteUnlockRequest.remoteRequestDetail(text: AppStrings): String {
+    val limitText = limitMillis?.let { limit -> " / ${formatDuration(limit)}" }.orEmpty()
+    val extraText = alreadyGrantedExtraMinutes
+        .takeIf { minutes -> minutes > 0 }
+        ?.let { minutes -> ", +${formatLimitMinutesLabel(minutes)}" }
+        .orEmpty()
+    val unlockText = if (unlockedForToday) ", ${text.remoteUnlockToday}" else ""
+    val messageText = childMessage.takeIf { message -> message.isNotBlank() }?.let { message -> "\n$message" }.orEmpty()
+    return "${childDeviceName.ifBlank { childDeviceId }} - ${formatDuration(usedMillis)}$limitText - ${text.remoteAddTime} ${formatLimitMinutesLabel(requestedMinutes)}$extraText$unlockText$messageText"
+}
+
+private fun RemoteRequestBlockReason.remoteLabel(text: AppStrings): String {
+    return when (this) {
+        RemoteRequestBlockReason.DailyLimit -> text.remoteDailyLimit
+        RemoteRequestBlockReason.AppGroupLimit -> text.appGroups
+        RemoteRequestBlockReason.AppLimit -> text.appLimits
+        RemoteRequestBlockReason.ScheduleBlock -> text.scheduleBlocking
+        RemoteRequestBlockReason.AllowOnlyMode -> text.allowOnlyMode
+    }
 }
 
 @Composable
@@ -3082,101 +3658,110 @@ private fun ParentLinkDetailRow(label: String, value: String) {
 }
 
 @Composable
-private fun RemoteCommandHistory(
-    commands: List<RemoteParentCommand>,
-    adminPin: String,
+private fun LinkedChildDeviceList(
+    children: List<LinkedChildDevice>,
     text: AppStrings,
-    onAdminPinChanged: (String) -> Unit,
-    onClearRemoteParentCommands: () -> Unit,
+    onUnlink: (String) -> Unit,
 ) {
-    Surface(
-        shape = RoundedCornerShape(18.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.34f),
-    ) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text.remoteCommands,
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                )
-                OutlinedButton(
-                    onClick = onClearRemoteParentCommands,
-                    enabled = commands.isNotEmpty() && adminPin.length >= 4,
-                    shape = RoundedCornerShape(999.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                    modifier = Modifier.height(34.dp),
+    if (children.isEmpty()) {
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        children.take(5).forEach { child ->
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Text(text.clear, maxLines = 1)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            child.childDeviceName.ifBlank { child.childDeviceId },
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            child.childDeviceId.take(8).ifBlank { child.pairingCode },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    StatusBadge(label = text.parentLinked, status = LimitStatus.Normal)
+                    TextButton(
+                        onClick = { onUnlink(child.childDeviceId) },
+                    ) {
+                        Text(text.unlinkParent, maxLines = 1)
+                    }
                 }
-            }
-            if (commands.isEmpty()) {
-                Text(
-                    text.noRemoteCommands,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                commands.take(5).forEach { command ->
-                    RemoteCommandRow(command = command, text = text)
-                }
-                SecurePinTextField(
-                    value = adminPin,
-                    onValueChange = onAdminPinChanged,
-                    label = text.adminPin,
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.NumberPassword,
-                        imeAction = ImeAction.Done,
-                    ),
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                )
             }
         }
     }
 }
 
 @Composable
-private fun RemoteCommandRow(command: RemoteParentCommand, text: AppStrings) {
-    val status = when (command.status) {
-        RemoteParentCommandStatus.Applied -> LimitStatus.Normal
-        RemoteParentCommandStatus.Pending -> LimitStatus.Warning
-        RemoteParentCommandStatus.Failed -> LimitStatus.Exceeded
+private fun LinkedParentDeviceList(
+    parents: List<LinkedParentDevice>,
+    text: AppStrings,
+    onUnlink: (String) -> Unit,
+) {
+    if (parents.isEmpty()) {
+        return
     }
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(
-                command.message.ifBlank { text.remoteCommandLabel(command) },
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                formatClockTime(command.timestampMillis),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text.linkedParentDevices,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = FontWeight.SemiBold,
+        )
+        parents.take(5).forEach { parent ->
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            parent.parentDisplayName.ifBlank { "Parent device" },
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            parent.parentUid.take(8),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    StatusBadge(label = text.parentLinked, status = LimitStatus.Normal)
+                    TextButton(
+                        onClick = { onUnlink(parent.parentUid) },
+                    ) {
+                        Text(text.unlinkParent, maxLines = 1)
+                    }
+                }
+            }
         }
-        StatusBadge(label = command.status.name.lowercase(), status = status)
-    }
-}
-
-private fun AppStrings.remoteCommandLabel(command: RemoteParentCommand): String {
-    val target = command.targetAppName.ifBlank { command.targetPackageName }
-    return when (command.type) {
-        RemoteParentCommandType.AddAppTime -> "${remoteAddTime} ${formatLimitMinutesLabel(command.minutes)} ${target}"
-        RemoteParentCommandType.UnlockAppToday -> "${remoteUnlockToday} ${target}"
-        RemoteParentCommandType.AddTotalTime -> "${remoteDailyLimit} +${formatLimitMinutesLabel(command.minutes)}"
-        RemoteParentCommandType.UnlockTotalToday -> "${remoteDailyLimit} ${remoteUnlockToday}"
     }
 }
 
@@ -3228,6 +3813,7 @@ fun NotificationPreferenceRow(
 fun AlwaysAllowedAppsSection(
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary> = emptyList(),
     text: AppStrings,
     onAllowedAppsChanged: (Set<String>) -> Unit,
 ) {
@@ -3235,6 +3821,7 @@ fun AlwaysAllowedAppsSection(
         AlwaysAllowedAppsContent(
             installedApps = installedApps,
             allowedAppPackages = allowedAppPackages,
+            temporaryAllowedApps = temporaryAllowedApps,
             text = text,
             onAllowedAppsChanged = onAllowedAppsChanged,
         )
@@ -3245,14 +3832,17 @@ fun AlwaysAllowedAppsSection(
 fun ColumnScope.AlwaysAllowedAppsContent(
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary> = emptyList(),
     text: AppStrings,
     onAllowedAppsChanged: (Set<String>) -> Unit,
 ) {
     val userAllowedPackages = allowedAppPackages - SafetyGate.neverBlockPackages
+    val temporaryAllowanceByPackage = temporaryAllowedApps.associateBy { allowance -> allowance.packageName }
+    val effectiveUserAllowedPackages = userAllowedPackages + temporaryAllowanceByPackage.keys
     var listsExpanded by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.CenterVertically) {
         SectionTitle(text.alwaysAllowedApps, Modifier.weight(1f))
-        StatusBadge(text.selectedApps(userAllowedPackages.size), LimitStatus.Normal)
+        StatusBadge(text.allowedAppCount(effectiveUserAllowedPackages.size), LimitStatus.Normal)
         Spacer(modifier = Modifier.width(8.dp))
         Surface(
             onClick = { listsExpanded = !listsExpanded },
@@ -3302,11 +3892,12 @@ fun ColumnScope.AlwaysAllowedAppsContent(
         style = MaterialTheme.typography.titleMedium,
         fontWeight = FontWeight.Bold,
     )
-    val sortedApps = remember(installedApps, userAllowedPackages) {
+    val sortedApps = remember(installedApps, userAllowedPackages, temporaryAllowanceByPackage) {
         installedApps
             .filterNot { app -> app.packageName in SafetyGate.neverBlockPackages }
             .sortedWith(
                 compareByDescending<InstalledAppInfo> { app -> app.packageName in userAllowedPackages }
+                    .thenByDescending { app -> app.packageName in temporaryAllowanceByPackage }
                     .thenByDescending { app -> app.packageName in SafetyGate.communicationAppPackages }
                     .thenBy { app -> app.appName.lowercase() },
             )
@@ -3318,16 +3909,25 @@ fun ColumnScope.AlwaysAllowedAppsContent(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(max = 360.dp),
-            resetKey = sortedApps.map { app -> app.packageName } + userAllowedPackages.sorted(),
+            resetKey = sortedApps.map { app -> app.packageName } +
+                userAllowedPackages.sorted() + temporaryAllowanceByPackage.keys.sorted(),
         ) {
             items(sortedApps, key = { app -> app.packageName }) { app ->
-                val selected = app.packageName in userAllowedPackages
+                val permanentlyAllowed = app.packageName in userAllowedPackages
+                val temporaryAllowance = temporaryAllowanceByPackage[app.packageName]
+                val selected = permanentlyAllowed || temporaryAllowance != null
                 UserAllowedAppRow(
                     app = app,
                     selected = selected,
                     text = text,
+                    enabled = temporaryAllowance == null,
+                    statusLabel = when {
+                        permanentlyAllowed -> text.allowed
+                        temporaryAllowance != null -> temporaryAllowanceStatusLabel(temporaryAllowance, text)
+                        else -> text.allow
+                    },
                     onToggle = {
-                        val nextPackages = if (selected) {
+                        val nextPackages = if (permanentlyAllowed) {
                             userAllowedPackages - app.packageName
                         } else {
                             userAllowedPackages + app.packageName
@@ -4025,7 +4625,7 @@ fun BlockSafetyStatusSection(
         val hasTemporaryTotalAllowance = todayTemporaryState.totalUnlockedForToday ||
             todayTemporaryState.totalExtraMinutes > 0
         val hasTemporaryPackageAllowance = todayTemporaryState.packageAllowances.any { (_, allowance) ->
-            allowance.unlockedForToday || allowance.extraMinutes > 0
+            allowance.unlockedForToday || allowance.extraMinutes > 0 || allowance.temporaryRemainingMinutes() > 0
         }
         if (!hasTemporaryTotalAllowance && !hasTemporaryPackageAllowance) {
             Text(text.noTemporaryAllowances, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -4053,7 +4653,9 @@ fun BlockSafetyStatusSection(
             }
 
             todayTemporaryState.packageAllowances
-                .filter { (_, allowance) -> allowance.unlockedForToday || allowance.extraMinutes > 0 }
+                .filter { (_, allowance) ->
+                    allowance.unlockedForToday || allowance.extraMinutes > 0 || allowance.temporaryRemainingMinutes() > 0
+                }
                 .toSortedMap(compareBy { packageName ->
                     installedNameByPackage[packageName]
                         ?: appSummaryByPackage[packageName]?.appName
@@ -4065,7 +4667,9 @@ fun BlockSafetyStatusSection(
                     val appName = installedNameByPackage[packageName]
                         ?: appSummary?.appName
                         ?: packageName
-                    val remaining = remainingTemporaryPackageMinutes(
+                    val temporaryRemaining = allowance.temporaryRemainingMinutes()
+                    val remaining = temporaryRemaining.takeIf { minutes -> minutes > 0 }
+                        ?: remainingTemporaryPackageMinutes(
                         extraMinutes = allowance.extraMinutes,
                         appSummary = appSummary,
                         groupSummary = groupSummary,
@@ -4309,8 +4913,9 @@ fun EventLogSection(
     eventLog: List<EventLogEntry>,
     text: AppStrings,
     onClearEventLog: () -> Unit,
+    wrapInCard: Boolean = true,
 ) {
-    SimpleCard {
+    OptionalSimpleCard(wrapInCard = wrapInCard) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             SectionTitle(text.eventLog, Modifier.weight(1f))
             OutlinedButton(onClick = onClearEventLog) {
@@ -4331,6 +4936,7 @@ fun EventLogSection(
 fun UsageStatsSection(
     hasUsageAccess: Boolean,
     usageAccessChecking: Boolean,
+    lastUpdatedAtMillis: Long,
     todayUsage: List<AppUsageInfo>,
     policySummary: PolicySummary,
     text: AppStrings,
@@ -4339,6 +4945,12 @@ fun UsageStatsSection(
     SimpleCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             SectionTitle(text.todayUsage, Modifier.weight(1f))
+            Text(
+                if (usageAccessChecking) text.updating else usageLastUpdatedLabel(lastUpdatedAtMillis, text),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.width(8.dp))
             if (hasUsageAccess) {
                 CircleTextButton(label = "R", onClick = onRefreshUsageStats)
             }
@@ -4390,6 +5002,14 @@ fun UsageStatsSection(
         } else if (todayUsage.isEmpty()) {
             Text(text.noUsageRecorded)
         }
+    }
+}
+
+private fun usageLastUpdatedLabel(lastUpdatedAtMillis: Long, text: AppStrings): String {
+    return if (lastUpdatedAtMillis > 0L) {
+        text.lastUpdated(formatClockTime(lastUpdatedAtMillis))
+    } else {
+        text.notUpdatedYet
     }
 }
 
@@ -4504,6 +5124,7 @@ fun PolicySummarySection(summary: PolicySummary, text: AppStrings) {
                 val isNext = summary.nextScheduleSummary?.id == scheduleSummary.id
                 SchedulePolicySummaryLine(
                     summary = scheduleSummary,
+                    temporaryAllowedApps = summary.temporaryAllowedApps,
                     text = text,
                     status = when {
                         isActive -> LimitStatus.Exceeded
@@ -4552,29 +5173,36 @@ fun AllowOnlyPolicySummaryLine(summary: PolicySummary, text: AppStrings) {
         shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.36f),
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            GroupSummaryDot(status = LimitStatus.Warning)
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text.allowOnlyMode,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    text.allowOnlyModeSummary,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                GroupSummaryDot(status = LimitStatus.Warning)
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text.allowOnlyMode,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text.allowOnlyModeSummary,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                StatusBadge(text.allowedAppCount(summary.allowOnlyAllowedAppCount), LimitStatus.Warning)
             }
-            StatusBadge(text.allowedAppCount(summary.allowOnlyAllowedAppCount), LimitStatus.Warning)
+            if (summary.temporaryAllowedApps.isNotEmpty()) {
+                TemporaryAllowedAppsSummaryList(summary.temporaryAllowedApps, text)
+            }
         }
     }
 }
@@ -4582,6 +5210,7 @@ fun AllowOnlyPolicySummaryLine(summary: PolicySummary, text: AppStrings) {
 @Composable
 fun SchedulePolicySummaryLine(
     summary: ScheduleSummary,
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
     status: LimitStatus,
     label: String,
@@ -4622,7 +5251,52 @@ fun SchedulePolicySummaryLine(
                     LimitTimeChip(text.startsIn(formatLimitMinutesLabel(minutes)))
                 }
             }
+            if (summary.activeNow && temporaryAllowedApps.isNotEmpty()) {
+                TemporaryAllowedAppsSummaryList(temporaryAllowedApps, text)
+            }
         }
+    }
+}
+
+@Composable
+private fun TemporaryAllowedAppsSummaryList(
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
+    text: AppStrings,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        temporaryAllowedApps.forEach { allowance ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                AppIcon(
+                    packageName = allowance.packageName,
+                    contentDescription = allowance.appName,
+                    size = 30.dp,
+                )
+                Text(
+                    text = allowance.appName,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                StatusBadge(temporaryAllowanceStatusLabel(allowance, text), LimitStatus.Normal)
+            }
+        }
+    }
+}
+
+private fun temporaryAllowanceStatusLabel(
+    allowance: TemporaryAllowedAppSummary,
+    text: AppStrings,
+): String {
+    return if (allowance.unlockedForToday) {
+        text.unlockedToday
+    } else {
+        text.temporaryAllowanceRemaining(allowance.temporaryRemainingMinutes)
     }
 }
 
@@ -4740,12 +5414,15 @@ fun GroupSummarySheet(
                                 {
                                     LimitTimeChip(
                                         if (limitMinutes != null) {
-                                            formatLimitWithAllowance(
+                                            formatLimitWithTemporaryAllowance(
                                                 limitMinutes = limitMinutes,
                                                 extraMinutes = appUsage.extraMinutes,
                                                 unlockedForToday = appUsage.unlockedForToday,
+                                                temporaryRemainingMinutes = appUsage.temporaryRemainingMinutes,
                                                 text = text,
                                             )
+                                        } else if (appUsage.temporaryRemainingMinutes > 0) {
+                                            "${formatLimitMinutesLabel(appUsage.temporaryRemainingMinutes)} ${text.temporaryAllowances}"
                                         } else if (appUsage.unlockedForToday) {
                                             text.unlockedToday
                                         } else {
@@ -4782,10 +5459,11 @@ fun AppLimitSummaryRow(summary: AppLimitSummary, text: AppStrings) {
         appName = summary.appName,
         packageName = summary.packageName,
         supportingText = "${formatLimitMinutesLabel(summary.usedMinutes)} / ${
-            formatLimitWithAllowance(
+            formatLimitWithTemporaryAllowance(
                 limitMinutes = summary.limitMinutes,
                 extraMinutes = summary.extraMinutes,
                 unlockedForToday = summary.unlockedForToday,
+                temporaryRemainingMinutes = summary.temporaryRemainingMinutes,
                 text = text,
             )
         }",
@@ -4917,10 +5595,11 @@ fun PolicyAppSummaryLine(summary: AppLimitSummary, text: AppStrings) {
             Text(summary.appName, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
                 "${formatLimitMinutesLabel(summary.usedMinutes)} / ${
-                    formatLimitWithAllowance(
+                    formatLimitWithTemporaryAllowance(
                         limitMinutes = summary.limitMinutes,
                         extraMinutes = summary.extraMinutes,
                         unlockedForToday = summary.unlockedForToday,
+                        temporaryRemainingMinutes = summary.temporaryRemainingMinutes,
                         text = text,
                     )
                 }",
@@ -5306,6 +5985,11 @@ private enum class PolicySectionIcon {
     AppLimits,
     Schedule,
     AllowOnly,
+    Language,
+    Notifications,
+    Pin,
+    ParentManagement,
+    EventLog,
 }
 
 @Composable
@@ -5522,6 +6206,156 @@ private fun PolicySectionIconBadge(
                         cap = StrokeCap.Round,
                     )
                 }
+
+                PolicySectionIcon.Language -> {
+                    drawCircle(
+                        color = primary,
+                        radius = size.minDimension * 0.36f,
+                        center = Offset(size.width / 2f, size.height / 2f),
+                        style = stroke,
+                    )
+                    drawLine(
+                        color = primary,
+                        start = Offset(size.width * 0.18f, size.height / 2f),
+                        end = Offset(size.width * 0.82f, size.height / 2f),
+                        strokeWidth = strokeWidth,
+                        cap = StrokeCap.Round,
+                    )
+                    drawArc(
+                        color = primary,
+                        startAngle = 100f,
+                        sweepAngle = 160f,
+                        useCenter = false,
+                        topLeft = Offset(size.width * 0.31f, size.height * 0.14f),
+                        size = Size(size.width * 0.38f, size.height * 0.72f),
+                        style = stroke,
+                    )
+                    drawArc(
+                        color = primary,
+                        startAngle = -80f,
+                        sweepAngle = 160f,
+                        useCenter = false,
+                        topLeft = Offset(size.width * 0.31f, size.height * 0.14f),
+                        size = Size(size.width * 0.38f, size.height * 0.72f),
+                        style = stroke,
+                    )
+                }
+
+                PolicySectionIcon.Notifications -> {
+                    val bellPath = Path().apply {
+                        moveTo(size.width * 0.30f, size.height * 0.56f)
+                        lineTo(size.width * 0.30f, size.height * 0.42f)
+                        quadraticTo(size.width * 0.30f, size.height * 0.24f, size.width * 0.50f, size.height * 0.24f)
+                        quadraticTo(size.width * 0.70f, size.height * 0.24f, size.width * 0.70f, size.height * 0.42f)
+                        lineTo(size.width * 0.70f, size.height * 0.56f)
+                        lineTo(size.width * 0.78f, size.height * 0.68f)
+                        lineTo(size.width * 0.22f, size.height * 0.68f)
+                        close()
+                    }
+                    drawPath(path = bellPath, color = primary, style = stroke)
+                    drawCircle(
+                        color = primary,
+                        radius = strokeWidth * 0.62f,
+                        center = Offset(size.width * 0.50f, size.height * 0.78f),
+                    )
+                    drawLine(
+                        color = primary,
+                        start = Offset(size.width * 0.50f, size.height * 0.18f),
+                        end = Offset(size.width * 0.50f, size.height * 0.12f),
+                        strokeWidth = strokeWidth,
+                        cap = StrokeCap.Round,
+                    )
+                }
+
+                PolicySectionIcon.Pin -> {
+                    drawArc(
+                        color = primary,
+                        startAngle = 180f,
+                        sweepAngle = 180f,
+                        useCenter = false,
+                        topLeft = Offset(size.width * 0.30f, size.height * 0.16f),
+                        size = Size(size.width * 0.40f, size.height * 0.46f),
+                        style = stroke,
+                    )
+                    drawRoundRect(
+                        color = primary,
+                        topLeft = Offset(size.width * 0.22f, size.height * 0.44f),
+                        size = Size(size.width * 0.56f, size.height * 0.38f),
+                        cornerRadius = CornerRadius(size.minDimension * 0.10f, size.minDimension * 0.10f),
+                        style = stroke,
+                    )
+                    drawCircle(
+                        color = primary,
+                        radius = strokeWidth * 0.68f,
+                        center = Offset(size.width * 0.50f, size.height * 0.62f),
+                    )
+                    drawLine(
+                        color = primary,
+                        start = Offset(size.width * 0.50f, size.height * 0.66f),
+                        end = Offset(size.width * 0.50f, size.height * 0.74f),
+                        strokeWidth = strokeWidth,
+                        cap = StrokeCap.Round,
+                    )
+                }
+
+                PolicySectionIcon.ParentManagement -> {
+                    drawCircle(
+                        color = primary,
+                        radius = size.minDimension * 0.13f,
+                        center = Offset(size.width * 0.39f, size.height * 0.34f),
+                        style = stroke,
+                    )
+                    drawCircle(
+                        color = primary,
+                        radius = size.minDimension * 0.11f,
+                        center = Offset(size.width * 0.66f, size.height * 0.38f),
+                        style = stroke,
+                    )
+                    drawArc(
+                        color = primary,
+                        startAngle = 205f,
+                        sweepAngle = 130f,
+                        useCenter = false,
+                        topLeft = Offset(size.width * 0.18f, size.height * 0.48f),
+                        size = Size(size.width * 0.43f, size.height * 0.35f),
+                        style = stroke,
+                    )
+                    drawArc(
+                        color = primary,
+                        startAngle = 205f,
+                        sweepAngle = 130f,
+                        useCenter = false,
+                        topLeft = Offset(size.width * 0.50f, size.height * 0.52f),
+                        size = Size(size.width * 0.35f, size.height * 0.28f),
+                        style = stroke,
+                    )
+                }
+
+                PolicySectionIcon.EventLog -> {
+                    drawRoundRect(
+                        color = primary,
+                        topLeft = Offset(size.width * 0.20f, size.height * 0.14f),
+                        size = Size(size.width * 0.60f, size.height * 0.72f),
+                        cornerRadius = CornerRadius(size.minDimension * 0.10f, size.minDimension * 0.10f),
+                        style = stroke,
+                    )
+                    listOf(0.34f, 0.50f, 0.66f).forEach { y ->
+                        drawLine(
+                            color = primary,
+                            start = Offset(size.width * 0.34f, size.height * y),
+                            end = Offset(size.width * 0.68f, size.height * y),
+                            strokeWidth = strokeWidth,
+                            cap = StrokeCap.Round,
+                        )
+                    }
+                    listOf(0.34f, 0.50f, 0.66f).forEach { y ->
+                        drawCircle(
+                            color = primary,
+                            radius = strokeWidth * 0.45f,
+                            center = Offset(size.width * 0.28f, size.height * y),
+                        )
+                    }
+                }
             }
         }
     }
@@ -5574,6 +6408,7 @@ fun ScheduleBlockingCard(
     settings: UsagePolicySettings,
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
@@ -5646,6 +6481,7 @@ fun ScheduleBlockingCard(
                 settings = settings,
                 installedApps = installedApps,
                 allowedAppPackages = allowedAppPackages,
+                temporaryAllowedApps = temporaryAllowedApps,
                 text = text,
                 onUpdateSettings = onUpdateSettings,
             )
@@ -5658,6 +6494,7 @@ fun AllowOnlyModeCard(
     settings: UsagePolicySettings,
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
@@ -5690,11 +6527,13 @@ fun AllowOnlyModeCard(
             AllowedPolicyRelationshipSummary(
                 settings = settings,
                 allowedAppPackages = allowedAppPackages,
+                temporaryAllowedApps = temporaryAllowedApps,
                 text = text,
             )
             AlwaysAllowedAppsContent(
                 installedApps = installedApps,
                 allowedAppPackages = allowedAppPackages,
+                temporaryAllowedApps = temporaryAllowedApps,
                 text = text,
                 onAllowedAppsChanged = onAllowedAppsChanged,
             )
@@ -5706,6 +6545,7 @@ fun AllowOnlyModeCard(
 private fun AllowedPolicyRelationshipSummary(
     settings: UsagePolicySettings,
     allowedAppPackages: Set<String>,
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
 ) {
     val userAllowedCount = (allowedAppPackages - SafetyGate.neverBlockPackages).size
@@ -5746,6 +6586,14 @@ private fun AllowedPolicyRelationshipSummary(
                 statusLabel = text.allowedAppCount(userAllowedCount),
                 status = if (userAllowedCount > 0) LimitStatus.Normal else LimitStatus.Warning,
             )
+            if (temporaryAllowedApps.isNotEmpty()) {
+                SafetyStatusRow(
+                    title = text.temporaryAllowances,
+                    supportingText = text.temporaryAllowancePolicy,
+                    statusLabel = text.allowedAppCount(temporaryAllowedApps.size),
+                    status = LimitStatus.Normal,
+                )
+            }
             SafetyStatusRow(
                 title = text.scheduleAllowedApps,
                 supportingText = text.scheduleAllowedPolicy,
@@ -5854,6 +6702,8 @@ private fun TimeWheelPickerDialog(
     saveLabel: String,
     onDismiss: () -> Unit,
     onApply: (Int) -> Unit,
+    headerIcon: (@Composable () -> Unit)? = null,
+    supportingText: String? = null,
 ) {
     val cleanLowerBound = lowerBound.coerceAtMost(upperBound)
     val cleanUpperBound = upperBound.coerceAtLeast(cleanLowerBound)
@@ -5877,10 +6727,10 @@ private fun TimeWheelPickerDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .widthIn(max = 440.dp),
-            shape = RoundedCornerShape(32.dp),
-            color = Color(0xFFF8FAFF),
+            shape = RoundedCornerShape(20.dp),
+            color = MaterialTheme.colorScheme.surface,
             tonalElevation = 0.dp,
-            shadowElevation = 18.dp,
+            shadowElevation = 4.dp,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
         ) {
             Column(
@@ -5889,24 +6739,37 @@ private fun TimeWheelPickerDialog(
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    headerIcon?.let { content ->
+                        content()
+                        Spacer(modifier = Modifier.height(10.dp))
+                    }
                     Text(
                         title,
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         textAlign = TextAlign.Center,
-                        color = Color(0xFF171A2E),
+                        color = MaterialTheme.colorScheme.onSurface,
                     )
+                    supportingText?.takeIf { value -> value.isNotBlank() }?.let { value ->
+                        Text(
+                            text = value,
+                            modifier = Modifier.padding(top = 6.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                     Surface(
                         modifier = Modifier.padding(top = 10.dp),
-                        shape = RoundedCornerShape(18.dp),
-                        color = Color(0xFFEAF2FF),
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer,
                     ) {
                         Text(
                             displayValue(draftMinutes),
                             modifier = Modifier.padding(horizontal = 22.dp, vertical = 10.dp),
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF2F6FE4),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
                         )
                     }
                 }
@@ -5915,8 +6778,8 @@ private fun TimeWheelPickerDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(300.dp)
-                        .clip(RoundedCornerShape(26.dp))
-                        .background(Color.White.copy(alpha = 0.7f)),
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
                     contentAlignment = Alignment.Center,
                 ) {
                     Box(
@@ -5925,8 +6788,8 @@ private fun TimeWheelPickerDialog(
                             .fillMaxWidth()
                             .padding(horizontal = 12.dp)
                             .height(66.dp)
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color(0xFFF0F3F8)),
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(MaterialTheme.colorScheme.surface),
                     )
                     Row(
                         modifier = Modifier
@@ -5956,7 +6819,7 @@ private fun TimeWheelPickerDialog(
                             .height(78.dp)
                             .background(
                                 Brush.verticalGradient(
-                                    colors = listOf(Color(0xFFF8FAFF), Color(0x00F8FAFF)),
+                                    colors = listOf(MaterialTheme.colorScheme.surface, Color.Transparent),
                                 ),
                             ),
                     )
@@ -5967,7 +6830,7 @@ private fun TimeWheelPickerDialog(
                             .height(78.dp)
                             .background(
                                 Brush.verticalGradient(
-                                    colors = listOf(Color(0x00F8FAFF), Color(0xFFF8FAFF)),
+                                    colors = listOf(Color.Transparent, MaterialTheme.colorScheme.surface),
                                 ),
                             ),
                     )
@@ -5978,8 +6841,8 @@ private fun TimeWheelPickerDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(58.dp),
-                    shape = RoundedCornerShape(30.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2F6FE4)),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                 ) {
                     Text(
                         saveLabel,
@@ -6003,6 +6866,7 @@ private fun ClockTimeWheel(
     modifier: Modifier = Modifier,
 ) {
     var showDirectInput by remember { mutableStateOf(false) }
+    var suppressWheelSelection by remember { mutableStateOf(false) }
     val wheelValues = remember(values.first, values.last) {
         values.toList().ifEmpty { listOf(value) }
     }
@@ -6014,12 +6878,20 @@ private fun ClockTimeWheel(
     val currentOnValueChange by rememberUpdatedState(onValueChange)
     LaunchedEffect(value, values.first, values.last) {
         val index = wheelValues.indexOf(value)
-        if (index >= 0 && !listState.isScrollInProgress) {
-            listState.animateScrollToItem(index)
+        if (index >= 0) {
+            suppressWheelSelection = true
+            try {
+                listState.scrollToItem(index)
+            } finally {
+                suppressWheelSelection = false
+            }
         }
     }
     LaunchedEffect(listState, wheelValues) {
         snapshotFlow {
+            if (listState.isScrollInProgress || suppressWheelSelection) {
+                return@snapshotFlow null
+            }
             val layoutInfo = listState.layoutInfo
             val center = (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2
             layoutInfo.visibleItemsInfo
@@ -6030,6 +6902,7 @@ private fun ClockTimeWheel(
             .collect { index ->
                 val nextValue = wheelValues.getOrNull(index ?: return@collect) ?: return@collect
                 if (nextValue != currentValue) {
+                    suppressWheelSelection = true
                     currentOnValueChange(nextValue)
                 }
             }
@@ -6051,6 +6924,7 @@ private fun ClockTimeWheel(
                     if (selected) {
                         showDirectInput = true
                     } else {
+                        suppressWheelSelection = true
                         currentOnValueChange(item)
                     }
                 },
@@ -6084,7 +6958,10 @@ private fun ClockTimeWheel(
             values = values,
             onDismiss = { showDirectInput = false },
             onApply = { input ->
-                currentOnValueChange(input)
+                if (input != currentValue) {
+                    suppressWheelSelection = true
+                    currentOnValueChange(input)
+                }
                 showDirectInput = false
             },
         )
@@ -6109,10 +6986,10 @@ private fun WheelNumberInputDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .widthIn(max = 320.dp),
-            shape = RoundedCornerShape(24.dp),
+            shape = RoundedCornerShape(18.dp),
             color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 8.dp,
-            shadowElevation = 14.dp,
+            tonalElevation = 2.dp,
+            shadowElevation = 4.dp,
         ) {
             Column(
                 modifier = Modifier.padding(20.dp),
@@ -6158,8 +7035,8 @@ private fun WheelNumberInputDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(52.dp),
-                    shape = RoundedCornerShape(26.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10C7B3)),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
                 ) {
                     Text("OK", color = Color.White, fontWeight = FontWeight.Bold)
                 }
@@ -6188,6 +7065,7 @@ private fun ScheduleTemplateSection(
     settings: UsagePolicySettings,
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
     onUpdateSettings: (UsagePolicySettings) -> Unit,
 ) {
@@ -6202,6 +7080,9 @@ private fun ScheduleTemplateSection(
     var appSearchQuery by remember(selectedTemplateId) { mutableStateOf("") }
     val selectedTemplate = templates.firstOrNull { template -> template.id == selectedTemplateId }
     val globalUserAllowedPackages = allowedAppPackages - SafetyGate.neverBlockPackages
+    val temporaryAllowedPackages = temporaryAllowedApps
+        .map { allowance -> allowance.packageName }
+        .toSet() - SafetyGate.neverBlockPackages
 
     fun applyTemplates(
         nextTemplates: List<ScheduleTemplatePolicy>,
@@ -6316,7 +7197,9 @@ private fun ScheduleTemplateSection(
                             globalUserAllowedPackages
                         ScheduleTemplateChip(
                             template = template,
-                            allowedAppCount = scheduleOnlyPackages.size + globalUserAllowedPackages.size,
+                            allowedAppCount = (
+                                scheduleOnlyPackages + globalUserAllowedPackages + temporaryAllowedPackages
+                                ).size,
                             selected = selectedTemplateId == template.id,
                             text = text,
                             onClick = {
@@ -6365,6 +7248,7 @@ private fun ScheduleTemplateSection(
                     templates = templates,
                     installedApps = installedApps,
                     globalAllowedPackages = allowedAppPackages,
+                    temporaryAllowedApps = temporaryAllowedApps,
                     appSearchQuery = appSearchQuery,
                     text = text,
                     onSearchQueryChange = { query -> appSearchQuery = query },
@@ -6546,6 +7430,7 @@ private fun ScheduleTemplateAllowedAppsEditor(
     templates: List<ScheduleTemplatePolicy>,
     installedApps: List<InstalledAppInfo>,
     globalAllowedPackages: Set<String>,
+    temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     appSearchQuery: String,
     text: AppStrings,
     onSearchQueryChange: (String) -> Unit,
@@ -6555,8 +7440,18 @@ private fun ScheduleTemplateAllowedAppsEditor(
     val scheduleOnlyAllowedPackages = template.allowedPackageNames -
         globalUserAllowedPackages -
         SafetyGate.neverBlockPackages
-    val totalVisibleAllowedCount = (scheduleOnlyAllowedPackages + globalUserAllowedPackages).size
-    val visibleApps = remember(installedApps, scheduleOnlyAllowedPackages, globalUserAllowedPackages, appSearchQuery) {
+    val temporaryAllowanceByPackage = temporaryAllowedApps.associateBy { allowance -> allowance.packageName }
+    val temporaryAllowedPackages = temporaryAllowanceByPackage.keys - SafetyGate.neverBlockPackages
+    val totalVisibleAllowedCount = (
+        scheduleOnlyAllowedPackages + globalUserAllowedPackages + temporaryAllowedPackages
+        ).size
+    val visibleApps = remember(
+        installedApps,
+        scheduleOnlyAllowedPackages,
+        globalUserAllowedPackages,
+        temporaryAllowedPackages,
+        appSearchQuery,
+    ) {
         installedApps
             .filterNot { app -> app.packageName in SafetyGate.neverBlockPackages }
             .filter { app ->
@@ -6565,6 +7460,7 @@ private fun ScheduleTemplateAllowedAppsEditor(
             .sortedWith(
                 compareByDescending<InstalledAppInfo> { app -> app.packageName in globalUserAllowedPackages }
                     .thenByDescending { app -> app.packageName in scheduleOnlyAllowedPackages }
+                    .thenByDescending { app -> app.packageName in temporaryAllowedPackages }
                     .thenByDescending { app -> app.packageName in SafetyGate.communicationAppPackages }
                     .thenBy { app -> app.appName.lowercase() },
             )
@@ -6600,20 +7496,27 @@ private fun ScheduleTemplateAllowedAppsEditor(
                 resetKey = template.id to (
                     appSearchQuery +
                         scheduleOnlyAllowedPackages.sorted().joinToString(",") +
-                        globalUserAllowedPackages.sorted().joinToString(",")
+                        globalUserAllowedPackages.sorted().joinToString(",") +
+                        temporaryAllowedPackages.sorted().joinToString(",")
                     ),
             ) {
                 items(visibleApps, key = { app -> app.packageName }) { app ->
                     val globallyAllowed = app.packageName in globalUserAllowedPackages
-                    val selected = globallyAllowed || app.packageName in scheduleOnlyAllowedPackages
+                    val scheduleAllowed = app.packageName in scheduleOnlyAllowedPackages
+                    val temporaryAllowance = temporaryAllowanceByPackage[app.packageName]
+                    val selected = globallyAllowed || scheduleAllowed || temporaryAllowance != null
                     UserAllowedAppRow(
                         app = app,
                         selected = selected,
                         text = text,
-                        enabled = !globallyAllowed,
-                        statusLabel = if (globallyAllowed) text.allowed else if (selected) text.allowed else text.allow,
+                        enabled = !globallyAllowed && temporaryAllowance == null,
+                        statusLabel = when {
+                            globallyAllowed || scheduleAllowed -> text.allowed
+                            temporaryAllowance != null -> temporaryAllowanceStatusLabel(temporaryAllowance, text)
+                            else -> text.allow
+                        },
                         onToggle = {
-                            val nextPackages = if (selected) {
+                            val nextPackages = if (scheduleAllowed) {
                                 scheduleOnlyAllowedPackages - app.packageName
                             } else {
                                 scheduleOnlyAllowedPackages + app.packageName
@@ -6861,6 +7764,7 @@ fun AppLimitRow(
     limitMinutes: Int?,
     extraMinutes: Int,
     unlockedForToday: Boolean,
+    temporaryRemainingMinutes: Int,
     text: AppStrings,
     onClick: () -> Unit,
 ) {
@@ -6885,6 +7789,8 @@ fun AppLimitRow(
                     Text(
                         when {
                             unlockedForToday -> text.unlockedToday
+                            temporaryRemainingMinutes > 0 ->
+                                "${formatLimitMinutesLabel(temporaryRemainingMinutes)} ${text.temporaryAllowances}"
                             hasLimit -> formatLimitWithAllowance(limitMinutes ?: 0, extraMinutes, false, text)
                             extraMinutes > 0 -> "+${formatLimitMinutesLabel(extraMinutes)}"
                             else -> text.noLimit
@@ -6895,7 +7801,7 @@ fun AppLimitRow(
                 }
                 Surface(
                     shape = RoundedCornerShape(16.dp),
-                    color = if (hasLimit || extraMinutes > 0 || unlockedForToday) {
+                    color = if (hasLimit || extraMinutes > 0 || unlockedForToday || temporaryRemainingMinutes > 0) {
                         MaterialTheme.colorScheme.primaryContainer
                     } else {
                         MaterialTheme.colorScheme.surfaceVariant
@@ -6904,6 +7810,8 @@ fun AppLimitRow(
                     Text(
                         when {
                             unlockedForToday -> text.unlockedToday
+                            temporaryRemainingMinutes > 0 ->
+                                "${formatLimitMinutesLabel(temporaryRemainingMinutes)} ${text.temporaryAllowances}"
                             hasLimit -> formatLimitWithAllowance(limitMinutes ?: 0, extraMinutes, false, text)
                             extraMinutes > 0 -> "+${formatLimitMinutesLabel(extraMinutes)}"
                             else -> text.addLimit
@@ -6911,7 +7819,7 @@ fun AppLimitRow(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
-                    color = if (hasLimit || extraMinutes > 0 || unlockedForToday) {
+                    color = if (hasLimit || extraMinutes > 0 || unlockedForToday || temporaryRemainingMinutes > 0) {
                         MaterialTheme.colorScheme.primary
                     } else {
                         MaterialTheme.colorScheme.onSurfaceVariant
@@ -6962,9 +7870,8 @@ private fun appLimitAllocationInfo(
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AppLimitEditorSheet(
+private fun AppLimitPickerDialog(
     app: InstalledAppInfo,
     initialLimitMinutes: Int?,
     allocationInfo: AppLimitAllocationInfo?,
@@ -6973,114 +7880,35 @@ private fun AppLimitEditorSheet(
     onApply: (Int?) -> Unit,
 ) {
     val maxAllowedMinutes = allocationInfo?.maxAllowedMinutes ?: POLICY_MAX_MINUTES
-    var draftMinutes by remember(app.packageName, initialLimitMinutes, maxAllowedMinutes) {
-        mutableStateOf((initialLimitMinutes ?: 0).coerceIn(0, maxAllowedMinutes))
-    }
-    val presets = listOf(0, 1, 2, 3, 5, 10, 15, 30, 60, 120, 240, 360, 720)
-        .filter { minutes -> minutes == 0 || minutes <= maxAllowedMinutes }
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val sheetScrollState = rememberScrollState()
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        containerColor = MaterialTheme.colorScheme.surface,
-        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .verticalScroll(sheetScrollState)
-                .navigationBarsPadding()
-                .padding(horizontal = 24.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                AppIcon(packageName = app.packageName, contentDescription = app.appName, size = 44.dp)
-                Spacer(modifier = Modifier.width(14.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(app.appName, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text(
-                        if (draftMinutes > 0) text.minutesPerDay(draftMinutes) else text.noLimit,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                presets.forEach { minutes ->
-                    LimitPresetChip(
-                        label = if (minutes == 0) text.noLimit else formatLimitMinutesLabel(minutes),
-                        selected = draftMinutes == minutes,
-                        onClick = { draftMinutes = minutes },
-                    )
-                }
-            }
-            allocationInfo?.let { info ->
-                Text(
-                    text = text.appLimitGroupAllowance(
-                        info.groupName.ifBlank { text.groupName },
-                        info.maxAllowedMinutes,
-                        info.groupBudgetMinutes,
-                    ),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            MinuteControlPanel(
-                valueMinutes = draftMinutes,
-                onValueMinutesChange = { minutes -> draftMinutes = minutes.coerceAtMost(maxAllowedMinutes) },
-                text = text,
-                title = text.appLimits,
-                maxMinutes = maxAllowedMinutes,
-            )
-
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(
-                    onClick = { draftMinutes = 0 },
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(18.dp),
-                ) {
-                    Text(text.noLimit)
-                }
-                Button(
-                    onClick = {
-                        onApply(draftMinutes.coerceAtMost(maxAllowedMinutes).takeIf { minutes -> minutes > 0 })
-                    },
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(18.dp),
-                ) {
-                    Text(text.applyLimit)
-                }
-            }
-            Spacer(modifier = Modifier.height(18.dp))
-        }
-    }
-}
-
-@Composable
-private fun LimitPresetChip(label: String, selected: Boolean, onClick: () -> Unit) {
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(22.dp),
-        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-    ) {
-        Text(
-            text = label,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Bold,
-            color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+    val supportingText = allocationInfo?.let { info ->
+        text.appLimitGroupAllowance(
+            info.groupName.ifBlank { text.groupName },
+            info.maxAllowedMinutes,
+            info.groupBudgetMinutes,
         )
     }
+    TimeWheelPickerDialog(
+        title = app.appName,
+        valueMinutes = (initialLimitMinutes ?: 0).coerceIn(0, maxAllowedMinutes),
+        lowerBound = 0,
+        upperBound = maxAllowedMinutes,
+        displayValue = { minutes ->
+            if (minutes == 0) text.noLimit else text.minutesPerDay(minutes)
+        },
+        saveLabel = text.applyLimit,
+        onDismiss = onDismiss,
+        onApply = { minutes -> onApply(minutes.takeIf { value -> value > 0 }) },
+        headerIcon = {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                AppIcon(packageName = app.packageName, contentDescription = app.appName, size = 44.dp)
+            }
+        },
+        supportingText = supportingText,
+    )
 }
 
 fun formatLimitMinutesLabel(minutes: Int): String {
@@ -7188,6 +8016,24 @@ private fun UsagePolicySection(
     }
     val appLimits = settings.appLimitMap()
     val todayTemporaryUnlockState = temporaryUnlockState.forToday()
+    var temporaryAllowanceNowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(todayTemporaryUnlockState) {
+        while (true) {
+            delay(30_000L)
+            temporaryAllowanceNowMillis = System.currentTimeMillis()
+        }
+    }
+    val temporaryAllowedApps = remember(
+        todayTemporaryUnlockState,
+        installedApps,
+        temporaryAllowanceNowMillis,
+    ) {
+        buildTemporaryAllowedAppSummaries(
+            temporaryUnlockState = todayTemporaryUnlockState,
+            appNameByPackage = installedApps.associate { app -> app.packageName to app.appName },
+            nowMillis = temporaryAllowanceNowMillis,
+        )
+    }
     var appSearchQuery by remember { mutableStateOf("") }
     var appLimitFilter by remember { mutableStateOf(AppLimitFilter.All) }
     var selectedLimitApp by remember { mutableStateOf<InstalledAppInfo?>(null) }
@@ -7503,6 +8349,7 @@ private fun UsagePolicySection(
                             limitMinutes = appLimit,
                             extraMinutes = allowance?.extraMinutes ?: 0,
                             unlockedForToday = allowance?.unlockedForToday == true,
+                            temporaryRemainingMinutes = allowance?.temporaryRemainingMinutes() ?: 0,
                             text = text,
                             onClick = { selectedLimitApp = app },
                         )
@@ -7514,7 +8361,7 @@ private fun UsagePolicySection(
 
     selectedLimitApp?.let { app ->
         val allocationInfo = appLimitAllocationInfo(app.packageName, appGroups, appLimits)
-        AppLimitEditorSheet(
+        AppLimitPickerDialog(
             app = app,
             initialLimitMinutes = appLimits[app.packageName],
             allocationInfo = allocationInfo,
@@ -7561,6 +8408,7 @@ private fun UsagePolicySection(
                     settings = settings,
                     installedApps = installedApps,
                     allowedAppPackages = allowedAppPackages,
+                    temporaryAllowedApps = temporaryAllowedApps,
                     text = text,
                     expanded = scheduleBlockingExpanded,
                     onExpandedChange = onScheduleBlockingExpandedChange,
@@ -7570,6 +8418,7 @@ private fun UsagePolicySection(
                     settings = settings,
                     installedApps = installedApps,
                     allowedAppPackages = allowedAppPackages,
+                    temporaryAllowedApps = temporaryAllowedApps,
                     text = text,
                     expanded = allowOnlyModeExpanded,
                     onExpandedChange = onAllowOnlyModeExpandedChange,
@@ -7584,16 +8433,32 @@ private fun UsagePolicySection(
 @Composable
 fun SimpleCard(content: @Composable ColumnScope.() -> Unit) {
     Card(
-        shape = RoundedCornerShape(24.dp),
+        shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            content = content,
+        )
+    }
+}
+
+@Composable
+fun OptionalSimpleCard(
+    wrapInCard: Boolean,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    if (wrapInCard) {
+        SimpleCard(content)
+    } else {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
             content = content,
         )
     }
@@ -7611,12 +8476,12 @@ private fun ContainedLazyColumn(
     }
     val containedScrollConnection = rememberContainedScrollConnection()
 
-    val shape = RoundedCornerShape(18.dp)
+    val shape = RoundedCornerShape(14.dp)
     Surface(
         modifier = modifier,
         shape = shape,
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.20f),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.92f)),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.24f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.78f)),
     ) {
         Box(modifier = Modifier.clip(shape)) {
             LazyColumn(
@@ -7759,6 +8624,7 @@ fun newAppGroupId(): String = UUID.randomUUID().toString()
 fun newScheduleTemplateId(): String = UUID.randomUUID().toString()
 
 private const val POLICY_MAX_MINUTES = 720
+private const val REMOTE_PARENT_MAX_EXTRA_MINUTES = POLICY_MAX_MINUTES
 private const val DAILY_POLICY_MAX_MINUTES = 24 * 60 - 1
 private const val SCHEDULE_MAX_MINUTES = 24 * 60 - 5
 
@@ -7889,6 +8755,7 @@ private fun formatMonitorAge(ageMillis: Long): String {
 
 private const val MONITOR_STALE_WARNING_MILLIS = 90_000L
 private const val USAGE_CONSISTENCY_TOLERANCE_MILLIS = 2L * 60L * 1000L
+private const val FOREGROUND_FORCE_REFRESH_AFTER_MILLIS = 10_000L
 
 fun Int.toDayIndex(): Int {
     return when (this) {
@@ -7904,6 +8771,8 @@ fun Int.toDayIndex(): Int {
 }
 
 class AppStrings {
+    var appTitle: String = "ScreenRest"
+    var appSubtitle: String = "Manager \u00B7 Today"
     var korean: String = ""
     var overview: String = ""
     var time: String = ""
@@ -7939,6 +8808,9 @@ class AppStrings {
     var usageAccessRequired: String = ""
     var openUsageAccessSettings: String = ""
     var refresh: String = ""
+    var updating: String = ""
+    var notUpdatedYet: String = ""
+    var lastUpdated: (String) -> String = { _ -> "" }
     var noUsageRecorded: String = ""
     var policySummary: String = ""
     var totalUsageSummary: String = ""
@@ -8081,6 +8953,8 @@ class AppStrings {
     var blockSafetyStatus: String = ""
     var currentBlockTargets: String = ""
     var temporaryAllowances: String = ""
+    var temporaryAllowancePolicy: String = ""
+    var temporaryAllowanceRemaining: (Int) -> String = { _ -> "" }
     var noCurrentBlockTargets: String = ""
     var noTemporaryAllowances: String = ""
     var dailyLimit: String = ""
@@ -8099,8 +8973,20 @@ class AppStrings {
     var parentPin: String = ""
     var parentManagement: String = ""
     var parentManagementDescription: String = ""
+    var parentDeviceRole: String = ""
+    var childDeviceMode: String = ""
+    var parentDeviceMode: String = ""
+    var childPairingCode: String = ""
+    var childPairingCodeHint: String = ""
+    var generatePairingCode: String = ""
+    var registerChildDevice: String = ""
+    var linkedChildDevices: String = ""
+    var linkedParentDevices: String = "연결된 부모 기기"
     var parentLinked: String = ""
     var parentNotLinked: String = ""
+    var profileName: String = "내 이름"
+    var profileSaved: String = ""
+    var profileSyncHint: String = ""
     var parentAccount: String = ""
     var childDeviceName: String = ""
     var childDeviceId: String = ""
@@ -8116,6 +9002,9 @@ class AppStrings {
     var remoteExtraTime: String = ""
     var remoteAddTime: String = ""
     var remoteUnlockToday: String = ""
+    var remoteRequests: String = ""
+    var noRemoteRequests: String = ""
+    var reject: String = ""
     var remoteCommands: String = ""
     var noRemoteCommands: String = ""
     var clearRemoteCommands: String = ""
@@ -8177,6 +9066,8 @@ class AppStrings {
 }
 fun appStrings(appLanguage: AppLanguage): AppStrings {
     return AppStrings().apply {
+        appTitle = "ScreenRest"
+        appSubtitle = "Manager \u00B7 Today"
         korean = "Korean"
         overview = "Overview"
         time = "Time"
@@ -8212,6 +9103,8 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         usageAccessRequired = "Usage Access Required"
         openUsageAccessSettings = "Open Usage Access Settings"
         refresh = "Refresh"
+        updating = "Updating"
+        notUpdatedYet = "Not updated yet"
         noUsageRecorded = "No Usage Recorded"
         policySummary = "Policy Summary"
         totalUsageSummary = "Total Usage Summary"
@@ -8241,7 +9134,7 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         unrestrictedApps = "Unrestricted Apps"
         searchApps = "Search Apps"
         noLimit = "No Limit"
-        unlockedToday = "Unlocked Today"
+        unlockedToday = "Allowed Today"
         addLimit = "Add Limit"
         clearLimit = "Clear Limit"
         applyLimit = "Apply Limit"
@@ -8343,6 +9236,7 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         blockSafetyStatus = "Block Safety Status"
         currentBlockTargets = "Current Block Targets"
         temporaryAllowances = "Temporary Allowances"
+        temporaryAllowancePolicy = "Exceptions approved from the block screen and active now."
         noCurrentBlockTargets = "No Current Block Targets"
         noTemporaryAllowances = "No Temporary Allowances"
         dailyLimit = "Daily Limit"
@@ -8360,10 +9254,22 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         parentPin = "Parent Pin"
         parentManagement = "Parent Management"
         parentManagementDescription = "Parent Management Description"
+        parentDeviceRole = "Device Role"
+        childDeviceMode = "Child Device"
+        parentDeviceMode = "Parent Device"
+        childPairingCode = "Pairing Code"
+        childPairingCodeHint = "Use this code to connect this child device from a parent device."
+        generatePairingCode = "Generate Code"
+        registerChildDevice = "Register Child"
+        linkedChildDevices = "Linked Child Devices"
+        linkedParentDevices = "Linked Parent Devices"
         parentLinked = "Parent Linked"
         parentNotLinked = "Parent Not Linked"
-        parentAccount = "Parent Account"
-        childDeviceName = "Child Device Name"
+        profileName = "Profile Name"
+        profileSaved = "Profile Saved"
+        profileSyncHint = "Linked devices will show this name after sync."
+        parentAccount = "Parent Display Name"
+        childDeviceName = "Child Nickname"
         childDeviceId = "Child Device Id"
         lastSync = "Last Sync"
         connectParent = "Connect Parent"
@@ -8377,6 +9283,9 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         remoteExtraTime = "Remote Extra Time"
         remoteAddTime = "Remote Add Time"
         remoteUnlockToday = "Remote Unlock Today"
+        remoteRequests = "Remote Requests"
+        noRemoteRequests = "No Remote Requests"
+        reject = "Reject"
         remoteCommands = "Remote Commands"
         noRemoteCommands = "No Remote Commands"
         clearRemoteCommands = "Clear Remote Commands"
@@ -8473,6 +9382,8 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         allowedAppCount = { count -> count.toString() + " allowed" }
         startsIn = { duration -> "in " + duration }
         temporaryAllowanceDetail = { remaining, extra -> "Remaining extra " + formatLimitMinutesLabel(remaining) + " / added " + formatLimitMinutesLabel(extra) }
+        temporaryAllowanceRemaining = { remaining -> "Temporary · " + formatLimitMinutesLabel(remaining) + " left" }
+        lastUpdated = { time -> "Updated " + time }
         usageDelta = { delta -> "Delta " + delta }
         usedMinutes = { minutes -> formatLimitMinutesLabel(minutes) + " used" }
         detectionDecision = { decision -> decision }
@@ -8497,6 +9408,8 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
 }
 
 private fun AppStrings.applyKoreanStrings() {
+    appTitle = "폰쉼"
+    appSubtitle = "관리 \u00B7 오늘"
     korean = "한국어"
     overview = "개요"
     time = "시간"
@@ -8532,6 +9445,8 @@ private fun AppStrings.applyKoreanStrings() {
     usageAccessRequired = "사용정보 접근 권한이 필요합니다"
     openUsageAccessSettings = "권한 설정"
     refresh = "새로고침"
+    updating = "업데이트 중"
+    notUpdatedYet = "업데이트 전"
     noUsageRecorded = "오늘 기록된 사용 시간이 없습니다"
     policySummary = "정책 요약"
     totalUsageSummary = "전체"
@@ -8562,7 +9477,7 @@ private fun AppStrings.applyKoreanStrings() {
     unrestrictedApps = "미제한"
     searchApps = "앱 검색"
     noLimit = "제한 없음"
-    unlockedToday = "오늘 차단 해제"
+    unlockedToday = "오늘만 허용"
     addLimit = "추가"
     clearLimit = "해제"
     applyLimit = "적용"
@@ -8663,7 +9578,8 @@ private fun AppStrings.applyKoreanStrings() {
     openExactAlarmSettings = "알람 설정"
     blockSafetyStatus = "차단 안전성 검증"
     currentBlockTargets = "현재 차단 대상"
-    temporaryAllowances = "임시 허용"
+    temporaryAllowances = "일시 허용"
+    temporaryAllowancePolicy = "블록창에서 승인되어 현재 적용 중인 예외입니다"
     noCurrentBlockTargets = "현재 차단될 대상이 없습니다"
     noTemporaryAllowances = "오늘 적용된 임시 허용이 없습니다"
     dailyLimit = "일일 제한"
@@ -8681,8 +9597,19 @@ private fun AppStrings.applyKoreanStrings() {
     parentPin = "관리 PIN"
     parentManagement = "부모 관리"
     parentManagementDescription = "부모 계정과 이 기기를 연결해 원격 추가 시간과 오늘만 해제를 받을 수 있습니다"
+    parentDeviceRole = "기기 역할"
+    childDeviceMode = "자녀 기기"
+    parentDeviceMode = "부모 기기"
+    childPairingCode = "연결 코드"
+    childPairingCodeHint = "부모 기기에서 이 코드를 입력해 자녀 기기를 연결합니다"
+    generatePairingCode = "코드 생성"
+    registerChildDevice = "자녀 등록"
+    linkedChildDevices = "연결된 자녀 기기"
     parentLinked = "연결됨"
     parentNotLinked = "미연결"
+    profileName = "내 이름"
+    profileSaved = "프로필 저장 완료"
+    profileSyncHint = "연결된 기기에는 동기화 후 이 이름이 표시됩니다"
     parentAccount = "부모 계정"
     childDeviceName = "자녀 기기 이름"
     childDeviceId = "기기 연결 ID"
@@ -8698,6 +9625,9 @@ private fun AppStrings.applyKoreanStrings() {
     remoteExtraTime = "추가 시간"
     remoteAddTime = "시간 추가"
     remoteUnlockToday = "오늘만 해제"
+    remoteRequests = "자녀 요청"
+    noRemoteRequests = "아직 자녀 요청이 없습니다"
+    reject = "거절"
     remoteCommands = "원격 명령 기록"
     noRemoteCommands = "아직 원격 명령이 없습니다"
     clearRemoteCommands = "기록 지우기"
@@ -8775,6 +9705,8 @@ private fun AppStrings.applyKoreanStrings() {
     temporaryAllowanceDetail = { remaining, extra ->
         "남은 추가 ${formatLimitMinutesLabel(remaining)} / 추가 ${formatLimitMinutesLabel(extra)}"
     }
+    temporaryAllowanceRemaining = { remaining -> "일시 허용 · ${formatLimitMinutesLabel(remaining)} 남음" }
+    lastUpdated = { time -> "업데이트 ${time}" }
     usageDelta = { delta -> "차이 ${delta}" }
     usedMinutes = { minutes -> formatLimitMinutesLabel(minutes) + " 사용" }
     detectionDecision = { decision ->
@@ -8851,19 +9783,32 @@ private fun ScreenTimeManagerPreviewContent() {
             onUpdateEmergencyPin = { _, _ -> },
             onPinInputChanged = {},
             onPairParentAccount = { _, _, _ -> },
+            onParentProfileNameChanged = {},
+            onParentDeviceRoleChanged = { _, _ -> },
+            onGenerateChildPairingCode = {},
+            onRegisterChildPairingCode = { _, _, _ -> },
             onUnlinkParentAccount = {},
+            onUnlinkLinkedChildDevice = { _, _ -> },
+            onUnlinkLinkedParentDevice = { _, _ -> },
             onSyncParentDevice = {},
             onClearRemoteParentCommands = {},
             onRemoteAppExtraTime = { _, _, _ -> },
             onRemoteAppUnlockToday = { _, _ -> },
             onRemoteTotalExtraTime = {},
             onRemoteTotalUnlockToday = {},
+            onApproveRemoteUnlockRequest = { _, _, _ -> },
+            onRejectRemoteUnlockRequest = {},
             onClearEventLog = {},
             onDailyPolicyExpandedChange = {},
             onAppGroupsExpandedChange = {},
             onAppLimitsExpandedChange = {},
             onScheduleBlockingExpandedChange = {},
             onAllowOnlyModeExpandedChange = {},
+            onSettingsLanguageExpandedChange = {},
+            onSettingsNotificationExpandedChange = {},
+            onSettingsPinExpandedChange = {},
+            onSettingsParentManagementExpandedChange = {},
+            onSettingsEventLogExpandedChange = {},
             suppressPermissionSetupAutoDialog = false,
         )
     }

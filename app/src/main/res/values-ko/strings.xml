@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">폰쉼</string>
+    <string name="notification_listener_service_label">폰쉼 알림 접근</string>
+</resources>

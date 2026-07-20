@@ -1,5 +1,47 @@
 # Changelog
 
+## 2026-07-18
+
+- Added a private 31-day per-app usage history so the 30-day statistics view
+  no longer depends on Android's roughly 10-day daily usage-stat retention.
+- Backfilled recent system daily buckets, kept cumulative daily values
+  monotonic, and reused the same history for daily trends and Top Apps.
+- Distinguished unavailable historical days from recorded zero-use days and
+  excluded unavailable days from daily-average and peak calculations.
+- Stabilized direct hour/minute entry by suppressing wheel callbacks during
+  programmatic position sync and committing drag selections only after scroll settles.
+- Replaced the app-limit-specific bottom sheet with the shared time wheel and
+  added the selected app icon and group-budget allowance to its header.
+- Extended the blocking screen background behind status, gesture-navigation,
+  three-button navigation, and tablet taskbar insets with a dedicated dark system-bar theme.
+
+## 2026-07-11
+
+- Added parent and child profile names so paired devices can show readable
+  names with a shortened connection identifier.
+- Added PIN-protected unlink actions for individual linked child and parent
+  devices, and synchronized the unlinked state to Firestore relationship data.
+- Extended temporary package allowances with an expiry timestamp so schedule
+  blocking and allow-only mode can grant app-specific extra time instead of
+  immediately re-blocking.
+- Reflected temporary and today-only allowances in policy summaries, app lists,
+  schedule allowed counts, and allow-only allowed counts.
+- Made Settings sections collapsible and reduced remote parent sync delay for
+  faster request notifications.
+
+## 2026-07-10
+
+- Improved parent remote request handling on the block screen with fast status
+  polling and clear pending, approved, rejected, expired, and failed states.
+- Reused existing pending remote requests for the same blocked target instead
+  of creating duplicates, and marked expired pending requests locally.
+- Reorganized parent management so parent devices see child requests first
+  while child devices focus on pairing code and connection status.
+- Added Firestore rules guidance for MVP testing and release-grade UID-based
+  parent/child ownership checks.
+- Changed parent approval rows so each child request can choose a flexible
+  extra-time amount through the shared time picker before approval.
+
 ## 2026-07-05
 
 - Removed the duplicate always-allowed apps card from the Blocking tab so app
@@ -525,3 +567,20 @@
   detaches it.
 - Added a foreground enforcement loop so games and video apps can be blocked
   while already running, even when no new accessibility window event is emitted.
+- Hardened remote parent pairing by validating the admin PIN before consuming a
+  pairing code, marking pairing codes as active/used/expired, and recording
+  unlink operations as `unlinked` instead of deleting cloud data.
+- Improved remote parent synchronization recovery with network-aware WorkManager
+  polling, faster initial sync, and child notifications for both parent approval
+  and rejection.
+- Updated Firestore rules documentation for pairing-code lifecycle, linked
+  parent access, and future 30-day cleanup policy after unlink.
+- Added multi-parent and multi-child remote-management groundwork: parent devices
+  now keep a stable linked-child list, sync requests from every linked child, show
+  linked child devices in the parent UI, and unlink only the current parent UID
+  from Firestore so other linked parents continue working.
+- Protected multi-parent approval conflicts with a first-decision-wins remote
+  transaction so late approvals or rejections cannot overwrite an already handled
+  child request.
+- Routed allow-only allowed-app changes through the same policy draft and Admin
+  PIN save flow as daily limits, app groups, app limits, and schedules.

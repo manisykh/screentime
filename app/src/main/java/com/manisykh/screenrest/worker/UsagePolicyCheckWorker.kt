@@ -4,9 +4,11 @@ import android.app.AlarmManager
 import android.content.Context
 import android.os.Build
 import android.provider.Settings
+import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -15,6 +17,9 @@ import androidx.work.workDataOf
 import com.manisykh.screenrest.blocking.UsageMonitorForegroundService
 import com.manisykh.screenrest.formatLimitMinutesLabel
 import com.manisykh.screenrest.data.EventLogType
+import com.manisykh.screenrest.data.ParentDeviceRole
+import com.manisykh.screenrest.data.ParentRemoteSyncDataSourceFactory
+import com.manisykh.screenrest.data.RemoteUnlockRequestStatus
 import com.manisykh.screenrest.data.SettingsRepository
 import com.manisykh.screenrest.data.SystemHealthStatus
 import com.manisykh.screenrest.data.normalizedAppGroups
@@ -62,7 +67,10 @@ class SystemHealthCheckWorker(
 ) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork(): Result {
         val appContext = applicationContext
-        val settingsRepository = SettingsRepository(appContext.settingsDataStore)
+        val settingsRepository = SettingsRepository(
+            appContext.settingsDataStore,
+            ParentRemoteSyncDataSourceFactory.create(appContext),
+        )
         val usageRepository = UsageStatsRepository(appContext)
         val notificationHelper = UsageNotificationHelper(appContext)
         val safeModeEnabled = settingsRepository.safeModeEnabled.first()
@@ -183,11 +191,15 @@ class DailyRolloverWorker(
 ) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork(): Result {
         val appContext = applicationContext
-        val settingsRepository = SettingsRepository(appContext.settingsDataStore)
+        val settingsRepository = SettingsRepository(
+            appContext.settingsDataStore,
+            ParentRemoteSyncDataSourceFactory.create(appContext),
+        )
         settingsRepository.recordDailyRollover()
         UsagePolicyCheckWorker.schedule(appContext)
         SystemHealthCheckWorker.scheduleNow(appContext)
         SystemHealthCheckWorker.schedulePeriodic(appContext)
+        RemoteParentSyncWorker.schedule(appContext)
         UsageMonitorRecoveryWorker.schedule(
             context = appContext,
             forceRestart = true,
@@ -213,13 +225,112 @@ class DailyRolloverWorker(
     }
 }
 
+class RemoteParentSyncWorker(
+    appContext: Context,
+    workerParams: WorkerParameters,
+) : CoroutineWorker(appContext, workerParams) {
+    override suspend fun doWork(): Result {
+        val appContext = applicationContext
+        val settingsRepository = SettingsRepository(
+            appContext.settingsDataStore,
+            ParentRemoteSyncDataSourceFactory.create(appContext),
+        )
+        val notificationHelper = UsageNotificationHelper(appContext)
+        val before = settingsRepository.parentManagementState.first()
+        val hasSyncTarget = before.childDeviceId.isNotBlank() ||
+            before.linkedChildDevices.any { child -> child.childDeviceId.isNotBlank() }
+        if (!before.paired || !hasSyncTarget) {
+            return Result.success()
+        }
+
+        settingsRepository.syncParentDevice()
+        val after = settingsRepository.parentManagementState.first()
+        val beforeById = before.remoteUnlockRequests.associateBy { request -> request.id }
+
+        if (after.deviceRole == ParentDeviceRole.Parent) {
+            val newPendingRequests = after.remoteUnlockRequests
+                .filter { request -> request.status == RemoteUnlockRequestStatus.Pending }
+                .filter { request -> request.id !in beforeById }
+            newPendingRequests.forEach { request ->
+                val target = request.targetAppName
+                    .ifBlank { request.targetGroupName }
+                    .ifBlank { request.targetPackageName }
+                    .ifBlank { "ScreenRest" }
+                notificationHelper.showPolicyAlert(
+                    title = "ScreenRest",
+                    message = "자녀 기기에서 사용 시간 요청이 왔습니다: $target",
+                )
+            }
+        }
+
+        if (after.deviceRole == ParentDeviceRole.Child) {
+            val newlyApprovedRequests = after.remoteUnlockRequests
+                .filter { request -> request.status == RemoteUnlockRequestStatus.Approved }
+                .filter { request -> beforeById[request.id]?.status != RemoteUnlockRequestStatus.Approved }
+            newlyApprovedRequests.forEach { request ->
+                val target = request.targetAppName
+                    .ifBlank { request.targetGroupName }
+                    .ifBlank { request.targetPackageName }
+                    .ifBlank { "ScreenRest" }
+                notificationHelper.showPolicyAlert(
+                    title = "ScreenRest",
+                    message = "부모가 사용 시간 요청을 승인했습니다: $target",
+                )
+            }
+            val newlyRejectedRequests = after.remoteUnlockRequests
+                .filter { request -> request.status == RemoteUnlockRequestStatus.Rejected }
+                .filter { request -> beforeById[request.id]?.status != RemoteUnlockRequestStatus.Rejected }
+            newlyRejectedRequests.forEach { request ->
+                val target = request.targetAppName
+                    .ifBlank { request.targetGroupName }
+                    .ifBlank { request.targetPackageName }
+                    .ifBlank { "ScreenRest" }
+                notificationHelper.showPolicyAlert(
+                    title = "ScreenRest",
+                    message = "부모가 사용 시간 요청을 거절했습니다: $target",
+                )
+            }
+        }
+        return Result.success()
+    }
+
+    companion object {
+        private const val UNIQUE_IMMEDIATE_WORK_NAME = "remote_parent_sync_immediate"
+        private const val UNIQUE_PERIODIC_WORK_NAME = "remote_parent_sync_periodic"
+
+        fun schedule(context: Context) {
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                UNIQUE_IMMEDIATE_WORK_NAME,
+                ExistingWorkPolicy.KEEP,
+                OneTimeWorkRequestBuilder<RemoteParentSyncWorker>()
+                    .setConstraints(networkConstraints())
+                    .build(),
+            )
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+                UNIQUE_PERIODIC_WORK_NAME,
+                ExistingPeriodicWorkPolicy.UPDATE,
+                PeriodicWorkRequestBuilder<RemoteParentSyncWorker>(15, TimeUnit.MINUTES)
+                    .setConstraints(networkConstraints())
+                    .build(),
+            )
+        }
+
+        private fun networkConstraints() = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+    }
+}
+
 class UsageMonitorRecoveryWorker(
     appContext: Context,
     workerParams: WorkerParameters,
 ) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork(): Result {
         val appContext = applicationContext
-        val settingsRepository = SettingsRepository(appContext.settingsDataStore)
+        val settingsRepository = SettingsRepository(
+            appContext.settingsDataStore,
+            ParentRemoteSyncDataSourceFactory.create(appContext),
+        )
         val usageRepository = UsageStatsRepository(appContext)
         val safeModeEnabled = settingsRepository.safeModeEnabled.first()
         val policyEnforcementEnabled = settingsRepository.policyEnforcementEnabled.first()
@@ -237,7 +348,15 @@ class UsageMonitorRecoveryWorker(
             return Result.success()
         }
 
-        UsageMonitorForegroundService.start(appContext)
+        val startRequested = UsageMonitorForegroundService.start(appContext)
+        if (!startRequested) {
+            settingsRepository.markUsageMonitorStopped("watchdog: foreground service start rejected")
+            settingsRepository.addEvent(
+                EventLogType.Warning,
+                "Usage monitor recovery failed: foreground service start rejected",
+            )
+            return Result.retry()
+        }
         UsageMonitorForegroundService.scheduleExactRecoveryAlarm(
             context = appContext,
             reason = "watchdog follow-up",
@@ -299,7 +418,10 @@ class UsageMonitorRecoveryWorker(
 object UsagePolicyAlertRunner {
     suspend fun evaluate(context: Context, sendNotifications: Boolean) {
         val appContext = context.applicationContext
-        val settingsRepository = SettingsRepository(appContext.settingsDataStore)
+        val settingsRepository = SettingsRepository(
+            appContext.settingsDataStore,
+            ParentRemoteSyncDataSourceFactory.create(appContext),
+        )
         val usageRepository = UsageStatsRepository(appContext)
         val notificationHelper = UsageNotificationHelper(appContext)
         val safeModeEnabled = settingsRepository.safeModeEnabled.first()

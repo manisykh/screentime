@@ -2,6 +2,7 @@ package com.manisykh.screenrest.safety
 
 import com.manisykh.screenrest.data.UsagePolicySettings
 import com.manisykh.screenrest.data.TemporaryUnlockState
+import com.manisykh.screenrest.data.isTemporarilyAllowed
 import com.manisykh.screenrest.data.normalizedAppGroups
 import com.manisykh.screenrest.data.isScheduleBlockingNow
 import com.manisykh.screenrest.ui.safety.appLimitMap
@@ -99,6 +100,7 @@ object BlockDecisionEngine {
         val packageAllowance = todayTemporaryUnlockState.packageAllowances[packageName]
         val packageExtraMinutes = packageAllowance?.extraMinutes ?: 0
         val packageUnlockedForToday = packageAllowance?.unlockedForToday == true
+        val packageTemporarilyAllowed = packageAllowance?.isTemporarilyAllowed() == true
         val effectiveTotalLimitMinutes = (totalLimitMinutes + todayTemporaryUnlockState.totalExtraMinutes)
             .coerceAtLeast(totalLimitMinutes)
         val effectiveAppLimitMinutes = (appLimitMinutes + packageExtraMinutes)
@@ -126,7 +128,9 @@ object BlockDecisionEngine {
             safetyGateResult.reason == SafetyGateReason.SafeModeEnabled -> BlockDecision.AllowedSafeMode
             safetyGateResult.reason == SafetyGateReason.PolicyEnforcementDisabled -> BlockDecision.AllowedPolicyDisabled
             safetyGateResult.reason == SafetyGateReason.WhitelistedPackage -> BlockDecision.AllowedWhitelist
-            settings.allowOnlyModeEnabled && !packageUnlockedForToday -> BlockDecision.WouldBlockAllowOnly
+            settings.allowOnlyModeEnabled && !packageUnlockedForToday && !packageTemporarilyAllowed -> {
+                BlockDecision.WouldBlockAllowOnly
+            }
             !todayTemporaryUnlockState.totalUnlockedForToday &&
                 totalLimitMinutes > 0 &&
                 totalUsedMillis >= effectiveTotalLimitMinutes.toMillisLimit() -> {
@@ -134,6 +138,7 @@ object BlockDecisionEngine {
             }
             !todayTemporaryUnlockState.totalUnlockedForToday &&
                 !packageUnlockedForToday &&
+                !packageTemporarilyAllowed &&
                 settings.isScheduleBlockingNow() &&
                 !schedulePackageAllowed -> {
                 BlockDecision.WouldBlockSchedule
@@ -187,9 +192,9 @@ object BlockDecisionEngine {
         val unlockedForToday = when {
             decision == BlockDecision.WouldBlockTotalLimit -> todayTemporaryUnlockState.totalUnlockedForToday
             decision == BlockDecision.WouldBlockSchedule -> {
-                todayTemporaryUnlockState.totalUnlockedForToday || packageUnlockedForToday
+                todayTemporaryUnlockState.totalUnlockedForToday || packageUnlockedForToday || packageTemporarilyAllowed
             }
-            decision == BlockDecision.WouldBlockAllowOnly -> packageUnlockedForToday
+            decision == BlockDecision.WouldBlockAllowOnly -> packageUnlockedForToday || packageTemporarilyAllowed
             appLimitMinutes <= 0 && targetGroup == null && totalLimitMinutes > 0 -> {
                 todayTemporaryUnlockState.totalUnlockedForToday
             }

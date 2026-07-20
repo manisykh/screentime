@@ -26,6 +26,7 @@ data class DailyUsageInfo(
     val dayStartMillis: Long,
     val dayLabel: String,
     val totalTimeMillis: Long,
+    val hasRecordedData: Boolean,
 )
 
 class UsageStatsRepository(
@@ -35,6 +36,7 @@ class UsageStatsRepository(
         context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
     private val packageManager = context.packageManager
     private val continuityStore = UsageContinuityStore(context.applicationContext)
+    private val historyStore = UsageHistoryStore(context.applicationContext)
     private val monotonicUsageMillisByPackage = mutableMapOf<String, Long>()
     private var monotonicUsageDayStartMillis: Long = 0L
     private val appNameCache = mutableMapOf<String, String>()
@@ -132,7 +134,7 @@ class UsageStatsRepository(
                 dailyUsageByPackage = dailyUsageByPackage,
             )
 
-            applyMonotonicUsage(
+            val stableUsageByPackage = applyMonotonicUsage(
                 dayStartMillis = startTime,
                 usageByPackage = mergeUsageByPackage(
                     eventUsageByPackage = sanitizedEventUsageByPackage,
@@ -142,9 +144,15 @@ class UsageStatsRepository(
                 maxAllowedUsageMillis = maxAllowedUsageMillis,
             )
                 .filter { (packageName, totalTimeMillis) ->
-                    totalTimeMillis >= MIN_VISIBLE_USAGE_MILLIS &&
+                    totalTimeMillis > 0L &&
                         (launchablePackages.isEmpty() || packageName in launchablePackages) &&
                         isVisibleUsageApp(packageName)
+                }
+            historyStore.mergeDays(mapOf(startTime to stableUsageByPackage))
+
+            stableUsageByPackage
+                .filter { (packageName, totalTimeMillis) ->
+                    totalTimeMillis >= MIN_VISIBLE_USAGE_MILLIS
                 }
                 .map { (packageName, totalTimeMillis) ->
                     AppUsageInfo(
@@ -214,7 +222,7 @@ class UsageStatsRepository(
                 dailyUsageByPackage = dailyUsageByPackage,
             )
 
-            applyMonotonicUsage(
+            val stableUsageByPackage = applyMonotonicUsage(
                 dayStartMillis = startTime,
                 usageByPackage = mergeUsageByPackage(
                     eventUsageByPackage = sanitizedEventUsageByPackage,
@@ -228,6 +236,8 @@ class UsageStatsRepository(
                         (launchablePackages.isEmpty() || packageName in launchablePackages) &&
                         isVisibleUsageApp(packageName)
                 }
+            historyStore.mergeDays(mapOf(startTime to stableUsageByPackage))
+            stableUsageByPackage
         } catch (_: RuntimeException) {
             todayContinuitySnapshot()
         }
@@ -238,17 +248,29 @@ class UsageStatsRepository(
         usageMillis: Long,
         forceWrite: Boolean = false,
     ): Long {
-        return continuityStore.rememberUsage(
-            dayStartMillis = localDayStartMillis(),
+        val todayStartMillis = localDayStartMillis()
+        val rememberedUsageMillis = continuityStore.rememberUsage(
+            dayStartMillis = todayStartMillis,
             packageName = packageName,
             usageMillis = usageMillis,
             forceWrite = forceWrite,
             maxAllowedUsageMillis = maxPossibleTodayUsageMillis(),
         )
+        historyStore.mergeDays(
+            usageByDay = mapOf(
+                todayStartMillis to continuityStore.snapshot(
+                    dayStartMillis = todayStartMillis,
+                    maxAllowedUsageMillis = maxPossibleTodayUsageMillis(),
+                ),
+            ),
+            forceWrite = forceWrite,
+        )
+        return rememberedUsageMillis
     }
 
     fun flushUsageContinuity() {
         continuityStore.flush()
+        historyStore.flush()
     }
 
     fun getDailyUsage(days: Int = 7, skipAccessCheck: Boolean = false): List<DailyUsageInfo> {
@@ -265,43 +287,21 @@ class UsageStatsRepository(
                     add(Calendar.DAY_OF_YEAR, -offset)
                 }.timeInMillis
             }
-            val totalsByDay = dayStarts.associateWith { 0L }.toMutableMap()
-            val startTime = dayStarts.first()
-            val endTime = System.currentTimeMillis()
             val launchablePackages = runCatching {
                 getLaunchablePackages()
             }.getOrDefault(emptySet())
-
-            usageStatsManager
-                .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, endTime)
-                .forEach { usageStats ->
-                    val packageName = usageStats.packageName
-                    val totalTimeMillis = usageStats.totalTimeInForeground
-                    if (
-                        totalTimeMillis <= 0L ||
-                        (launchablePackages.isNotEmpty() && packageName !in launchablePackages) ||
-                        !isVisibleUsageApp(packageName)
-                    ) {
-                        return@forEach
-                    }
-                    val timestamp = when {
-                        usageStats.lastTimeUsed > 0L -> usageStats.lastTimeUsed
-                        usageStats.lastTimeStamp > 0L -> usageStats.lastTimeStamp
-                        else -> usageStats.firstTimeStamp
-                    }
-                    val dayStartMillis = dayStartMillisFor(timestamp)
-                    if (dayStartMillis in totalsByDay) {
-                        totalsByDay[dayStartMillis] = (totalsByDay[dayStartMillis] ?: 0L) + totalTimeMillis
-                    }
-                }
-
-            totalsByDay[todayStartMillis] = getTodayUsageMillisByPackage(skipAccessCheck = true).values.sum()
+            val usageHistory = refreshUsageHistory(
+                dayStarts = dayStarts,
+                launchablePackages = launchablePackages,
+            )
 
             dayStarts.map { dayStartMillis ->
+                val usageByPackage = usageHistory[dayStartMillis]
                 DailyUsageInfo(
                     dayStartMillis = dayStartMillis,
                     dayLabel = dayLabel(dayStartMillis),
-                    totalTimeMillis = totalsByDay[dayStartMillis] ?: 0L,
+                    totalTimeMillis = usageByPackage.orEmpty().values.sum(),
+                    hasRecordedData = usageByPackage != null,
                 )
             }
         } catch (_: RuntimeException) {
@@ -325,45 +325,25 @@ class UsageStatsRepository(
 
         return try {
             val todayStartMillis = localDayStartMillis()
-            val startTime = Calendar.getInstance().apply {
-                timeInMillis = todayStartMillis
-                add(Calendar.DAY_OF_YEAR, -(safeDays - 1))
-            }.timeInMillis
-            val endTime = System.currentTimeMillis()
+            val dayStarts = (safeDays - 1 downTo 0).map { offset ->
+                Calendar.getInstance().apply {
+                    timeInMillis = todayStartMillis
+                    add(Calendar.DAY_OF_YEAR, -offset)
+                }.timeInMillis
+            }
             val launchablePackages = runCatching {
                 getLaunchablePackages()
             }.getOrDefault(emptySet())
             val usageByPackage = mutableMapOf<String, Long>()
 
-            usageStatsManager
-                .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, endTime)
-                .forEach { usageStats ->
-                    val packageName = usageStats.packageName
-                    val totalTimeMillis = usageStats.totalTimeInForeground
-                    if (
-                        totalTimeMillis <= 0L ||
-                        (launchablePackages.isNotEmpty() && packageName !in launchablePackages) ||
-                        !isVisibleUsageApp(packageName)
-                    ) {
-                        return@forEach
-                    }
-
-                    val timestamp = when {
-                        usageStats.lastTimeUsed > 0L -> usageStats.lastTimeUsed
-                        usageStats.lastTimeStamp > 0L -> usageStats.lastTimeStamp
-                        else -> usageStats.firstTimeStamp
-                    }
-                    val dayStartMillis = dayStartMillisFor(timestamp)
-                    if (dayStartMillis < startTime || dayStartMillis >= todayStartMillis) {
-                        return@forEach
-                    }
-
+            refreshUsageHistory(
+                dayStarts = dayStarts,
+                launchablePackages = launchablePackages,
+            ).values.forEach { dailyUsageByPackage ->
+                dailyUsageByPackage.forEach { (packageName, totalTimeMillis) ->
                     usageByPackage[packageName] =
                         (usageByPackage[packageName] ?: 0L) + totalTimeMillis
                 }
-
-            getTodayUsageMillisByPackage(skipAccessCheck = true).forEach { (packageName, totalTimeMillis) ->
-                usageByPackage[packageName] = (usageByPackage[packageName] ?: 0L) + totalTimeMillis
             }
 
             usageByPackage
@@ -384,6 +364,88 @@ class UsageStatsRepository(
         } catch (_: RuntimeException) {
             emptyList()
         }
+    }
+
+    private fun refreshUsageHistory(
+        dayStarts: List<Long>,
+        launchablePackages: Set<String>,
+    ): Map<Long, Map<String, Long>> {
+        if (dayStarts.isEmpty()) {
+            return emptyMap()
+        }
+        val requestedDays = dayStarts.toSet()
+        val updates = mutableMapOf<Long, Map<String, Long>>()
+        var systemDailyQuerySucceeded = false
+        try {
+            val systemUsageByDay = querySystemDailyUsage(
+                startTime = dayStarts.first(),
+                endTime = System.currentTimeMillis(),
+                requestedDays = requestedDays,
+                launchablePackages = launchablePackages,
+            )
+            systemDailyQuerySucceeded = true
+            updates.putAll(systemUsageByDay)
+        } catch (_: RuntimeException) {
+            // Previously recorded days remain available when the system query is temporarily unavailable.
+        }
+
+        if (systemDailyQuerySucceeded) {
+            dayStarts
+                .takeLast(minOf(dayStarts.size, SYSTEM_DAILY_RETENTION_DAYS))
+                .forEach { dayStartMillis ->
+                    updates.putIfAbsent(dayStartMillis, emptyMap())
+                }
+        }
+
+        val todayStartMillis = dayStarts.last()
+        val todayUsageByPackage = getTodayUsageMillisByPackage(skipAccessCheck = true)
+        updates[todayStartMillis] = mergeUsageByMaximum(
+            updates[todayStartMillis].orEmpty(),
+            todayUsageByPackage,
+        )
+
+        historyStore.mergeDays(
+            usageByDay = updates,
+            forceWrite = true,
+        )
+        return historyStore.snapshot(dayStarts)
+    }
+
+    private fun querySystemDailyUsage(
+        startTime: Long,
+        endTime: Long,
+        requestedDays: Set<Long>,
+        launchablePackages: Set<String>,
+    ): Map<Long, Map<String, Long>> {
+        val usageByDay = mutableMapOf<Long, MutableMap<String, Long>>()
+        usageStatsManager
+            .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, endTime)
+            .orEmpty()
+            .forEach { usageStats ->
+                val packageName = usageStats.packageName
+                val totalTimeMillis = usageStats.totalTimeInForeground
+                if (
+                    totalTimeMillis <= 0L ||
+                    totalTimeMillis > MAX_PLAUSIBLE_DAILY_USAGE_MILLIS ||
+                    (launchablePackages.isNotEmpty() && packageName !in launchablePackages) ||
+                    !isVisibleUsageApp(packageName)
+                ) {
+                    return@forEach
+                }
+                val timestamp = when {
+                    usageStats.lastTimeUsed > 0L -> usageStats.lastTimeUsed
+                    usageStats.lastTimeStamp > 0L -> usageStats.lastTimeStamp
+                    else -> usageStats.firstTimeStamp
+                }
+                val dayStartMillis = dayStartMillisFor(timestamp)
+                if (dayStartMillis !in requestedDays) {
+                    return@forEach
+                }
+                val dailyUsageByPackage = usageByDay.getOrPut(dayStartMillis) { mutableMapOf() }
+                dailyUsageByPackage[packageName] =
+                    (dailyUsageByPackage[packageName] ?: 0L) + totalTimeMillis
+            }
+        return usageByDay
     }
 
     fun getAppLabel(packageName: String): String {
@@ -658,17 +720,11 @@ class UsageStatsRepository(
         statsUsageByPackage: Map<String, Long>,
         dailyUsageByPackage: Map<String, Long>,
     ): Map<String, Long> {
-        if (eventUsageByPackage.isNotEmpty()) {
-            return eventUsageByPackage
-        }
-
-        return (statsUsageByPackage.keys + dailyUsageByPackage.keys)
-            .associateWith { packageName ->
-                maxOf(
-                    statsUsageByPackage[packageName] ?: 0L,
-                    dailyUsageByPackage[packageName] ?: 0L,
-                )
-            }
+        return mergeUsageSources(
+            eventUsageByPackage = eventUsageByPackage,
+            statsUsageByPackage = statsUsageByPackage,
+            dailyUsageByPackage = dailyUsageByPackage,
+        )
     }
 
     @Synchronized
@@ -1010,6 +1066,8 @@ class UsageStatsRepository(
 
     companion object {
         private const val MIN_VISIBLE_USAGE_MILLIS = 10_000L
+        private const val SYSTEM_DAILY_RETENTION_DAYS = 10
+        private const val MAX_PLAUSIBLE_DAILY_USAGE_MILLIS = 26L * 60L * 60L * 1000L
         private const val USAGE_ACCESS_PROBE_WINDOW_MILLIS = 7L * 24L * 60L * 60L * 1000L
         private const val CURRENT_FOREGROUND_LOOKBACK_MILLIS = 30_000L
         private const val CURRENT_FOREGROUND_TRACKER_MAX_AGE_MILLIS = 2_500L
@@ -1019,4 +1077,31 @@ class UsageStatsRepository(
         private const val IMPOSSIBLE_USAGE_TOLERANCE_MILLIS = 2L * 60L * 1000L
         private const val USAGE_AUDIT_TAG = "STM-UsageAudit"
     }
+}
+
+private fun mergeUsageByMaximum(
+    first: Map<String, Long>,
+    second: Map<String, Long>,
+): Map<String, Long> {
+    return (first.keys + second.keys)
+        .associateWith { packageName ->
+            maxOf(first[packageName] ?: 0L, second[packageName] ?: 0L)
+        }
+        .filterValues { usageMillis -> usageMillis > 0L }
+}
+
+internal fun mergeUsageSources(
+    eventUsageByPackage: Map<String, Long>,
+    statsUsageByPackage: Map<String, Long>,
+    dailyUsageByPackage: Map<String, Long>,
+): Map<String, Long> {
+    return (eventUsageByPackage.keys + statsUsageByPackage.keys + dailyUsageByPackage.keys)
+        .associateWith { packageName ->
+            maxOf(
+                eventUsageByPackage[packageName] ?: 0L,
+                statsUsageByPackage[packageName] ?: 0L,
+                dailyUsageByPackage[packageName] ?: 0L,
+            )
+        }
+        .filterValues { usageMillis -> usageMillis > 0L }
 }
