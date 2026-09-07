@@ -39,6 +39,25 @@ class ParentRemoteNotificationDetectorTest {
     }
 
     @Test
+    fun refreshedPendingRequest_notifiesAgainWithNewEventToken() {
+        val original = request(status = RemoteUnlockRequestStatus.Pending)
+        val refreshed = original.copy(createdAtMillis = original.createdAtMillis + 60_000L)
+        val notifications = detectParentRemoteNotifications(
+            before = ParentManagementState(
+                deviceRole = ParentDeviceRole.Parent,
+                remoteUnlockRequests = listOf(original),
+            ),
+            after = ParentManagementState(
+                deviceRole = ParentDeviceRole.Parent,
+                remoteUnlockRequests = listOf(refreshed),
+            ),
+            nowMillis = now,
+        )
+
+        assertEquals(listOf(ParentRemoteNotificationType.NewPendingRequest), notifications.map { it.type })
+    }
+
+    @Test
     fun child_notifiesWhenPendingRequestBecomesApproved() {
         val pending = request(status = RemoteUnlockRequestStatus.Pending)
         val approved = pending.copy(status = RemoteUnlockRequestStatus.Approved)
@@ -58,7 +77,7 @@ class ParentRemoteNotificationDetectorTest {
     }
 
     @Test
-    fun oldInitialSnapshot_isNotReplayedAsNotification() {
+    fun activeRequestIsNotDroppedOnlyBecauseItIsOlderThanFifteenMinutes() {
         val oldRequest = request(status = RemoteUnlockRequestStatus.Pending).copy(
             createdAtMillis = now - 16L * 60L * 1_000L,
             expiresAtMillis = now + 60_000L,
@@ -69,6 +88,48 @@ class ParentRemoteNotificationDetectorTest {
                 deviceRole = ParentDeviceRole.Parent,
                 remoteUnlockRequests = listOf(oldRequest),
             ),
+            nowMillis = now,
+        )
+
+        assertEquals(
+            listOf(ParentRemoteNotificationType.NewPendingRequest),
+            notifications.map { it.type },
+        )
+    }
+
+    @Test
+    fun handledEventTokenPreventsDuplicateNotification() {
+        val pending = request(status = RemoteUnlockRequestStatus.Pending)
+        val state = ParentManagementState(
+            deviceRole = ParentDeviceRole.Parent,
+            remoteUnlockRequests = listOf(pending),
+        )
+        val first = detectParentRemoteNotifications(
+            state = state,
+            handledEventTokens = emptySet(),
+            nowMillis = now,
+        ).single()
+
+        val repeated = detectParentRemoteNotifications(
+            state = state,
+            handledEventTokens = setOf(first.eventToken),
+            nowMillis = now,
+        )
+
+        assertTrue(repeated.isEmpty())
+    }
+
+    @Test
+    fun expiredPendingRequestDoesNotNotify() {
+        val expired = request(status = RemoteUnlockRequestStatus.Pending).copy(
+            expiresAtMillis = now - 1L,
+        )
+        val notifications = detectParentRemoteNotifications(
+            state = ParentManagementState(
+                deviceRole = ParentDeviceRole.Parent,
+                remoteUnlockRequests = listOf(expired),
+            ),
+            handledEventTokens = emptySet(),
             nowMillis = now,
         )
 

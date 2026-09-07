@@ -5,7 +5,6 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import com.manisykh.screenrest.worker.DailyRolloverWorker
 import com.manisykh.screenrest.worker.RemoteParentSyncWorker
 import com.manisykh.screenrest.worker.SystemHealthCheckWorker
@@ -57,12 +56,6 @@ class BootRecoveryReceiver : BroadcastReceiver() {
         fun scheduleDailyRolloverAlarm(context: Context) {
             val appContext = context.applicationContext
             val alarmManager = appContext.getSystemService(AlarmManager::class.java)
-            if (
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                !alarmManager.canScheduleExactAlarms()
-            ) {
-                return
-            }
             val triggerAtMillis = Calendar.getInstance().apply {
                 add(Calendar.DAY_OF_YEAR, 1)
                 set(Calendar.HOUR_OF_DAY, 0)
@@ -79,7 +72,7 @@ class BootRecoveryReceiver : BroadcastReceiver() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
             runCatching {
-                alarmManager.setExactAndAllowWhileIdle(
+                alarmManager.setAndAllowWhileIdle(
                     AlarmManager.RTC_WAKEUP,
                     triggerAtMillis,
                     pendingIntent,

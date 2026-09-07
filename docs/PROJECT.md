@@ -20,10 +20,10 @@ self-lockout.
 
 1. Developer Safe Mode is visible and enabled by default.
 2. Safe Mode state is persisted with DataStore.
-3. Emergency Unlock and Kill Switch are available before blocking features.
+3. Admin-PIN Safe Recovery and Kill Switch are available before blocking features.
 4. UsageStatsManager-based usage summary is added after safety controls.
 5. Blocking enforcement uses UsageStats, ForegroundService monitoring, and
-   display-over-other-apps overlay permission after Safe Mode, Emergency Unlock,
+   display-over-other-apps overlay permission after Safe Mode, Safe Recovery,
    Kill Switch, Auto Recovery, and whitelist rules are documented and present.
 
 ## Roadmap
@@ -39,7 +39,7 @@ self-lockout.
 - Developer Safe Mode UI
 - DataStore-backed Safe Mode state
 - Kill Switch action
-- Emergency Unlock design
+- Safe Recovery and Emergency Pass design
 - Auto Recovery entry points
 - Accessibility whitelist policy
 
@@ -70,7 +70,7 @@ Blocking must not be implemented before the Phase 1 safety foundation.
 - Phase 0 complete.
 - Developer Safe Mode UI complete.
 - Safe Mode persistence with DataStore complete.
-- Offline Emergency Unlock initial PIN path complete.
+- Offline Safe Recovery through the Admin PIN is complete.
 - Kill Switch recovery path complete.
 - Auto Recovery startup detection complete.
 - UsageStatsManager permission and today usage display complete.
@@ -86,7 +86,8 @@ Blocking must not be implemented before the Phase 1 safety foundation.
 - Internal event log records safety and policy events.
 - Android notifications can be requested for warning/exceeded policy states.
 - WorkManager periodically checks usage policy state without blocking.
-- Admin PIN and Emergency PIN are separated.
+- One Admin PIN authenticates local administration and Safe Recovery. Emergency
+  Pass is a separate rolling seven-day level-3 entitlement, not a second PIN.
 - Shared blocking safety gate is implemented for Safe Mode, Policy Enforcement,
   and never-block packages.
 - Foreground usage monitoring and blocking overlay enforcement are implemented

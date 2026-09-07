@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import com.manisykh.screenrest.safety.SafetyGate
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
@@ -27,6 +28,11 @@ data class DailyUsageInfo(
     val dayLabel: String,
     val totalTimeMillis: Long,
     val hasRecordedData: Boolean,
+)
+
+private val PHONE_USAGE_COMPONENT_PACKAGES = SafetyGate.phoneAppPackages + setOf(
+    "com.samsung.android.incallui",
+    "com.android.incallui",
 )
 
 class UsageStatsRepository(
@@ -88,24 +94,26 @@ class UsageStatsRepository(
         return try {
             val startTime = localDayStartMillis()
             val endTime = System.currentTimeMillis()
+            val launchablePackages = runCatching {
+                getLaunchablePackages()
+            }.getOrDefault(emptySet())
             val currentForeground = getCurrentForegroundSnapshot()
-            val eventUsageByPackage = runCatching {
+            val eventUsageSnapshot = runCatching {
                 getEventForegroundUsage(
                     startTime = startTime,
                     endTime = endTime,
                     currentForegroundPackageName = currentForeground.packageName,
                     foregroundBoundaryTimeMillis = currentForeground.updatedAtWallClockMillis,
+                    launchablePackages = launchablePackages,
                 )
-            }.getOrDefault(emptyMap())
+            }.getOrDefault(ForegroundUsageSnapshot())
+            val eventUsageByPackage = eventUsageSnapshot.usageByPackage
             val statsUsageByPackage = runCatching {
-                getStatsForegroundUsage(startTime, endTime)
+                getStatsForegroundUsage(startTime, endTime, launchablePackages)
             }.getOrDefault(emptyMap())
             val dailyUsageByPackage = runCatching {
-                getDailyForegroundUsage(startTime, endTime)
+                getDailyForegroundUsage(startTime, endTime, launchablePackages)
             }.getOrDefault(emptyMap())
-            val launchablePackages = runCatching {
-                getLaunchablePackages()
-            }.getOrDefault(emptySet())
 
             val maxAllowedUsageMillis = maxPossibleTodayUsageMillis(startTime, endTime)
             val sanitizedEventUsageByPackage = sanitizeTodayUsageMap(
@@ -140,15 +148,23 @@ class UsageStatsRepository(
                     eventUsageByPackage = sanitizedEventUsageByPackage,
                     statsUsageByPackage = sanitizedStatsUsageByPackage,
                     dailyUsageByPackage = sanitizedDailyUsageByPackage,
+                    eventTimelineAvailable = eventUsageSnapshot.hasTimelineEvents,
                 ),
                 maxAllowedUsageMillis = maxAllowedUsageMillis,
+                authoritative = eventUsageSnapshot.hasTimelineEvents,
             )
                 .filter { (packageName, totalTimeMillis) ->
                     totalTimeMillis > 0L &&
                         (launchablePackages.isEmpty() || packageName in launchablePackages) &&
                         isVisibleUsageApp(packageName)
                 }
-            historyStore.mergeDays(mapOf(startTime to stableUsageByPackage))
+            val reportableUsageByPackage = stableUsageByPackage
+                .filterValues { totalTimeMillis -> totalTimeMillis >= MIN_VISIBLE_USAGE_MILLIS }
+            if (eventUsageSnapshot.hasTimelineEvents) {
+                historyStore.replaceDays(mapOf(startTime to reportableUsageByPackage))
+            } else {
+                historyStore.mergeDays(mapOf(startTime to reportableUsageByPackage))
+            }
 
             stableUsageByPackage
                 .filter { (packageName, totalTimeMillis) ->
@@ -177,24 +193,26 @@ class UsageStatsRepository(
         return try {
             val startTime = localDayStartMillis()
             val endTime = System.currentTimeMillis()
+            val launchablePackages = runCatching {
+                getLaunchablePackages()
+            }.getOrDefault(emptySet())
             val currentForeground = getCurrentForegroundSnapshot()
-            val eventUsageByPackage = runCatching {
+            val eventUsageSnapshot = runCatching {
                 getEventForegroundUsage(
                     startTime = startTime,
                     endTime = endTime,
                     currentForegroundPackageName = currentForeground.packageName,
                     foregroundBoundaryTimeMillis = currentForeground.updatedAtWallClockMillis,
+                    launchablePackages = launchablePackages,
                 )
-            }.getOrDefault(emptyMap())
+            }.getOrDefault(ForegroundUsageSnapshot())
+            val eventUsageByPackage = eventUsageSnapshot.usageByPackage
             val statsUsageByPackage = runCatching {
-                getStatsForegroundUsage(startTime, endTime)
+                getStatsForegroundUsage(startTime, endTime, launchablePackages)
             }.getOrDefault(emptyMap())
             val dailyUsageByPackage = runCatching {
-                getDailyForegroundUsage(startTime, endTime)
+                getDailyForegroundUsage(startTime, endTime, launchablePackages)
             }.getOrDefault(emptyMap())
-            val launchablePackages = runCatching {
-                getLaunchablePackages()
-            }.getOrDefault(emptySet())
             val maxAllowedUsageMillis = maxPossibleTodayUsageMillis(startTime, endTime)
             val sanitizedEventUsageByPackage = sanitizeTodayUsageMap(
                 source = "events",
@@ -228,15 +246,23 @@ class UsageStatsRepository(
                     eventUsageByPackage = sanitizedEventUsageByPackage,
                     statsUsageByPackage = sanitizedStatsUsageByPackage,
                     dailyUsageByPackage = sanitizedDailyUsageByPackage,
+                    eventTimelineAvailable = eventUsageSnapshot.hasTimelineEvents,
                 ),
                 maxAllowedUsageMillis = maxAllowedUsageMillis,
+                authoritative = eventUsageSnapshot.hasTimelineEvents,
             )
                 .filter { (packageName, totalTimeMillis) ->
                     totalTimeMillis > 0L &&
                         (launchablePackages.isEmpty() || packageName in launchablePackages) &&
                         isVisibleUsageApp(packageName)
                 }
-            historyStore.mergeDays(mapOf(startTime to stableUsageByPackage))
+            val reportableUsageByPackage = stableUsageByPackage
+                .filterValues { totalTimeMillis -> totalTimeMillis >= MIN_VISIBLE_USAGE_MILLIS }
+            if (eventUsageSnapshot.hasTimelineEvents) {
+                historyStore.replaceDays(mapOf(startTime to reportableUsageByPackage))
+            } else {
+                historyStore.mergeDays(mapOf(startTime to reportableUsageByPackage))
+            }
             stableUsageByPackage
         } catch (_: RuntimeException) {
             todayContinuitySnapshot()
@@ -375,6 +401,7 @@ class UsageStatsRepository(
         }
         val requestedDays = dayStarts.toSet()
         val updates = mutableMapOf<Long, Map<String, Long>>()
+        var authoritativeEventDays: Map<Long, Map<String, Long>> = emptyMap()
         var systemDailyQuerySucceeded = false
         try {
             val systemUsageByDay = querySystemDailyUsage(
@@ -384,6 +411,9 @@ class UsageStatsRepository(
                 launchablePackages = launchablePackages,
             )
             systemDailyQuerySucceeded = true
+            // The platform may retain daily aggregates longer than detailed events. Merge every
+            // available day so an early partial snapshot does not become permanently frozen once
+            // it falls outside the detailed-event repair window.
             updates.putAll(systemUsageByDay)
         } catch (_: RuntimeException) {
             // Previously recorded days remain available when the system query is temporarily unavailable.
@@ -391,21 +421,38 @@ class UsageStatsRepository(
 
         if (systemDailyQuerySucceeded) {
             dayStarts
-                .takeLast(minOf(dayStarts.size, SYSTEM_DAILY_RETENTION_DAYS))
+                .takeLast(minOf(dayStarts.size, DETAILED_EVENT_REPAIR_DAYS))
                 .forEach { dayStartMillis ->
                     updates.putIfAbsent(dayStartMillis, emptyMap())
                 }
         }
 
+        runCatching {
+            queryEventDailyUsage(
+            dayStarts = dayStarts.takeLast(minOf(dayStarts.size, DETAILED_EVENT_REPAIR_DAYS)),
+                launchablePackages = launchablePackages,
+            )
+        }.getOrNull()?.let { eventUsage ->
+            authoritativeEventDays = eventUsage.coveredDayStarts.associateWith { dayStartMillis ->
+                eventUsage.usageByDay[dayStartMillis]
+                    .orEmpty()
+                    .filterValues { totalTimeMillis -> totalTimeMillis >= MIN_VISIBLE_USAGE_MILLIS }
+            }
+            authoritativeEventDays.keys.forEach(updates::remove)
+        }
+
         val todayStartMillis = dayStarts.last()
         val todayUsageByPackage = getTodayUsageMillisByPackage(skipAccessCheck = true)
-        updates[todayStartMillis] = mergeUsageByMaximum(
-            updates[todayStartMillis].orEmpty(),
-            todayUsageByPackage,
-        )
+            .filterValues { totalTimeMillis -> totalTimeMillis >= MIN_VISIBLE_USAGE_MILLIS }
+        updates.remove(todayStartMillis)
+        authoritativeEventDays = authoritativeEventDays + (todayStartMillis to todayUsageByPackage)
 
         historyStore.mergeDays(
             usageByDay = updates,
+            forceWrite = true,
+        )
+        historyStore.replaceDays(
+            usageByDay = authoritativeEventDays,
             forceWrite = true,
         )
         return historyStore.snapshot(dayStarts)
@@ -422,20 +469,32 @@ class UsageStatsRepository(
             .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, endTime)
             .orEmpty()
             .forEach { usageStats ->
-                val packageName = usageStats.packageName
+                val rawPackageName = usageStats.packageName
+                val packageName = canonicalUsagePackageName(
+                    packageName = rawPackageName,
+                    launchablePackages = launchablePackages,
+                )
                 val totalTimeMillis = usageStats.totalTimeInForeground
                 if (
                     totalTimeMillis <= 0L ||
                     totalTimeMillis > MAX_PLAUSIBLE_DAILY_USAGE_MILLIS ||
-                    (launchablePackages.isNotEmpty() && packageName !in launchablePackages) ||
-                    !isVisibleUsageApp(packageName)
+                    (
+                        launchablePackages.isNotEmpty() &&
+                            packageName !in launchablePackages &&
+                            rawPackageName !in PHONE_USAGE_COMPONENT_PACKAGES
+                        ) ||
+                    !isVisibleUsageApp(rawPackageName)
                 ) {
                     return@forEach
                 }
+                // INTERVAL_DAILY returns one UsageStats record per package/bucket. The bucket's
+                // first timestamp identifies the day; lastTimeUsed identifies the last app event
+                // and can move an older bucket into a later date. That was most visible just past
+                // the detailed-event retention window as very small day 12/13 totals.
                 val timestamp = when {
-                    usageStats.lastTimeUsed > 0L -> usageStats.lastTimeUsed
-                    usageStats.lastTimeStamp > 0L -> usageStats.lastTimeStamp
-                    else -> usageStats.firstTimeStamp
+                    usageStats.firstTimeStamp > 0L -> usageStats.firstTimeStamp
+                    usageStats.lastTimeStamp > 0L -> usageStats.lastTimeStamp - 1L
+                    else -> usageStats.lastTimeUsed
                 }
                 val dayStartMillis = dayStartMillisFor(timestamp)
                 if (dayStartMillis !in requestedDays) {
@@ -446,6 +505,106 @@ class UsageStatsRepository(
                     (dailyUsageByPackage[packageName] ?: 0L) + totalTimeMillis
             }
         return usageByDay
+    }
+
+    private fun queryEventDailyUsage(
+        dayStarts: List<Long>,
+        launchablePackages: Set<String>,
+    ): UserVisibleUsageTimeline {
+        if (dayStarts.isEmpty()) return UserVisibleUsageTimeline()
+
+        val dayWindows = dayStarts.map { dayStartMillis ->
+            UsageDayWindow(
+                startMillis = dayStartMillis,
+                endMillis = Calendar.getInstance().apply {
+                    timeInMillis = dayStartMillis
+                    add(Calendar.DAY_OF_YEAR, 1)
+                }.timeInMillis,
+            )
+        }
+        val rangeStartMillis = dayWindows.first().startMillis
+        val rangeEndMillis = minOf(System.currentTimeMillis(), dayWindows.last().endMillis)
+        val usageEvents = usageStatsManager.queryEvents(
+            (rangeStartMillis - EVENT_SESSION_LOOKBACK_MILLIS).coerceAtLeast(0L),
+            rangeEndMillis,
+        )
+        val event = UsageEvents.Event()
+        val timelineEvents = mutableListOf<UserVisibleUsageEvent>()
+
+        while (usageEvents.hasNextEvent()) {
+            usageEvents.getNextEvent(event)
+            val rawPackageName = event.packageName.orEmpty()
+            val packageName = canonicalUsagePackageName(
+                packageName = rawPackageName,
+                launchablePackages = launchablePackages,
+            )
+            when {
+                isSessionClearEvent(event.eventType) -> {
+                    timelineEvents += UserVisibleUsageEvent(
+                        timestampMillis = event.timeStamp,
+                        type = UserVisibleUsageEventType.SessionPause,
+                    )
+                }
+
+                isSessionResumeEvent(event.eventType) -> {
+                    timelineEvents += UserVisibleUsageEvent(
+                        timestampMillis = event.timeStamp,
+                        type = UserVisibleUsageEventType.SessionResume,
+                    )
+                }
+
+                isForegroundEvent(event.eventType) -> {
+                    when {
+                        rawPackageName.isBlank() -> Unit
+                        rawPackageName == context.packageName ||
+                            AppVisibility.clearsForegroundSession(rawPackageName) -> {
+                            timelineEvents += UserVisibleUsageEvent(
+                                timestampMillis = event.timeStamp,
+                                type = UserVisibleUsageEventType.SessionClear,
+                            )
+                        }
+                        AppVisibility.isHiddenPackage(rawPackageName) -> Unit
+                        launchablePackages.isNotEmpty() &&
+                            packageName !in launchablePackages &&
+                            rawPackageName !in PHONE_USAGE_COMPONENT_PACKAGES -> Unit
+                        else -> {
+                            timelineEvents += UserVisibleUsageEvent(
+                                timestampMillis = event.timeStamp,
+                                packageName = packageName,
+                                type = UserVisibleUsageEventType.Foreground,
+                                activityIdentity = usageActivityIdentity(event),
+                            )
+                        }
+                    }
+                }
+
+                isBackgroundEvent(event.eventType) &&
+                    rawPackageName.isNotBlank() &&
+                    !AppVisibility.isHiddenPackage(rawPackageName) -> {
+                    timelineEvents += UserVisibleUsageEvent(
+                        timestampMillis = event.timeStamp,
+                        packageName = packageName,
+                        type = UserVisibleUsageEventType.Background,
+                        activityIdentity = if (isPackageBackgroundEvent(event.eventType)) {
+                            ""
+                        } else {
+                            usageActivityIdentity(event)
+                        },
+                    )
+                }
+            }
+        }
+
+        val currentForegroundPackageName = getCurrentForegroundSnapshot().packageName
+            ?.let { packageName ->
+                canonicalUsagePackageName(packageName, launchablePackages)
+            }
+        return aggregateUserVisibleUsageByDay(
+            events = timelineEvents,
+            dayWindows = dayWindows,
+            rangeEndMillis = rangeEndMillis,
+            currentForegroundPackageName = currentForegroundPackageName,
+        )
     }
 
     fun getAppLabel(packageName: String): String {
@@ -510,6 +669,7 @@ class UsageStatsRepository(
             val event = UsageEvents.Event()
             var foregroundPackageName: String? = null
             var hasRelevantTerminalEvent = false
+            val activeActivityIdentities = mutableSetOf<String>()
 
             while (usageEvents.hasNextEvent()) {
                 usageEvents.getNextEvent(event)
@@ -518,6 +678,7 @@ class UsageStatsRepository(
                     isSessionClearEvent(event.eventType) -> {
                         foregroundPackageName = null
                         hasRelevantTerminalEvent = true
+                        activeActivityIdentities.clear()
                     }
 
                     isForegroundEvent(event.eventType) -> {
@@ -526,23 +687,45 @@ class UsageStatsRepository(
                             eventPackageName == context.packageName -> {
                                 foregroundPackageName = null
                                 hasRelevantTerminalEvent = true
+                                activeActivityIdentities.clear()
                             }
                             AppVisibility.clearsForegroundSession(eventPackageName) -> {
                                 foregroundPackageName = null
                                 hasRelevantTerminalEvent = true
+                                activeActivityIdentities.clear()
                             }
                             AppVisibility.isHiddenPackage(eventPackageName) -> Unit
                             else -> {
+                                if (foregroundPackageName != eventPackageName) {
+                                    activeActivityIdentities.clear()
+                                }
                                 foregroundPackageName = eventPackageName
                                 hasRelevantTerminalEvent = false
+                                usageActivityIdentity(event)
+                                    .takeIf { identity -> identity.isNotBlank() }
+                                    ?.let(activeActivityIdentities::add)
                             }
                         }
                     }
 
-                    isBackgroundEvent(event.eventType) && eventPackageName.isNotBlank() -> {
-                        if (foregroundPackageName == eventPackageName || foregroundPackageName == null) {
+                    isBackgroundEvent(event.eventType) &&
+                        eventPackageName.isNotBlank() &&
+                        foregroundPackageName == eventPackageName -> {
+                        val activityIdentity = if (isPackageBackgroundEvent(event.eventType)) {
+                            ""
+                        } else {
+                            usageActivityIdentity(event)
+                        }
+                        if (activityIdentity.isBlank()) {
                             foregroundPackageName = null
                             hasRelevantTerminalEvent = true
+                            activeActivityIdentities.clear()
+                        } else {
+                            activeActivityIdentities -= activityIdentity
+                            if (activeActivityIdentities.isEmpty()) {
+                                foregroundPackageName = null
+                                hasRelevantTerminalEvent = true
+                            }
                         }
                     }
                 }
@@ -606,6 +789,7 @@ class UsageStatsRepository(
             val usageEvents = usageStatsManager.queryEvents(startTime, endTime)
             val event = UsageEvents.Event()
             var foregroundPackageName: String? = null
+            val activeActivityIdentities = mutableSetOf<String>()
 
             while (usageEvents.hasNextEvent()) {
                 usageEvents.getNextEvent(event)
@@ -613,14 +797,34 @@ class UsageStatsRepository(
                 when {
                     isSessionClearEvent(event.eventType) -> {
                         foregroundPackageName = null
+                        activeActivityIdentities.clear()
                     }
 
                     isForegroundEvent(event.eventType) && eventPackageName.isNotBlank() -> {
+                        if (foregroundPackageName != eventPackageName) {
+                            activeActivityIdentities.clear()
+                        }
                         foregroundPackageName = eventPackageName
+                        usageActivityIdentity(event)
+                            .takeIf { identity -> identity.isNotBlank() }
+                            ?.let(activeActivityIdentities::add)
                     }
 
                     isBackgroundEvent(event.eventType) && foregroundPackageName == eventPackageName -> {
-                        foregroundPackageName = null
+                        val activityIdentity = if (isPackageBackgroundEvent(event.eventType)) {
+                            ""
+                        } else {
+                            usageActivityIdentity(event)
+                        }
+                        if (activityIdentity.isBlank()) {
+                            foregroundPackageName = null
+                            activeActivityIdentities.clear()
+                        } else {
+                            activeActivityIdentities -= activityIdentity
+                            if (activeActivityIdentities.isEmpty()) {
+                                foregroundPackageName = null
+                            }
+                        }
                     }
                 }
             }
@@ -636,12 +840,19 @@ class UsageStatsRepository(
         endTime: Long,
         currentForegroundPackageName: String?,
         foregroundBoundaryTimeMillis: Long?,
-    ): Map<String, Long> {
+        launchablePackages: Set<String>,
+    ): ForegroundUsageSnapshot {
         val usageByPackage = mutableMapOf<String, Long>()
         var foregroundPackageName: String? = null
         var foregroundStartedAt = 0L
+        var suspendedForegroundPackageName: String? = null
+        val activeActivityIdentities = mutableSetOf<String>()
+        var hasTimelineEvents = false
         val event = UsageEvents.Event()
-        val usageEvents = usageStatsManager.queryEvents(startTime, endTime)
+        val usageEvents = usageStatsManager.queryEvents(
+            (startTime - EVENT_SESSION_LOOKBACK_MILLIS).coerceAtLeast(0L),
+            endTime,
+        )
 
         fun closeForegroundSession(closedAt: Long) {
             val packageName = foregroundPackageName ?: return
@@ -655,24 +866,63 @@ class UsageStatsRepository(
             foregroundStartedAt = 0L
         }
 
+        fun clearForegroundSession(closedAt: Long) {
+            closeForegroundSession(closedAt)
+            activeActivityIdentities.clear()
+        }
+
         while (usageEvents.hasNextEvent()) {
             usageEvents.getNextEvent(event)
+            val rawEventPackageName = event.packageName.orEmpty()
+            val eventPackageName = canonicalUsagePackageName(
+                packageName = rawEventPackageName,
+                launchablePackages = launchablePackages,
+            )
+            val relevantPackageEvent = rawEventPackageName.isNotBlank() &&
+                (
+                    rawEventPackageName == context.packageName ||
+                        AppVisibility.clearsForegroundSession(rawEventPackageName) ||
+                        !AppVisibility.isHiddenPackage(rawEventPackageName)
+                    )
+            if (
+                event.timeStamp >= startTime &&
+                (
+                    (isForegroundEvent(event.eventType) && relevantPackageEvent) ||
+                        (isBackgroundEvent(event.eventType) && relevantPackageEvent) ||
+                        isSessionClearEvent(event.eventType) ||
+                        isSessionResumeEvent(event.eventType)
+                    )
+            ) {
+                hasTimelineEvents = true
+            }
             when {
                 isSessionClearEvent(event.eventType) -> {
+                    if (foregroundPackageName != null) {
+                        suspendedForegroundPackageName = foregroundPackageName
+                    }
                     closeForegroundSession(event.timeStamp)
                 }
 
+                isSessionResumeEvent(event.eventType) -> {
+                    suspendedForegroundPackageName?.let { packageName ->
+                        foregroundPackageName = packageName
+                        foregroundStartedAt = event.timeStamp
+                    }
+                    suspendedForegroundPackageName = null
+                }
+
                 isForegroundEvent(event.eventType) -> {
-                    val eventPackageName = event.packageName.orEmpty()
                     when {
-                        eventPackageName.isBlank() -> Unit
-                        eventPackageName == context.packageName ||
-                            AppVisibility.clearsForegroundSession(eventPackageName) -> {
-                            closeForegroundSession(event.timeStamp)
+                        rawEventPackageName.isBlank() -> Unit
+                        rawEventPackageName == context.packageName ||
+                            AppVisibility.clearsForegroundSession(rawEventPackageName) -> {
+                            suspendedForegroundPackageName = null
+                            clearForegroundSession(event.timeStamp)
                         }
-                        AppVisibility.isHiddenPackage(eventPackageName) -> Unit
+                        AppVisibility.isHiddenPackage(rawEventPackageName) -> Unit
                         foregroundPackageName != eventPackageName -> {
-                            closeForegroundSession(event.timeStamp)
+                            suspendedForegroundPackageName = null
+                            clearForegroundSession(event.timeStamp)
                             foregroundPackageName = eventPackageName
                             foregroundStartedAt = event.timeStamp
                         }
@@ -680,27 +930,76 @@ class UsageStatsRepository(
                             foregroundStartedAt = event.timeStamp
                         }
                     }
+                    if (
+                        rawEventPackageName.isNotBlank() &&
+                        rawEventPackageName != context.packageName &&
+                        !AppVisibility.clearsForegroundSession(rawEventPackageName) &&
+                        !AppVisibility.isHiddenPackage(rawEventPackageName) &&
+                        foregroundPackageName == eventPackageName
+                    ) {
+                        usageActivityIdentity(event)
+                            .takeIf { identity -> identity.isNotBlank() }
+                            ?.let(activeActivityIdentities::add)
+                    }
                 }
 
-                isBackgroundEvent(event.eventType) && foregroundPackageName == event.packageName -> {
-                    closeForegroundSession(event.timeStamp)
+                isBackgroundEvent(event.eventType) && foregroundPackageName == eventPackageName -> {
+                    val activityIdentity = if (isPackageBackgroundEvent(event.eventType)) {
+                        ""
+                    } else {
+                        usageActivityIdentity(event)
+                    }
+                    if (activityIdentity.isBlank()) {
+                        clearForegroundSession(event.timeStamp)
+                    } else {
+                        activeActivityIdentities -= activityIdentity
+                        if (activeActivityIdentities.isEmpty()) {
+                            closeForegroundSession(event.timeStamp)
+                        }
+                    }
+                }
+                isBackgroundEvent(event.eventType) && suspendedForegroundPackageName == eventPackageName -> {
+                    val activityIdentity = if (isPackageBackgroundEvent(event.eventType)) {
+                        ""
+                    } else {
+                        usageActivityIdentity(event)
+                    }
+                    if (activityIdentity.isBlank()) {
+                        suspendedForegroundPackageName = null
+                        activeActivityIdentities.clear()
+                    } else {
+                        activeActivityIdentities -= activityIdentity
+                        if (activeActivityIdentities.isEmpty()) {
+                            suspendedForegroundPackageName = null
+                        }
+                    }
                 }
             }
         }
 
+        val canonicalCurrentForegroundPackageName = currentForegroundPackageName?.let { packageName ->
+            canonicalUsagePackageName(packageName, launchablePackages)
+        }
         when {
-            foregroundPackageName == currentForegroundPackageName -> {
+            foregroundPackageName == canonicalCurrentForegroundPackageName -> {
                 closeForegroundSession(endTime)
             }
             foregroundBoundaryTimeMillis != null && foregroundStartedAt > 0L -> {
                 closeForegroundSession(foregroundBoundaryTimeMillis)
             }
         }
-        return usageByPackage
+        return ForegroundUsageSnapshot(
+            usageByPackage = usageByPackage,
+            hasTimelineEvents = hasTimelineEvents,
+        )
     }
 
-    private fun getStatsForegroundUsage(startTime: Long, endTime: Long): Map<String, Long> {
-        return usageStatsManager
+    private fun getStatsForegroundUsage(
+        startTime: Long,
+        endTime: Long,
+        launchablePackages: Set<String>,
+    ): Map<String, Long> {
+        val rawUsageByPackage = usageStatsManager
             .queryAndAggregateUsageStats(startTime, endTime)
             .filter { (packageName, usageStats) ->
                 usageStats.totalTimeInForeground > 0L &&
@@ -713,17 +1012,20 @@ class UsageStatsRepository(
                     )
             }
             .mapValues { (_, usageStats) -> usageStats.totalTimeInForeground }
+        return canonicalizeUsageMap(rawUsageByPackage, launchablePackages)
     }
 
     private fun mergeUsageByPackage(
         eventUsageByPackage: Map<String, Long>,
         statsUsageByPackage: Map<String, Long>,
         dailyUsageByPackage: Map<String, Long>,
+        eventTimelineAvailable: Boolean,
     ): Map<String, Long> {
         return mergeUsageSources(
             eventUsageByPackage = eventUsageByPackage,
             statsUsageByPackage = statsUsageByPackage,
             dailyUsageByPackage = dailyUsageByPackage,
+            eventTimelineAvailable = eventTimelineAvailable,
         )
     }
 
@@ -732,6 +1034,7 @@ class UsageStatsRepository(
         dayStartMillis: Long,
         usageByPackage: Map<String, Long>,
         maxAllowedUsageMillis: Long,
+        authoritative: Boolean,
     ): Map<String, Long> {
         if (monotonicUsageDayStartMillis != dayStartMillis) {
             monotonicUsageDayStartMillis = dayStartMillis
@@ -755,6 +1058,15 @@ class UsageStatsRepository(
             startTime = dayStartMillis,
             endTime = System.currentTimeMillis(),
         )
+        if (authoritative) {
+            monotonicUsageMillisByPackage.clear()
+            monotonicUsageMillisByPackage.putAll(sanitizedUsageByPackage)
+            return continuityStore.replaceRawUsage(
+                dayStartMillis = dayStartMillis,
+                rawUsageMillisByPackage = sanitizedUsageByPackage,
+                maxAllowedUsageMillis = maxAllowedUsageMillis,
+            )
+        }
         val observedPackageNames = sanitizedUsageByPackage.keys
         monotonicUsageMillisByPackage
             .keys
@@ -787,8 +1099,12 @@ class UsageStatsRepository(
         )
     }
 
-    private fun getDailyForegroundUsage(startTime: Long, endTime: Long): Map<String, Long> {
-        return usageStatsManager
+    private fun getDailyForegroundUsage(
+        startTime: Long,
+        endTime: Long,
+        launchablePackages: Set<String>,
+    ): Map<String, Long> {
+        val rawUsageByPackage = usageStatsManager
             .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, endTime)
             .filter { usageStats ->
                 usageStats.totalTimeInForeground > 0L &&
@@ -802,6 +1118,7 @@ class UsageStatsRepository(
             }
             .groupBy { usageStats -> usageStats.packageName }
             .mapValues { (_, usageStats) -> usageStats.sumOf { stat -> stat.totalTimeInForeground } }
+        return canonicalizeUsageMap(rawUsageByPackage, launchablePackages)
     }
 
     private fun usageStatsHasTodaySignal(
@@ -835,9 +1152,25 @@ class UsageStatsRepository(
             eventType == UsageEvents.Event.MOVE_TO_BACKGROUND
     }
 
+    @Suppress("DEPRECATION")
+    private fun isPackageBackgroundEvent(eventType: Int): Boolean {
+        return eventType == UsageEvents.Event.MOVE_TO_BACKGROUND
+    }
+
+    private fun usageActivityIdentity(event: UsageEvents.Event): String {
+        return event.className
+            ?.takeIf { className -> className.isNotBlank() }
+            ?.let { className -> "class:$className" }
+            .orEmpty()
+    }
+
     private fun isSessionClearEvent(eventType: Int): Boolean {
         return eventType == UsageEvents.Event.SCREEN_NON_INTERACTIVE ||
             eventType == UsageEvents.Event.KEYGUARD_SHOWN
+    }
+
+    private fun isSessionResumeEvent(eventType: Int): Boolean {
+        return eventType == UsageEvents.Event.KEYGUARD_HIDDEN
     }
 
     private fun localDayStartMillis(): Long {
@@ -865,6 +1198,27 @@ class UsageStatsRepository(
 
     private fun isVisibleUsageApp(packageName: String): Boolean {
         return packageName != context.packageName && !AppVisibility.isHiddenPackage(packageName)
+    }
+
+    private fun canonicalUsagePackageName(
+        packageName: String,
+        launchablePackages: Set<String>,
+    ): String {
+        return canonicalPhoneUsagePackageName(packageName, launchablePackages)
+    }
+
+    private fun canonicalizeUsageMap(
+        usageByPackage: Map<String, Long>,
+        launchablePackages: Set<String>,
+    ): Map<String, Long> {
+        val canonicalUsageByPackage = mutableMapOf<String, Long>()
+        usageByPackage.forEach { (packageName, usageMillis) ->
+            val canonicalPackageName =
+                canonicalUsagePackageName(packageName, launchablePackages)
+            canonicalUsageByPackage[canonicalPackageName] =
+                (canonicalUsageByPackage[canonicalPackageName] ?: 0L) + usageMillis
+        }
+        return canonicalUsageByPackage
     }
 
     private fun getLaunchablePackages(): Set<String> {
@@ -1059,6 +1413,11 @@ class UsageStatsRepository(
         val updatedAtWallClockMillis: Long?,
     )
 
+    private data class ForegroundUsageSnapshot(
+        val usageByPackage: Map<String, Long> = emptyMap(),
+        val hasTimelineEvents: Boolean = false,
+    )
+
     private data class UsageEventsForegroundState(
         val packageName: String? = null,
         val hasRelevantTerminalEvent: Boolean = false,
@@ -1066,10 +1425,11 @@ class UsageStatsRepository(
 
     companion object {
         private const val MIN_VISIBLE_USAGE_MILLIS = 10_000L
-        private const val SYSTEM_DAILY_RETENTION_DAYS = 10
+        private const val DETAILED_EVENT_REPAIR_DAYS = 10
         private const val MAX_PLAUSIBLE_DAILY_USAGE_MILLIS = 26L * 60L * 60L * 1000L
         private const val USAGE_ACCESS_PROBE_WINDOW_MILLIS = 7L * 24L * 60L * 60L * 1000L
         private const val CURRENT_FOREGROUND_LOOKBACK_MILLIS = 30_000L
+        private const val EVENT_SESSION_LOOKBACK_MILLIS = 24L * 60L * 60L * 1000L
         private const val CURRENT_FOREGROUND_TRACKER_MAX_AGE_MILLIS = 2_500L
         private const val RECENT_FOREGROUND_STATS_LOOKBACK_MILLIS = 30_000L
         private const val RECENT_FOREGROUND_STATS_MAX_AGE_MILLIS = 15_000L
@@ -1079,22 +1439,180 @@ class UsageStatsRepository(
     }
 }
 
-private fun mergeUsageByMaximum(
-    first: Map<String, Long>,
-    second: Map<String, Long>,
-): Map<String, Long> {
-    return (first.keys + second.keys)
-        .associateWith { packageName ->
-            maxOf(first[packageName] ?: 0L, second[packageName] ?: 0L)
+internal enum class UserVisibleUsageEventType {
+    Foreground,
+    Background,
+    SessionPause,
+    SessionResume,
+    SessionClear,
+}
+
+internal fun canonicalPhoneUsagePackageName(
+    packageName: String,
+    launchablePackages: Set<String>,
+): String {
+    if (packageName !in PHONE_USAGE_COMPONENT_PACKAGES) {
+        return packageName
+    }
+    return SafetyGate.phoneAppPackages
+        .firstOrNull { phonePackage -> phonePackage in launchablePackages }
+        ?: packageName
+}
+
+internal data class UserVisibleUsageEvent(
+    val timestampMillis: Long,
+    val packageName: String = "",
+    val type: UserVisibleUsageEventType,
+    val activityIdentity: String = "",
+)
+
+internal data class UsageDayWindow(
+    val startMillis: Long,
+    val endMillis: Long,
+)
+
+internal data class UserVisibleUsageTimeline(
+    val usageByDay: Map<Long, Map<String, Long>> = emptyMap(),
+    val coveredDayStarts: Set<Long> = emptySet(),
+)
+
+internal fun aggregateUserVisibleUsageByDay(
+    events: List<UserVisibleUsageEvent>,
+    dayWindows: List<UsageDayWindow>,
+    rangeEndMillis: Long,
+    currentForegroundPackageName: String?,
+): UserVisibleUsageTimeline {
+    val validWindows = dayWindows
+        .filter { window -> window.startMillis >= 0L && window.endMillis > window.startMillis }
+        .sortedBy { window -> window.startMillis }
+    if (validWindows.isEmpty()) return UserVisibleUsageTimeline()
+
+    val usageByDay = mutableMapOf<Long, MutableMap<String, Long>>()
+    val coveredDayStarts = mutableSetOf<Long>()
+    var foregroundPackageName: String? = null
+    var foregroundStartedAtMillis = 0L
+    var suspendedForegroundPackageName: String? = null
+    val activeActivityIdentities = mutableSetOf<String>()
+
+    fun markCovered(timestampMillis: Long) {
+        validWindows.firstOrNull { window ->
+            timestampMillis in window.startMillis until window.endMillis
+        }?.let { window -> coveredDayStarts += window.startMillis }
+    }
+
+    fun addForegroundInterval(packageName: String, startedAtMillis: Long, endedAtMillis: Long) {
+        if (packageName.isBlank() || endedAtMillis <= startedAtMillis) return
+        validWindows.forEach { window ->
+            val clippedStart = maxOf(startedAtMillis, window.startMillis)
+            val clippedEnd = minOf(endedAtMillis, window.endMillis, rangeEndMillis)
+            if (clippedEnd > clippedStart) {
+                val dailyUsage = usageByDay.getOrPut(window.startMillis) { mutableMapOf() }
+                dailyUsage[packageName] =
+                    (dailyUsage[packageName] ?: 0L) + clippedEnd - clippedStart
+                coveredDayStarts += window.startMillis
+            }
         }
-        .filterValues { usageMillis -> usageMillis > 0L }
+    }
+
+    fun closeForegroundSession(closedAtMillis: Long) {
+        val packageName = foregroundPackageName ?: return
+        addForegroundInterval(
+            packageName = packageName,
+            startedAtMillis = foregroundStartedAtMillis,
+            endedAtMillis = closedAtMillis,
+        )
+        foregroundPackageName = null
+        foregroundStartedAtMillis = 0L
+    }
+
+    fun clearForegroundSession(closedAtMillis: Long) {
+        closeForegroundSession(closedAtMillis)
+        activeActivityIdentities.clear()
+    }
+
+    events.sortedBy { event -> event.timestampMillis }.forEach { event ->
+        markCovered(event.timestampMillis)
+        when (event.type) {
+            UserVisibleUsageEventType.SessionPause -> {
+                if (foregroundPackageName != null) {
+                    suspendedForegroundPackageName = foregroundPackageName
+                }
+                closeForegroundSession(event.timestampMillis)
+            }
+            UserVisibleUsageEventType.SessionResume -> {
+                suspendedForegroundPackageName?.let { packageName ->
+                    foregroundPackageName = packageName
+                    foregroundStartedAtMillis = event.timestampMillis
+                }
+                suspendedForegroundPackageName = null
+            }
+            UserVisibleUsageEventType.SessionClear -> {
+                suspendedForegroundPackageName = null
+                clearForegroundSession(event.timestampMillis)
+            }
+            UserVisibleUsageEventType.Foreground -> {
+                if (event.packageName.isBlank()) return@forEach
+                if (foregroundPackageName != event.packageName) {
+                    suspendedForegroundPackageName = null
+                    clearForegroundSession(event.timestampMillis)
+                    foregroundPackageName = event.packageName
+                    foregroundStartedAtMillis = event.timestampMillis
+                } else if (foregroundStartedAtMillis <= 0L) {
+                    foregroundStartedAtMillis = event.timestampMillis
+                }
+                if (event.activityIdentity.isNotBlank()) {
+                    activeActivityIdentities += event.activityIdentity
+                }
+            }
+            UserVisibleUsageEventType.Background -> {
+                if (foregroundPackageName == event.packageName) {
+                    if (event.activityIdentity.isBlank()) {
+                        clearForegroundSession(event.timestampMillis)
+                    } else {
+                        activeActivityIdentities -= event.activityIdentity
+                        if (activeActivityIdentities.isEmpty()) {
+                            closeForegroundSession(event.timestampMillis)
+                        }
+                    }
+                }
+                if (suspendedForegroundPackageName == event.packageName) {
+                    if (event.activityIdentity.isBlank()) {
+                        suspendedForegroundPackageName = null
+                        activeActivityIdentities.clear()
+                    } else {
+                        activeActivityIdentities -= event.activityIdentity
+                        if (activeActivityIdentities.isEmpty()) {
+                            suspendedForegroundPackageName = null
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (foregroundPackageName == currentForegroundPackageName) {
+        closeForegroundSession(rangeEndMillis)
+    }
+
+    return UserVisibleUsageTimeline(
+        usageByDay = usageByDay.mapValues { (_, usageByPackage) ->
+            usageByPackage
+                .filterValues { usageMillis -> usageMillis > 0L }
+                .toSortedMap()
+        },
+        coveredDayStarts = coveredDayStarts,
+    )
 }
 
 internal fun mergeUsageSources(
     eventUsageByPackage: Map<String, Long>,
     statsUsageByPackage: Map<String, Long>,
     dailyUsageByPackage: Map<String, Long>,
+    eventTimelineAvailable: Boolean = false,
 ): Map<String, Long> {
+    if (eventTimelineAvailable) {
+        return eventUsageByPackage.filterValues { usageMillis -> usageMillis > 0L }
+    }
     return (eventUsageByPackage.keys + statsUsageByPackage.keys + dailyUsageByPackage.keys)
         .associateWith { packageName ->
             maxOf(

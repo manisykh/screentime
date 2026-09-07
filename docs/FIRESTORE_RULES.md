@@ -1,176 +1,46 @@
-# Firestore Rules
+# ScreenRest Firestore 보안 규칙
 
-ScreenRest remote parent features use Firebase Authentication and Cloud Firestore.
-The current MVP uses anonymous authentication and a pairing code flow.
+## 적용 방법
 
-## Collections
+루트의 `firestore.rules`가 현재 전체 규칙입니다. Firebase Console의 **Firestore Database > 규칙**에 파일 전체를 붙여 넣어 게시하거나 Firebase CLI에서 아래 명령을 실행합니다.
 
-- `screenrest_pairing_codes/{pairingCode}`
-- `screenrest_children/{childDeviceId}/unlock_requests/{requestId}`
-- `screenrest_children/{childDeviceId}/remote_commands/{commandId}`
-
-## MVP Rule Draft
-
-Use this only while testing with paired devices. It requires the client to be signed in,
-but it does not yet fully prove that the signed-in user owns the parent/child relation.
-
-```firestore
-rules_version = '2';
-
-service cloud.firestore {
-  match /databases/{database}/documents {
-    function signedIn() {
-      return request.auth != null;
-    }
-
-    match /screenrest_pairing_codes/{pairingCode} {
-      allow create, read: if signedIn();
-      allow update, delete: if false;
-    }
-
-    match /screenrest_children/{childDeviceId} {
-      allow create, read, update: if signedIn();
-      allow delete: if false;
-    }
-
-    match /screenrest_children/{childDeviceId}/unlock_requests/{requestId} {
-      allow create, read, update: if signedIn();
-      allow delete: if false;
-    }
-
-    match /screenrest_children/{childDeviceId}/remote_commands/{commandId} {
-      allow create, read, update: if signedIn();
-      allow delete: if false;
-    }
-  }
-}
+```bash
+firebase deploy --only firestore:rules
 ```
 
-## Release Target
+## 사용하는 컬렉션
 
-Before release, add ownership fields and restrict access to linked devices only.
+- `screenrest_pairing_codes/{pairingCode}`: 자녀 연결 코드
+- `screenrest_children/{childDeviceId}`: 자녀와 연결 부모 정보
+- `screenrest_children/{childDeviceId}/unlock_requests/{requestId}`: 추가 시간 요청
+- `screenrest_children/{childDeviceId}/remote_commands/{commandId}`: 부모 승인 명령
+- `screenrest_children/{childDeviceId}/push_tokens/{tokenId}`: FCM 수신 대상
 
-Required document fields:
+## FCM 토큰 규칙
 
-- Pairing code doc: `childUid`, `childDeviceId`, `expiresAt`, `expiresAtMillis`, `status`, `used`
-- Child root doc: `childUid`, `parentUids`, `activePairingCode`, `status`, `updatedAtMillis`
-- Unlock request doc: `childUid`, `parentUid`
-- Remote command doc: `parentUid`
+- 토큰 문서는 로그인한 현재 기기만 만들거나 갱신할 수 있습니다.
+- 자녀 토큰은 해당 자녀 문서의 `childUid`와 로그인 UID가 일치해야 합니다.
+- 부모 토큰은 해당 자녀 문서의 `parentUids`에 로그인 UID가 있어야 합니다.
+- 앱 클라이언트는 토큰 문서를 읽거나 목록 조회할 수 없습니다.
+- 자신의 토큰 문서만 삭제할 수 있습니다. 연결 해제 직후의 정리도 가능하도록 삭제에는 현재 연결 여부를 요구하지 않습니다.
+- Cloud Functions의 Admin SDK는 보안 규칙을 우회하지만, 함수에서 자녀 UID와 연결 부모 UID를 다시 확인합니다.
 
-```firestore
-rules_version = '2';
+## 최소 권한 규칙
 
-service cloud.firestore {
-  match /databases/{database}/documents {
-    function signedIn() {
-      return request.auth != null;
-    }
+- 자녀 문서의 `childUid`와 `childDeviceId`는 생성 후 변경할 수 없습니다.
+- 연결된 부모는 자녀 문서 전체를 덮어쓸 수 없습니다. 본인 프로필 갱신, 본인 연결 해제, 원자적 연결 확정에 필요한 필드만 변경할 수 있습니다.
+- 승인 요청은 자녀가 생성하며, 부모는 Pending 요청의 승인·거절 필드만 변경할 수 있습니다.
+- 원격 명령은 연결된 부모만 정해진 스키마로 생성할 수 있고 클라이언트 수정은 허용하지 않습니다.
+- 문서 ID, UID, 역할, 상태, 숫자 범위, 문자열 크기와 변경 필드 목록을 규칙에서 검증합니다.
+- 연결 부모와 프로필 배열은 자녀 한 명당 최대 10개로 제한합니다.
 
-    function childDoc(childDeviceId) {
-      return get(/databases/$(database)/documents/screenrest_children/$(childDeviceId));
-    }
+규칙을 게시하기 전에 자녀 코드 생성 → 부모 연결 → 요청 → 승인/거절 → 연결 해제 → 7일 경과 데이터 삭제 흐름을 테스트 프로젝트에서 검증해야 합니다. 운영 프로젝트에는 검증되지 않은 규칙을 바로 게시하지 않습니다.
 
-    function isChildOwner(childDeviceId) {
-      return signedIn() && childDoc(childDeviceId).data.childUid == request.auth.uid;
-    }
+## 무료 데이터 정리 정책
 
-    function isLinkedParent(childDeviceId) {
-      return signedIn() &&
-        childDoc(childDeviceId).data.status != "unlinked" &&
-        request.auth.uid in childDoc(childDeviceId).data.parentUids;
-    }
+- 자녀 기기는 7일이 지난 요청과 원격 명령을 기존 정리 작업에서 삭제합니다.
+- FCM 토큰은 같은 앱 설치에서 토큰이 바뀌어도 같은 문서 ID로 덮어씁니다.
+- 연결이 끊긴 UID나 FCM이 무효라고 응답한 토큰은 알림 함수가 발견하는 즉시 삭제합니다.
+- 별도의 Firestore TTL 정책은 사용하지 않습니다.
 
-    function activePairingCode(childDeviceId) {
-      return childDoc(childDeviceId).data.activePairingCode;
-    }
-
-    function canReadForActivePairing(childDeviceId) {
-      let pairing = get(/databases/$(database)/documents/screenrest_pairing_codes/$(activePairingCode(childDeviceId)));
-      return signedIn() &&
-        pairing.data.childDeviceId == childDeviceId &&
-        pairing.data.status == "active" &&
-        pairing.data.used == false &&
-        pairing.data.expiresAt > request.time;
-    }
-
-    function isAtomicPairingParent(childDeviceId) {
-      let pairingAfter = getAfter(/databases/$(database)/documents/screenrest_pairing_codes/$(activePairingCode(childDeviceId)));
-      return signedIn() &&
-        pairingAfter.data.childDeviceId == childDeviceId &&
-        pairingAfter.data.status == "used" &&
-        pairingAfter.data.used == true &&
-        pairingAfter.data.parentUid == request.auth.uid &&
-        request.auth.uid in request.resource.data.parentUids;
-    }
-
-    function isActivePairingCode() {
-      return resource.data.status == "active" &&
-        resource.data.used == false &&
-        resource.data.expiresAt > request.time;
-    }
-
-    match /screenrest_pairing_codes/{pairingCode} {
-      allow create: if signedIn() &&
-        request.resource.data.childUid == request.auth.uid &&
-        request.resource.data.status == "active" &&
-        request.resource.data.used == false;
-      allow get: if signedIn() &&
-        (isActivePairingCode() || resource.data.parentUid == request.auth.uid || resource.data.childUid == request.auth.uid);
-      allow list: if false;
-      allow update: if signedIn() &&
-        (
-          resource.data.childUid == request.auth.uid ||
-          request.resource.data.parentUid == request.auth.uid
-        ) &&
-        request.resource.data.status in ["used", "expired"];
-      allow delete: if false;
-    }
-
-    match /screenrest_children/{childDeviceId} {
-      allow create: if signedIn() &&
-        request.resource.data.childUid == request.auth.uid;
-      allow read: if isChildOwner(childDeviceId) || isLinkedParent(childDeviceId) || canReadForActivePairing(childDeviceId);
-      allow update: if isChildOwner(childDeviceId) || isLinkedParent(childDeviceId) || isAtomicPairingParent(childDeviceId);
-
-      match /unlock_requests/{requestId} {
-        allow create: if isChildOwner(childDeviceId) &&
-          request.resource.data.childUid == request.auth.uid;
-        allow read: if isChildOwner(childDeviceId) || isLinkedParent(childDeviceId);
-        allow update: if isLinkedParent(childDeviceId);
-        allow delete: if false;
-      }
-
-      match /remote_commands/{commandId} {
-        allow create: if isLinkedParent(childDeviceId);
-        allow read: if isChildOwner(childDeviceId) || isLinkedParent(childDeviceId);
-        allow update: if isChildOwner(childDeviceId);
-        allow delete: if false;
-      }
-    }
-  }
-}
-```
-
-## Notes
-
-- The MVP rule is intentionally still limited to authenticated clients, but it is not
-  enough for production.
-- Release rules require the app to write UID ownership fields during pairing.
-- Pairing codes are single-use. The app now marks them as `used`, or `expired`
-  when a parent tries to resolve an expired code.
-- A child device can have multiple linked parent UIDs in `parentUids`.
-  Linked parents are equal authority in the current MVP. If needed later,
-  add an owner/guardian role field for sensitive operations such as unlinking
-  every parent or changing remote-management policy.
-- A parent device can track multiple child devices locally. It syncs each
-  linked child document and merges unlock requests into one parent request list.
-- For multi-parent request conflicts, the app uses a first-decision-wins model:
-  once an unlock request is no longer `Pending`, later parent approvals or
-  rejections do not overwrite the existing decision.
-- Disconnecting a parent/child link does not delete data immediately. The app
-  removes only the current parent UID from `parentUids`. It marks the child
-  document as `status = "unlinked"` only when no linked parent remains, and
-  writes `unlinkedAtMillis`. A release policy can later delete or archive those
-  records after 30 days.
-- FCM or Firestore snapshot listeners can reduce latency later, but the current MVP
-  keeps fast polling on the block screen to avoid extra background policy complexity.
+전체 규칙 원문은 [`firestore.rules`](../firestore.rules)를 기준으로 관리합니다.

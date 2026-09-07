@@ -5,28 +5,36 @@ import android.content.Context
 import android.os.Build
 import android.provider.Settings
 import androidx.work.Constraints
+import androidx.work.BackoffPolicy
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.manisykh.screenrest.blocking.UsageMonitorForegroundService
 import com.manisykh.screenrest.formatLimitMinutesLabel
+import com.manisykh.screenrest.data.AppLanguage
 import com.manisykh.screenrest.data.EventLogType
-import com.manisykh.screenrest.data.ParentDeviceRole
 import com.manisykh.screenrest.data.ParentRemoteSyncDataSourceFactory
-import com.manisykh.screenrest.data.RemoteUnlockRequestStatus
 import com.manisykh.screenrest.data.SettingsRepository
 import com.manisykh.screenrest.data.SystemHealthStatus
 import com.manisykh.screenrest.data.normalizedAppGroups
+import com.manisykh.screenrest.data.activeScheduleTemplates
+import com.manisykh.screenrest.data.appliesOn
+import com.manisykh.screenrest.data.currentPolicyDayOfWeek
+import com.manisykh.screenrest.data.currentOccurrenceEndMillis
+import com.manisykh.screenrest.data.limitMinutesOrNull
 import com.manisykh.screenrest.data.settingsDataStore
 import com.manisykh.screenrest.notification.UsageNotificationHelper
-import com.manisykh.screenrest.ui.safety.appLimitMap
-import com.manisykh.screenrest.ui.safety.todayLimitMinutes
+import com.manisykh.screenrest.notification.ParentRemoteNotificationCoordinator
+import com.manisykh.screenrest.safety.SafetyGate
+import com.manisykh.screenrest.ui.safety.activeAppLimitMap
+import com.manisykh.screenrest.ui.safety.todayLimitMinutesOrNull
 import com.manisykh.screenrest.usage.UsageStatsRepository
 import kotlinx.coroutines.flow.first
 import java.text.SimpleDateFormat
@@ -39,6 +47,9 @@ class UsagePolicyCheckWorker(
     workerParams: WorkerParameters,
 ) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork(): Result {
+        if (!monitoringDisclosureAccepted(applicationContext)) {
+            return Result.success()
+        }
         UsagePolicyAlertRunner.evaluate(applicationContext, sendNotifications = true)
         return Result.success()
     }
@@ -71,6 +82,9 @@ class SystemHealthCheckWorker(
             appContext.settingsDataStore,
             ParentRemoteSyncDataSourceFactory.create(appContext),
         )
+        if (!settingsRepository.monitoringDisclosureAccepted.first()) {
+            return Result.success()
+        }
         val usageRepository = UsageStatsRepository(appContext)
         val notificationHelper = UsageNotificationHelper(appContext)
         val safeModeEnabled = settingsRepository.safeModeEnabled.first()
@@ -83,7 +97,7 @@ class SystemHealthCheckWorker(
         val usageAccessReady = usageRepository.hasUsageAccess()
         val overlayPermissionReady = Settings.canDrawOverlays(appContext)
         val notificationPermissionReady = notificationHelper.canPostNotifications()
-        val notificationAccessReady = hasNotificationListenerAccess(appContext)
+        val notificationAccessReady = true
         val exactAlarmReady = canScheduleExactAlarms(appContext)
         val status = SystemHealthStatus(
             lastCheckedMillis = now,
@@ -100,8 +114,6 @@ class SystemHealthCheckWorker(
                 usageAccessReady = usageAccessReady,
                 overlayPermissionReady = overlayPermissionReady,
                 notificationPermissionReady = notificationPermissionReady,
-                notificationAccessReady = notificationAccessReady,
-                exactAlarmReady = exactAlarmReady,
                 foregroundServiceRunning = monitorStatus.running,
                 foregroundServiceFresh = foregroundServiceFresh,
             ),
@@ -147,14 +159,6 @@ class SystemHealthCheckWorker(
             )
         }
 
-        private fun hasNotificationListenerAccess(context: Context): Boolean {
-            val enabledListeners = Settings.Secure.getString(
-                context.contentResolver,
-                "enabled_notification_listeners",
-            ).orEmpty()
-            return enabledListeners.contains(context.packageName, ignoreCase = true)
-        }
-
         private fun canScheduleExactAlarms(context: Context): Boolean {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
                 return true
@@ -167,8 +171,6 @@ class SystemHealthCheckWorker(
             usageAccessReady: Boolean,
             overlayPermissionReady: Boolean,
             notificationPermissionReady: Boolean,
-            notificationAccessReady: Boolean,
-            exactAlarmReady: Boolean,
             foregroundServiceRunning: Boolean,
             foregroundServiceFresh: Boolean,
         ): String {
@@ -176,8 +178,6 @@ class SystemHealthCheckWorker(
                 "usage access".takeUnless { usageAccessReady },
                 "overlay".takeUnless { overlayPermissionReady },
                 "notification permission".takeUnless { notificationPermissionReady },
-                "notification access".takeUnless { notificationAccessReady },
-                "exact alarm".takeUnless { exactAlarmReady },
                 "monitor stopped".takeIf { serviceExpected && !foregroundServiceRunning },
                 "monitor stale".takeIf { serviceExpected && foregroundServiceRunning && !foregroundServiceFresh },
             ).joinToString(", ")
@@ -195,6 +195,9 @@ class DailyRolloverWorker(
             appContext.settingsDataStore,
             ParentRemoteSyncDataSourceFactory.create(appContext),
         )
+        if (!settingsRepository.monitoringDisclosureAccepted.first()) {
+            return Result.success()
+        }
         settingsRepository.recordDailyRollover()
         UsagePolicyCheckWorker.schedule(appContext)
         SystemHealthCheckWorker.scheduleNow(appContext)
@@ -235,82 +238,65 @@ class RemoteParentSyncWorker(
             appContext.settingsDataStore,
             ParentRemoteSyncDataSourceFactory.create(appContext),
         )
-        val notificationHelper = UsageNotificationHelper(appContext)
+        if (!settingsRepository.monitoringDisclosureAccepted.first()) {
+            return Result.success()
+        }
         val before = settingsRepository.parentManagementState.first()
         val hasSyncTarget = before.childDeviceId.isNotBlank() ||
             before.linkedChildDevices.any { child -> child.childDeviceId.isNotBlank() }
         if (!before.paired || !hasSyncTarget) {
             return Result.success()
         }
-
-        settingsRepository.syncParentDevice()
-        val after = settingsRepository.parentManagementState.first()
-        val beforeById = before.remoteUnlockRequests.associateBy { request -> request.id }
-
-        if (after.deviceRole == ParentDeviceRole.Parent) {
-            val newPendingRequests = after.remoteUnlockRequests
-                .filter { request -> request.status == RemoteUnlockRequestStatus.Pending }
-                .filter { request -> request.id !in beforeById }
-            newPendingRequests.forEach { request ->
-                val target = request.targetAppName
-                    .ifBlank { request.targetGroupName }
-                    .ifBlank { request.targetPackageName }
-                    .ifBlank { "ScreenRest" }
-                notificationHelper.showPolicyAlert(
-                    title = "ScreenRest",
-                    message = "자녀 기기에서 사용 시간 요청이 왔습니다: $target",
-                )
-            }
+        if (inputData.getBoolean(INPUT_FETCH_REQUEST_DIRECTLY, false)) {
+            inputData.getString(INPUT_REQUEST_ID)
+                ?.takeIf { requestId -> requestId.isNotBlank() }
+                ?.let { requestId -> settingsRepository.syncRemoteUnlockRequest(requestId) }
         }
-
-        if (after.deviceRole == ParentDeviceRole.Child) {
-            val newlyApprovedRequests = after.remoteUnlockRequests
-                .filter { request -> request.status == RemoteUnlockRequestStatus.Approved }
-                .filter { request -> beforeById[request.id]?.status != RemoteUnlockRequestStatus.Approved }
-            newlyApprovedRequests.forEach { request ->
-                val target = request.targetAppName
-                    .ifBlank { request.targetGroupName }
-                    .ifBlank { request.targetPackageName }
-                    .ifBlank { "ScreenRest" }
-                notificationHelper.showPolicyAlert(
-                    title = "ScreenRest",
-                    message = "부모가 사용 시간 요청을 승인했습니다: $target",
-                )
-            }
-            val newlyRejectedRequests = after.remoteUnlockRequests
-                .filter { request -> request.status == RemoteUnlockRequestStatus.Rejected }
-                .filter { request -> beforeById[request.id]?.status != RemoteUnlockRequestStatus.Rejected }
-            newlyRejectedRequests.forEach { request ->
-                val target = request.targetAppName
-                    .ifBlank { request.targetGroupName }
-                    .ifBlank { request.targetPackageName }
-                    .ifBlank { "ScreenRest" }
-                notificationHelper.showPolicyAlert(
-                    title = "ScreenRest",
-                    message = "부모가 사용 시간 요청을 거절했습니다: $target",
-                )
-            }
-        }
-        return Result.success()
+        val syncResult = ParentRemoteNotificationCoordinator(
+            context = appContext,
+            repository = settingsRepository,
+        ).synchronizeAndNotify()
+        return if (syncResult.retryable) Result.retry() else Result.success()
     }
 
     companion object {
         private const val UNIQUE_IMMEDIATE_WORK_NAME = "remote_parent_sync_immediate"
         private const val UNIQUE_PERIODIC_WORK_NAME = "remote_parent_sync_periodic"
+        private const val INPUT_REQUEST_ID = "request_id"
+        private const val INPUT_FETCH_REQUEST_DIRECTLY = "fetch_request_directly"
 
         fun schedule(context: Context) {
-            WorkManager.getInstance(context).enqueueUniqueWork(
-                UNIQUE_IMMEDIATE_WORK_NAME,
-                ExistingWorkPolicy.KEEP,
-                OneTimeWorkRequestBuilder<RemoteParentSyncWorker>()
-                    .setConstraints(networkConstraints())
-                    .build(),
-            )
+            scheduleImmediate(context)
             WorkManager.getInstance(context).enqueueUniquePeriodicWork(
                 UNIQUE_PERIODIC_WORK_NAME,
                 ExistingPeriodicWorkPolicy.UPDATE,
                 PeriodicWorkRequestBuilder<RemoteParentSyncWorker>(15, TimeUnit.MINUTES)
                     .setConstraints(networkConstraints())
+                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                    .build(),
+            )
+        }
+
+        fun scheduleImmediate(
+            context: Context,
+            eventKey: String = "default",
+            requestId: String = "",
+            fetchRequestDirectly: Boolean = false,
+        ) {
+            val uniqueSuffix = eventKey.hashCode().toUInt().toString(16)
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                "${UNIQUE_IMMEDIATE_WORK_NAME}_$uniqueSuffix",
+                ExistingWorkPolicy.KEEP,
+                OneTimeWorkRequestBuilder<RemoteParentSyncWorker>()
+                    .setInputData(
+                        workDataOf(
+                            INPUT_REQUEST_ID to requestId,
+                            INPUT_FETCH_REQUEST_DIRECTLY to fetchRequestDirectly,
+                        ),
+                    )
+                    .setConstraints(networkConstraints())
+                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                     .build(),
             )
         }
@@ -331,6 +317,10 @@ class UsageMonitorRecoveryWorker(
             appContext.settingsDataStore,
             ParentRemoteSyncDataSourceFactory.create(appContext),
         )
+        if (!settingsRepository.monitoringDisclosureAccepted.first()) {
+            UsageMonitorForegroundService.stop(appContext)
+            return Result.success()
+        }
         val usageRepository = UsageStatsRepository(appContext)
         val safeModeEnabled = settingsRepository.safeModeEnabled.first()
         val policyEnforcementEnabled = settingsRepository.policyEnforcementEnabled.first()
@@ -357,7 +347,7 @@ class UsageMonitorRecoveryWorker(
             )
             return Result.retry()
         }
-        UsageMonitorForegroundService.scheduleExactRecoveryAlarm(
+        UsageMonitorForegroundService.scheduleRecoveryAlarm(
             context = appContext,
             reason = "watchdog follow-up",
         )
@@ -415,6 +405,12 @@ class UsageMonitorRecoveryWorker(
     }
 }
 
+private suspend fun monitoringDisclosureAccepted(context: Context): Boolean =
+    SettingsRepository(
+        context.settingsDataStore,
+        ParentRemoteSyncDataSourceFactory.create(context),
+    ).monitoringDisclosureAccepted.first()
+
 object UsagePolicyAlertRunner {
     suspend fun evaluate(context: Context, sendNotifications: Boolean) {
         val appContext = context.applicationContext
@@ -424,6 +420,24 @@ object UsagePolicyAlertRunner {
         )
         val usageRepository = UsageStatsRepository(appContext)
         val notificationHelper = UsageNotificationHelper(appContext)
+        val appLanguage = settingsRepository.appLanguage.first()
+        val hardshipLifecycle = settingsRepository.reconcileHardshipLifecycle()
+        if (sendNotifications) {
+            hardshipLifecycle.startedSchedules.forEach { schedule ->
+                notificationHelper.showPolicyAlert(
+                    title = if (appLanguage == AppLanguage.Korean) {
+                        "${schedule.scheduleName} · 고행 ${schedule.level.storageValue}단계"
+                    } else {
+                        "${schedule.scheduleName} · Hardship level ${schedule.level.storageValue}"
+                    },
+                    message = if (appLanguage == AppLanguage.Korean) {
+                        "스케줄 고행 모드가 시작되었습니다. 스케줄 종료 시 자동으로 해제됩니다."
+                    } else {
+                        "Schedule hardship has started and will unlock automatically when this schedule ends."
+                    },
+                )
+            }
+        }
         val safeModeEnabled = settingsRepository.safeModeEnabled.first()
         val policyEnforcementEnabled = settingsRepository.policyEnforcementEnabled.first()
         if (safeModeEnabled || !policyEnforcementEnabled || !usageRepository.hasUsageAccess()) {
@@ -431,21 +445,67 @@ object UsagePolicyAlertRunner {
         }
         val warningNotificationsEnabled = settingsRepository.warningNotificationsEnabled.first()
         val limitNotificationsEnabled = settingsRepository.limitNotificationsEnabled.first()
-
         val settings = settingsRepository.usagePolicySettings.first()
         val temporaryUnlockState = settingsRepository.temporaryUnlockState.first().forToday()
+        val allRestrictionsExemptPackages =
+            settingsRepository.allRestrictionsExemptPackages.first()
+        val enforcementExcludedPackages =
+            SafetyGate.neverBlockPackages +
+                SafetyGate.expandedUserAllowedPackages(allRestrictionsExemptPackages)
+        settings.activeScheduleTemplates().firstOrNull()?.let { activeSchedule ->
+            val occurrenceEndMillis = activeSchedule.currentOccurrenceEndMillis()
+            val message = if (appLanguage == AppLanguage.Korean) {
+                buildString {
+                    append("${activeSchedule.name} 스케줄이 시작되었습니다.")
+                    if (settings.allowOnlyModeEnabled) {
+                        append(" 스케줄 종료 후 허용앱만 모드가 자동으로 다시 적용됩니다.")
+                    }
+                }
+            } else {
+                buildString {
+                    append("${activeSchedule.name} schedule started.")
+                    if (settings.allowOnlyModeEnabled) {
+                        append(" Allow-only mode will resume automatically afterward.")
+                    }
+                }
+            }
+            val recorded = settingsRepository.recordPolicyAlertOnce(
+                alertKey = "scope:schedule:${activeSchedule.id}:$occurrenceEndMillis",
+                type = EventLogType.Info,
+                message = message,
+            )
+            if (
+                recorded &&
+                sendNotifications &&
+                warningNotificationsEnabled &&
+                activeSchedule.hardshipLevel == com.manisykh.screenrest.data.HardshipLevel.Off
+            ) {
+                notificationHelper.showPolicyAlert("ScreenRest", message)
+            }
+        }
         val usage = usageRepository.getTodayUsage(maxItems = 500)
         val usageByPackage = usage.associateBy { appUsage -> appUsage.packageName }
-        val totalUsedMinutes = usage.sumOf { appUsage -> appUsage.totalTimeMillis }.toMinutesCeil()
+        val totalUsedMinutes = usage
+            .filter { appUsage -> appUsage.packageName !in enforcementExcludedPackages }
+            .sumOf { appUsage -> appUsage.totalTimeMillis }
+            .toMinutesCeil()
 
-        val totalLimitMinutes = settings.todayLimitMinutes()
-        if (!temporaryUnlockState.totalUnlockedForToday && totalLimitMinutes > 0) {
+        val totalLimitMinutes = settings.todayLimitMinutesOrNull()
+        if (!temporaryUnlockState.totalUnlockedForToday && totalLimitMinutes != null) {
             logIfNeeded(
                 alertId = "total",
                 usedMinutes = totalUsedMinutes,
                 limitMinutes = totalLimitMinutes + temporaryUnlockState.totalExtraMinutes,
-                warningMessage = "Total usage reached 80%",
-                exceededMessage = "Total usage exceeded",
+                warningMessage = if (appLanguage == AppLanguage.Korean) {
+                    "일일 사용 시간이 제한의 80%에 도달했습니다"
+                } else {
+                    "Daily usage reached 80%"
+                },
+                exceededMessage = if (appLanguage == AppLanguage.Korean) {
+                    "일일 사용 시간이 제한을 초과했습니다"
+                } else {
+                    "Daily usage exceeded"
+                },
                 settingsRepository = settingsRepository,
                 notificationHelper = notificationHelper,
                 sendNotifications = sendNotifications,
@@ -455,18 +515,23 @@ object UsagePolicyAlertRunner {
         }
 
         settings.normalizedAppGroups().forEachIndexed { index, group ->
-            if (group.budgetMinutes <= 0) {
+            if (!group.appliesOn(currentPolicyDayOfWeek())) {
                 return@forEachIndexed
             }
-            val groupUsedMinutes = group.packageNames
+            val groupLimitMinutes = group.limitMinutesOrNull()
+            if (groupLimitMinutes == null) {
+                return@forEachIndexed
+            }
+            val enforcedGroupPackages = group.packageNames - enforcementExcludedPackages
+            val groupUsedMinutes = enforcedGroupPackages
                 .sumOf { packageName -> usageByPackage[packageName]?.totalTimeMillis ?: 0L }
                 .toMinutesCeil()
-            val groupExtraMinutes = group.packageNames
+            val groupExtraMinutes = enforcedGroupPackages
                 .sumOf { packageName -> temporaryUnlockState.packageAllowances[packageName]?.extraMinutes ?: 0 }
             logIfNeeded(
                 alertId = "group:$index:${group.name.hashCode()}",
                 usedMinutes = groupUsedMinutes,
-                limitMinutes = group.budgetMinutes + groupExtraMinutes,
+                limitMinutes = groupLimitMinutes + groupExtraMinutes,
                 warningMessage = "${group.name} group reached 80%",
                 exceededMessage = "${group.name} group exceeded",
                 settingsRepository = settingsRepository,
@@ -477,8 +542,8 @@ object UsagePolicyAlertRunner {
             )
         }
 
-        settings.appLimitMap().forEach { (packageName, limitMinutes) ->
-            if (limitMinutes <= 0) {
+        settings.activeAppLimitMap().forEach { (packageName, limitMinutes) ->
+            if (limitMinutes < 0 || packageName in enforcementExcludedPackages) {
                 return@forEach
             }
             val appAllowance = temporaryUnlockState.packageAllowances[packageName]
@@ -515,7 +580,7 @@ object UsagePolicyAlertRunner {
         warningNotificationsEnabled: Boolean,
         limitNotificationsEnabled: Boolean,
     ) {
-        if (limitMinutes <= 0) {
+        if (limitMinutes < 0) {
             return
         }
 

@@ -56,6 +56,28 @@ class UsageContinuityStore(context: Context) {
         cachedUsageMillisByPackage.toMap()
     }
 
+    fun replaceRawUsage(
+        dayStartMillis: Long,
+        rawUsageMillisByPackage: Map<String, Long>,
+        maxAllowedUsageMillis: Long = Long.MAX_VALUE,
+    ): Map<String, Long> = synchronized(sharedLock) {
+        val dayKey = dayKey(dayStartMillis)
+        ensureLoaded(dayKey)
+        val replacement = rawUsageMillisByPackage
+            .filter { (packageName, usageMillis) ->
+                packageName.isNotBlank() &&
+                    usageMillis > 0L &&
+                    usageMillis <= maxAllowedUsageMillis
+            }
+            .toMutableMap()
+        if (replacement != cachedUsageMillisByPackage) {
+            cachedUsageMillisByPackage = replacement
+            dirty = true
+            writeIfDue(force = false)
+        }
+        cachedUsageMillisByPackage.toMap()
+    }
+
     fun rememberUsage(
         dayStartMillis: Long,
         packageName: String,

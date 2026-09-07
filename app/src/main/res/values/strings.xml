@@ -1,4 +1,4 @@
 <resources>
+    <string name="monitoring_notification_title">ScreenRest · Screen-time monitoring active</string>
     <string name="app_name">ScreenRest</string>
-    <string name="notification_listener_service_label">ScreenRest Notification Access</string>
 </resources>

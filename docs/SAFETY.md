@@ -20,25 +20,27 @@ When Safe Mode is enabled:
 Safe Mode must be enabled by default during development and must be visible on
 the main screen.
 
-## Emergency Unlock
+## Safe Recovery
 
-Emergency Unlock must work without an internet connection.
+Safe Recovery must work without an internet connection.
 
-Accepted mechanisms:
+Authentication:
 
-- Developer PIN
-- Emergency password
-- Hidden local menu
+- A single 4-8 digit Admin PIN
+- No separate Emergency PIN
 
 The goal is immediate recovery of app and device control.
 
-Initial development PIN:
+Release behavior:
 
-- `0000`
-
-This default PIN exists only so early builds always have a known local recovery
-path. Before real device enforcement is added, this must be changed through a
-parent/developer settings flow.
+- There is no default PIN.
+- The first-run security gate requires one 4-8 digit Admin PIN.
+- The Admin PIN is stored as a salted PBKDF2-HMAC-SHA256 credential, never as plaintext.
+- Five consecutive failures lock Admin PIN verification for 30 seconds.
+- Legacy plaintext PINs are migrated to the hashed format after successful use.
+- An active hardship level 3 cannot be normally disabled through Safe Recovery.
+  Its app-scoped Emergency Pass remains the only local exception and requires
+  Admin PIN confirmation plus an available rolling seven-day entitlement.
 
 ## Kill Switch
 
@@ -51,7 +53,8 @@ The Kill Switch must immediately:
 
 Implementation rule:
 
-- Kill Switch and Emergency Unlock must use the same recovery path.
+- Kill Switch and Safe Recovery must use the same recovery path and require the
+  Admin PIN.
 - That path must set Safe Mode to `true`.
 - That path must set policy enforcement to `false`.
 
@@ -156,7 +159,8 @@ It must:
 
 - Stop and remove blocking overlays when Safe Mode or Kill Switch is activated.
 - Respect the required whitelist and user-selected always-allowed apps.
-- Keep Emergency Unlock and Kill Switch available on block surfaces.
+- Keep Safe Recovery and Kill Switch available on non-level-3 block surfaces.
+- On level-3 block surfaces, replace normal recovery with Emergency Pass.
 
 ## Strong Blocking Permissions
 
@@ -187,7 +191,7 @@ window, or vendor-customized foreground surface.
 Strict commercial-grade enforcement for a managed child device should be
 designed as an optional Device Owner / managed-device mode. That mode can use
 Android management APIs in addition to the current safety gate. It must still
-keep Emergency Unlock, Kill Switch, required whitelist apps, and Safe Mode
+keep Safe Recovery, Kill Switch, required whitelist apps, and Safe Mode
 recovery paths available before stronger enforcement is enabled.
 - Block required whitelist or user always-allowed packages.
 Kill Switch remains the highest-priority recovery path because it enables Safe
@@ -207,11 +211,13 @@ The blocked-screen Activity remains `exported=false` and may be opened from:
 
 In real blocking mode:
 
-- Emergency Unlock and Kill Switch must remain visible.
+- Safe Recovery and Kill Switch must remain available except where an active
+  hardship level 3 intentionally requires Emergency Pass.
 - Parent/Admin PIN time override may grant temporary access for today.
 - A full-screen application overlay may cover games or immersive apps after
   SafetyGate and policy checks pass.
-- The blocking overlay must expose Emergency Unlock and Kill Switch.
+- The blocking overlay must expose Safe Recovery or Emergency Pass according to
+  the active hardship level.
 - The service may send Home before opening the blocking screen so full-screen
   apps do not remain usable behind the block.
 - Back must not return the user directly to the blocked app.

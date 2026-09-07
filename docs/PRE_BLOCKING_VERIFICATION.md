@@ -5,7 +5,7 @@
 목표는 명확합니다.
 
 - 사용자가 기기 제어권을 잃지 않는다.
-- Safe Mode, Kill Switch, Emergency Unlock이 항상 우선한다.
+- Safe Mode, Kill Switch, 관리 PIN 안전 복구가 우선하되 활성 고행 3단계는 Emergency Pass 규칙을 유지한다.
 - 정책 저장/계산/감지는 정상 동작한다.
 - 차단은 Usage Access, foreground monitor, overlay, notification access 경로로 동작한다.
 
@@ -96,11 +96,11 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 - 이벤트 로그에 Kill Switch 기록이 남음
 - 앱이나 기기가 잠기지 않음
 
-## 5. Emergency Unlock
+## 5. 안전 복구
 
 절차:
 
-1. 안전 탭의 긴급 해제 PIN 입력
+1. 안전 탭의 안전 복구에서 관리 PIN 입력
 2. 잘못된 PIN 입력
 3. 올바른 PIN 입력
 
@@ -117,15 +117,15 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 
 1. 설정 탭으로 이동
 2. 관리 PIN 변경
-3. 긴급 PIN 변경
-4. 잘못된 현재 PIN으로 변경 시도
-5. 새 PIN으로 정책 저장 또는 긴급 해제 검증
+3. 잘못된 현재 PIN으로 변경 시도
+4. 새 PIN으로 정책 저장 또는 안전 복구 검증
 
 기대 결과:
 
 - 현재 PIN이 틀리면 변경 실패
 - 새 PIN은 4자리 이상일 때만 유효
-- 관리 PIN과 긴급 PIN이 각각 독립적으로 동작
+- 앱 전체에서 단일 관리 PIN이 일관되게 동작
+- 고행 3단계는 관리 PIN만으로 일반 해제되지 않음
 - 이벤트 또는 상태 메시지가 정상 표시됨
 
 ## 7. UsageStats 권한
@@ -376,7 +376,7 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 3. 버튼 클릭
 4. 미리보기 화면에서 닫기
 5. 다시 열어서 Kill Switch 실행
-6. 다시 열어서 긴급 PIN 입력
+6. 다시 열어서 관리 PIN으로 안전 복구
 
 기대 결과:
 
@@ -384,7 +384,7 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 - 미리보기 배지가 표시됨
 - 닫기 또는 뒤로 가기가 가능
 - Kill Switch 실행 시 Safe Mode ON으로 복구
-- 긴급 PIN 성공 시 화면이 닫히고 Safe Mode ON
+- 관리 PIN 안전 복구 성공 시 화면이 닫히고 Safe Mode ON
 - 실제 앱 실행 중 자동으로 이 화면이 뜨지는 않음
 
 ## 22. 실제 차단 미연결 확인
@@ -481,7 +481,8 @@ set "JAVA_HOME=C:\Program Files\Android\Android Studio2\jbr" && set "PATH=%JAVA_
 
 - Safe Mode ON/OFF 정상
 - Kill Switch 정상
-- Emergency Unlock 정상
+- 관리 PIN 안전 복구 정상
+- Emergency Pass 현재 앱 한정·사용 후 7일 제한 정상
 - UsageStats 집계 정상
 - 시스템/키보드/런처 앱 필터 정상
 - 요일별 제한 저장 정상

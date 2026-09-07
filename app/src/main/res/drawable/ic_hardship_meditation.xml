@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+
+    <!-- Original seated-meditation silhouette, simplified for small UI sizes. -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M50,6 C40,6 34,13 34,23 L34,31 C34,42 40,49 50,49 C60,49 66,42 66,31 L66,23 C66,13 60,6 50,6 Z M35,25 L65,25"
+        android:strokeColor="#FF000000"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="7" />
+
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M18,72 L18,54 C18,42 27,35 39,35 L61,35 C73,35 82,42 82,54 L82,72 M29,51 L29,72 M71,53 L71,72 M62,36 C60,49 52,55 37,59 L37,72"
+        android:strokeColor="#FF000000"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="7" />
+
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M14,72 L86,72 C91,72 94,76 94,81 L94,83 L6,83 L6,81 C6,76 9,72 14,72 Z M6,83 C12,96 25,97 32,87 C37,96 44,97 50,87 C56,97 63,96 68,87 C75,97 88,96 94,83"
+        android:strokeColor="#FF000000"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="7" />
+</vector>

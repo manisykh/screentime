@@ -42,6 +42,23 @@ class UsageHistoryStoreTest {
     }
 
     @Test
+    fun authoritativeReplacement_canCorrectInflatedDay() {
+        val replaced = replaceUsageHistoryDays(
+            existing = mapOf(
+                1_000L to mapOf("app.one" to 10_000L),
+                2_000L to mapOf("app.two" to 4_000L),
+            ),
+            replacements = mapOf(
+                1_000L to mapOf("app.one" to 6_000L),
+            ),
+            maxDays = 31,
+        )
+
+        assertEquals(6_000L, replaced.getValue(1_000L).getValue("app.one"))
+        assertEquals(4_000L, replaced.getValue(2_000L).getValue("app.two"))
+    }
+
+    @Test
     fun codec_roundTripsUsageAndEmptyRecordedDays() {
         val original = mapOf(
             1_000L to mapOf("app.one" to 10_000L),

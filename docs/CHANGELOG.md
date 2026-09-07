@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-09-01
+
+- Unified local authentication around one Admin PIN and retired the separate
+  Emergency PIN without resetting existing Emergency Pass cooldowns or grants.
+- Renamed Emergency Unlock to Safe Recovery and kept it unavailable as a normal
+  bypass while hardship level 3 is active.
+- Required Admin PIN confirmation before consuming the app-scoped Emergency
+  Pass, added an impact confirmation step, and exposed precise next-available
+  timing for its rolling seven-day cooldown.
+- Updated both blocked-screen implementations and release/safety documentation
+  so PIN roles and level-3 exception wording remain consistent.
+
 ## 2026-07-18
 
 - Added a private 31-day per-app usage history so the 30-day statistics view

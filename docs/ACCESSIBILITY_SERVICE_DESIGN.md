@@ -45,7 +45,7 @@ Blocking may only be considered when:
 - Policy enforcement is explicitly enabled.
 - The target app is not whitelisted.
 - Usage access data confirms the target app exceeded its limit.
-- Emergency Unlock and Kill Switch remain available.
+- Safe Recovery and Kill Switch remain available outside active hardship level 3.
 
 ## Forbidden Behavior
 
@@ -55,7 +55,7 @@ The AccessibilityService must not:
 - Block package installers.
 - Block Screen Time Manager.
 - Hide or disable Kill Switch.
-- Hide or disable Emergency Unlock.
+- Hide or disable Safe Recovery.
 - Run when Safe Mode is ON.
 - Kill another app process.
 - Disable system navigation.
@@ -76,7 +76,7 @@ The current service:
 - Evaluates daily, app, and group limits.
 - Launches `BlockedActivity` when a policy is exceeded.
 - Updates the latest foreground detection status shown in the Safety tab.
-- Keeps Emergency Unlock and Kill Switch available from the blocking screen.
+- Keeps Safe Recovery and Kill Switch available from non-level-3 blocking screens.
 
 The service never attempts to terminate another app. Blocking is implemented by
 showing a full-screen `TYPE_ACCESSIBILITY_OVERLAY` blocking layer from the
@@ -88,9 +88,9 @@ Home with both the accessibility Home action and a launcher Home intent, opening
 `BlockedActivity`, and retrying the blocked-screen launch once after a short
 delay. Leaving the blocking screen without an override also sends the user Home.
 
-The overlay includes Emergency Unlock, a Kill Switch, and a button that opens
+The overlay includes Safe Recovery, a Kill Switch, and a button that opens
 the full blocked-screen controls. It is removed automatically when Safe Mode is
-enabled, Policy Enforcement is disabled, Emergency Unlock succeeds, or Kill
+enabled, Policy Enforcement is disabled, Safe Recovery succeeds, or Kill
 Switch is activated.
 
 While a target remains blocked, a short-interval overlay guard checks whether
@@ -150,5 +150,5 @@ Before coding the service:
 - Verify Safe Mode ON prevents every blocking decision.
 - Verify every whitelist package returns before policy checks.
 - Verify Kill Switch forces Safe Mode ON.
-- Verify Emergency Unlock works offline.
+- Verify Admin-PIN Safe Recovery works offline and cannot normally end active hardship level 3.
 - Verify Auto Recovery restores Safe Mode after abnormal startup.

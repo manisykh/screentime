@@ -43,7 +43,7 @@ DataStore / Room / Android system services
 ## Current Modules
 
 - `data/SettingsDataStore.kt`: DataStore instance.
-- `data/SettingsRepository.kt`: Safe Mode, Kill Switch, Emergency Unlock, and
+- `data/SettingsRepository.kt`: Safe Mode, Kill Switch, Safe Recovery, and
   Auto Recovery persistence. It also stores policy values, temporary parent
   allowances, local parent/device pairing state, and the remote command inbox.
 - `ui/safety/SafeModeViewModel.kt`: UI state and safety actions.
@@ -81,9 +81,10 @@ Current policy settings are stored in DataStore:
 The current parent-management implementation is the app-side boundary for a
 future backend:
 
-- Admin PIN controls policy changes and local parent pairing.
-- Emergency PIN is not a parent approval mechanism; it is only for offline Safe
-  Mode recovery.
+- Admin PIN is the single local credential for policy changes, pairing, allowed
+  overrides, Safe Recovery, and Emergency Pass confirmation.
+- Emergency Pass is not a second PIN. It is an app-scoped level-3 exception
+  shared across all level-3 policies with a rolling seven-day cooldown.
 - Remote commands are persisted as an inbox in DataStore and can apply:
   app extra time, app unlock-for-today, daily extra time, and daily
   unlock-for-today.

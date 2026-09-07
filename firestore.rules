@@ -1,0 +1,318 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function childPath(childDeviceId) {
+      return /databases/$(database)/documents/screenrest_children/$(childDeviceId);
+    }
+
+    function childDoc(childDeviceId) {
+      return get(childPath(childDeviceId));
+    }
+
+    function isChildOwner(childDeviceId) {
+      return signedIn() && childDoc(childDeviceId).data.childUid == request.auth.uid;
+    }
+
+    function isLinkedParent(childDeviceId) {
+      return signedIn() &&
+        childDoc(childDeviceId).data.status != "unlinked" &&
+        request.auth.uid in childDoc(childDeviceId).data.parentUids;
+    }
+
+    function activePairingCode(childDeviceId) {
+      return childDoc(childDeviceId).data.activePairingCode;
+    }
+
+    function canReadForActivePairing(childDeviceId) {
+      let pairing = get(
+        /databases/$(database)/documents/screenrest_pairing_codes/$(activePairingCode(childDeviceId))
+      );
+      return signedIn() &&
+        pairing.data.childDeviceId == childDeviceId &&
+        pairing.data.status == "active" &&
+        pairing.data.used == false &&
+        pairing.data.expiresAt > request.time;
+    }
+
+    function validRelationLists(data) {
+      return data.get("parentUids", []) is list &&
+        data.get("linkedParents", []) is list &&
+        data.get("parentUids", []).size() <= 10 &&
+        data.get("linkedParents", []).size() <= 10;
+    }
+
+    function isAtomicPairingParent(childDeviceId) {
+      let pairingAfter = getAfter(
+        /databases/$(database)/documents/screenrest_pairing_codes/$(activePairingCode(childDeviceId))
+      );
+      return signedIn() &&
+        pairingAfter.data.childDeviceId == childDeviceId &&
+        pairingAfter.data.status == "used" &&
+        pairingAfter.data.used == true &&
+        pairingAfter.data.parentUid == request.auth.uid &&
+        request.auth.uid in request.resource.data.parentUids &&
+        request.resource.data.parentUids.hasAll(resource.data.parentUids) &&
+        request.resource.data.parentUids.size() == resource.data.parentUids.size() + 1 &&
+        validRelationLists(request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "parentUids", "linkedParents", "status", "linkedAtMillis", "updatedAtMillis"
+        ]);
+    }
+
+    function isParentProfileUpdate() {
+      return request.resource.data.parentUids == resource.data.parentUids &&
+        validRelationLists(request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "linkedParents", "updatedAtMillis"
+        ]);
+    }
+
+    function isParentSelfUnlink() {
+      return request.resource.data.parentUids ==
+          resource.data.parentUids.removeAll([request.auth.uid]) &&
+        request.resource.data.lastUnlinkedParentUid == request.auth.uid &&
+        request.resource.data.remainingParentCount == request.resource.data.parentUids.size() &&
+        request.resource.data.status ==
+          (request.resource.data.parentUids.size() == 0 ? "unlinked" : "active") &&
+        validRelationLists(request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "parentUids", "linkedParents", "status", "lastUnlinkedParentUid",
+          "remainingParentCount", "unlinkedAtMillis", "updatedAtMillis"
+        ]);
+    }
+
+    function isActivePairingCode() {
+      return resource.data.status == "active" &&
+        resource.data.used == false &&
+        resource.data.expiresAt > request.time;
+    }
+
+    function validPairingCreate(pairingCode) {
+      return request.resource.data.keys().hasOnly([
+          "pairingCode", "childDeviceId", "childDeviceName", "childUid",
+          "createdAtMillis", "expiresAtMillis", "expiresAt", "status", "used",
+          "updatedAtMillis"
+        ]) &&
+        request.resource.data.pairingCode == pairingCode &&
+        request.resource.data.childDeviceId is string &&
+        request.resource.data.childDeviceId.size() > 0 &&
+        request.resource.data.childDeviceName is string &&
+        request.resource.data.childDeviceName.size() <= 100 &&
+        request.resource.data.childUid == request.auth.uid &&
+        request.resource.data.createdAtMillis is int &&
+        request.resource.data.expiresAtMillis is int &&
+        request.resource.data.expiresAt is timestamp &&
+        request.resource.data.expiresAt > request.time &&
+        request.resource.data.expiresAt <= request.time + duration.value(11, 'm') &&
+        request.resource.data.status == "active" &&
+        request.resource.data.used == false;
+    }
+
+    function validPairingClaim() {
+      return resource.data.status == "active" &&
+        resource.data.used == false &&
+        resource.data.expiresAt > request.time &&
+        request.resource.data.used == true &&
+        request.resource.data.status == "used" &&
+        request.resource.data.parentUid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "used", "status", "parentUid", "usedAtMillis", "usedAt", "updatedAtMillis"
+        ]);
+    }
+
+    function validPairingExpire() {
+      return resource.data.status == "active" &&
+        resource.data.used == false &&
+        resource.data.expiresAt <= request.time &&
+        request.resource.data.status == "expired" &&
+        request.resource.data.used == false &&
+        request.resource.data.parentUid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "status", "parentUid", "expiredAt", "updatedAtMillis"
+        ]);
+    }
+
+    function validChildCreate(childDeviceId) {
+      return request.resource.data.keys().hasOnly([
+          "childDeviceId", "childDeviceName", "childUid", "activePairingCode",
+          "status", "updatedAtMillis", "parentUids", "linkedParents"
+        ]) &&
+        request.resource.data.childDeviceId == childDeviceId &&
+        request.resource.data.childUid == request.auth.uid &&
+        request.resource.data.childDeviceName is string &&
+        request.resource.data.childDeviceName.size() <= 100 &&
+        request.resource.data.status in ["active", "unlinked"] &&
+        validRelationLists(request.resource.data);
+    }
+
+    function validChildOwnerUpdate(childDeviceId) {
+      return request.resource.data.childDeviceId == childDeviceId &&
+        request.resource.data.childDeviceId == resource.data.childDeviceId &&
+        request.resource.data.childUid == resource.data.childUid &&
+        request.resource.data.childUid == request.auth.uid &&
+        request.resource.data.status in ["active", "unlinked"] &&
+        validRelationLists(request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "childDeviceName", "activePairingCode", "status", "updatedAtMillis",
+          "parentUids", "linkedParents", "lastUnlinkedParentUid",
+          "remainingParentCount", "unlinkedAtMillis"
+        ]);
+    }
+
+    function isOlderThanRemoteRetention(timestampMillis) {
+      return timestampMillis is int &&
+        timestampMillis <= request.time.toMillis() - 604800000;
+    }
+
+    function validUnlockRequestCreate(childDeviceId, requestId) {
+      return request.resource.data.keys().hasOnly([
+          "id", "childDeviceId", "childDeviceName", "createdAtMillis", "expiresAtMillis",
+          "blockReason", "targetPackageName", "targetAppName", "targetGroupName",
+          "scheduleName", "usedMillis", "limitMillis", "alreadyGrantedExtraMinutes",
+          "unlockedForToday", "requestedMinutes", "childMessage", "status", "childUid"
+        ]) &&
+        request.resource.data.id == requestId &&
+        request.resource.data.childDeviceId == childDeviceId &&
+        request.resource.data.childUid == request.auth.uid &&
+        request.resource.data.status == "Pending" &&
+        request.resource.data.blockReason in [
+          "DailyLimit", "AppGroupLimit", "AppLimit", "ScheduleBlock", "AllowOnlyMode"
+        ] &&
+        request.resource.data.createdAtMillis is int &&
+        request.resource.data.expiresAtMillis is int &&
+        request.resource.data.expiresAtMillis > request.resource.data.createdAtMillis &&
+        request.resource.data.requestedMinutes is int &&
+        request.resource.data.requestedMinutes >= 0 &&
+        request.resource.data.requestedMinutes <= 720 &&
+        request.resource.data.childMessage is string &&
+        request.resource.data.childMessage.size() <= 500;
+    }
+
+    function validChildPendingRequestUpdate(childDeviceId, requestId) {
+      return resource.data.childUid == request.auth.uid &&
+        request.resource.data.childUid == resource.data.childUid &&
+        request.resource.data.id == requestId &&
+        request.resource.data.childDeviceId == childDeviceId &&
+        resource.data.status == "Pending" &&
+        request.resource.data.status == "Pending" &&
+        validUnlockRequestCreate(childDeviceId, requestId);
+    }
+
+    function validParentDecisionUpdate() {
+      return resource.data.status == "Pending" &&
+        request.resource.data.status in ["Approved", "Rejected"] &&
+        request.resource.data.parentUid == request.auth.uid &&
+        request.resource.data.decisionApproved is bool &&
+        (
+          (request.resource.data.status == "Approved" &&
+            request.resource.data.decisionApproved == true) ||
+          (request.resource.data.status == "Rejected" &&
+            request.resource.data.decisionApproved == false)
+        ) &&
+        request.resource.data.decisionExtraMinutes is int &&
+        request.resource.data.decisionExtraMinutes >= 0 &&
+        request.resource.data.decisionExtraMinutes <= 720 &&
+        request.resource.data.decisionUnlockForToday is bool &&
+        request.resource.data.decidedAtMillis is int &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "status", "decisionApproved", "decisionExtraMinutes",
+          "decisionUnlockForToday", "decidedAtMillis", "parentUid"
+        ]);
+    }
+
+    function validRemoteCommandCreate(childDeviceId, commandId) {
+      return request.resource.data.keys().hasOnly([
+          "id", "timestampMillis", "type", "targetPackageName", "targetAppName",
+          "minutes", "status", "message", "parentUid"
+        ]) &&
+        request.resource.data.id == commandId &&
+        request.resource.data.parentUid == request.auth.uid &&
+        request.resource.data.timestampMillis is int &&
+        request.resource.data.type in [
+          "AddAppTime", "UnlockAppToday", "AddTotalTime", "UnlockTotalToday"
+        ] &&
+        request.resource.data.minutes is int &&
+        request.resource.data.minutes >= 0 &&
+        request.resource.data.minutes <= 720 &&
+        request.resource.data.status in ["Pending", "Applied"] &&
+        request.resource.data.message is string &&
+        request.resource.data.message.size() <= 500;
+    }
+
+    function validPushTokenData(childDeviceId, tokenId) {
+      return request.resource.data.keys().hasOnly([
+          "uid", "token", "role", "platform", "updatedAtMillis"
+        ]) &&
+        tokenId.size() == 64 &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.token is string &&
+        request.resource.data.token.size() >= 20 &&
+        request.resource.data.token.size() <= 4096 &&
+        request.resource.data.platform == "android" &&
+        request.resource.data.updatedAtMillis is int &&
+        (
+          (request.resource.data.role == "child" && isChildOwner(childDeviceId)) ||
+          (request.resource.data.role == "parent" && isLinkedParent(childDeviceId))
+        );
+    }
+
+    match /screenrest_pairing_codes/{pairingCode} {
+      allow create: if signedIn() && validPairingCreate(pairingCode);
+      allow get: if signedIn() &&
+        (isActivePairingCode() ||
+          resource.data.parentUid == request.auth.uid ||
+          resource.data.childUid == request.auth.uid);
+      allow list: if false;
+      allow update: if signedIn() &&
+        ((resource.data.childUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "childDeviceName", "updatedAtMillis"
+          ])) || validPairingClaim() || validPairingExpire());
+      allow delete: if signedIn() && resource.data.childUid == request.auth.uid;
+    }
+
+    match /screenrest_children/{childDeviceId} {
+      allow create: if signedIn() && validChildCreate(childDeviceId);
+      allow read: if isChildOwner(childDeviceId) ||
+        isLinkedParent(childDeviceId) || canReadForActivePairing(childDeviceId);
+      allow update: if
+        (isChildOwner(childDeviceId) && validChildOwnerUpdate(childDeviceId)) ||
+        (isLinkedParent(childDeviceId) && (isParentProfileUpdate() || isParentSelfUnlink())) ||
+        isAtomicPairingParent(childDeviceId);
+      allow delete: if false;
+
+      match /unlock_requests/{requestId} {
+        allow create: if isChildOwner(childDeviceId) &&
+          validUnlockRequestCreate(childDeviceId, requestId);
+        allow read: if isChildOwner(childDeviceId) || isLinkedParent(childDeviceId);
+        allow update: if
+          (isChildOwner(childDeviceId) && validChildPendingRequestUpdate(childDeviceId, requestId)) ||
+          (isLinkedParent(childDeviceId) && validParentDecisionUpdate());
+        allow delete: if isChildOwner(childDeviceId) &&
+          isOlderThanRemoteRetention(resource.data.get("createdAtMillis", 0));
+      }
+
+      match /remote_commands/{commandId} {
+        allow create: if isLinkedParent(childDeviceId) &&
+          validRemoteCommandCreate(childDeviceId, commandId);
+        allow read: if isChildOwner(childDeviceId) || isLinkedParent(childDeviceId);
+        allow update: if false;
+        allow delete: if isChildOwner(childDeviceId) &&
+          isOlderThanRemoteRetention(resource.data.get("timestampMillis", 0));
+      }
+
+      match /push_tokens/{tokenId} {
+        allow read: if false;
+        allow create: if signedIn() && validPushTokenData(childDeviceId, tokenId);
+        allow update: if signedIn() &&
+          resource.data.uid == request.auth.uid && validPushTokenData(childDeviceId, tokenId);
+        allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+      }
+    }
+  }
+}

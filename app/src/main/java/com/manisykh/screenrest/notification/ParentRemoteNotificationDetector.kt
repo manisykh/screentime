@@ -14,43 +14,65 @@ internal enum class ParentRemoteNotificationType {
 internal data class ParentRemoteNotification(
     val type: ParentRemoteNotificationType,
     val request: RemoteUnlockRequest,
-)
+) {
+    val eventToken: String
+        get() = request.eventToken(type)
+}
 
 internal fun detectParentRemoteNotifications(
-    before: ParentManagementState,
-    after: ParentManagementState,
+    state: ParentManagementState,
+    handledEventTokens: Set<String>,
     nowMillis: Long,
-    freshnessWindowMillis: Long = 15L * 60L * 1_000L,
 ): List<ParentRemoteNotification> {
-    val beforeById = before.remoteUnlockRequests.associateBy { request -> request.id }
-    return after.remoteUnlockRequests.mapNotNull { request ->
-        if (
-            request.id.isBlank() ||
-            request.createdAtMillis < nowMillis - freshnessWindowMillis ||
-            request.expiresAtMillis < nowMillis - REQUEST_EXPIRY_NOTIFICATION_GRACE_MILLIS
-        ) {
+    return state.remoteUnlockRequests.mapNotNull { request ->
+        if (request.id.isBlank()) {
             return@mapNotNull null
         }
-        val previousStatus = beforeById[request.id]?.status
         val type = when {
-            after.deviceRole == ParentDeviceRole.Parent &&
+            state.deviceRole == ParentDeviceRole.Parent &&
                 request.status == RemoteUnlockRequestStatus.Pending &&
-                request.expiresAtMillis >= nowMillis &&
-                previousStatus == null -> ParentRemoteNotificationType.NewPendingRequest
+                request.expiresAtMillis >= nowMillis -> ParentRemoteNotificationType.NewPendingRequest
 
-            after.deviceRole == ParentDeviceRole.Child &&
+            state.deviceRole == ParentDeviceRole.Child &&
                 request.status == RemoteUnlockRequestStatus.Approved &&
-                previousStatus != RemoteUnlockRequestStatus.Approved ->
+                request.expiresAtMillis >= nowMillis - REQUEST_EXPIRY_NOTIFICATION_GRACE_MILLIS ->
                 ParentRemoteNotificationType.RequestApproved
 
-            after.deviceRole == ParentDeviceRole.Child &&
+            state.deviceRole == ParentDeviceRole.Child &&
                 request.status == RemoteUnlockRequestStatus.Rejected &&
-                previousStatus != RemoteUnlockRequestStatus.Rejected ->
+                request.expiresAtMillis >= nowMillis - REQUEST_EXPIRY_NOTIFICATION_GRACE_MILLIS ->
                 ParentRemoteNotificationType.RequestRejected
 
             else -> null
         } ?: return@mapNotNull null
         ParentRemoteNotification(type = type, request = request)
+            .takeUnless { notification -> notification.eventToken in handledEventTokens }
+    }
+}
+
+internal fun detectParentRemoteNotifications(
+    before: ParentManagementState,
+    after: ParentManagementState,
+    nowMillis: Long,
+): List<ParentRemoteNotification> {
+    val handledEventTokens = before.remoteUnlockRequests.mapNotNull { request ->
+        val type = when (request.status) {
+            RemoteUnlockRequestStatus.Pending -> ParentRemoteNotificationType.NewPendingRequest
+            RemoteUnlockRequestStatus.Approved -> ParentRemoteNotificationType.RequestApproved
+            RemoteUnlockRequestStatus.Rejected -> ParentRemoteNotificationType.RequestRejected
+            RemoteUnlockRequestStatus.Expired,
+            RemoteUnlockRequestStatus.Failed -> null
+        } ?: return@mapNotNull null
+        request.eventToken(type)
+    }.toSet()
+    return detectParentRemoteNotifications(after, handledEventTokens, nowMillis)
+}
+
+private fun RemoteUnlockRequest.eventToken(type: ParentRemoteNotificationType): String {
+    return if (type == ParentRemoteNotificationType.NewPendingRequest) {
+        "$id:${type.name}:$createdAtMillis"
+    } else {
+        "$id:${type.name}"
     }
 }
 

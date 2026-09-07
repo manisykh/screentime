@@ -1,5 +1,7 @@
 package com.manisykh.screenrest.usage
 
+import com.manisykh.screenrest.safety.SafetyGate
+
 object AppVisibility {
     val hiddenPackages = setOf(
         "android",
@@ -44,12 +46,14 @@ object AppVisibility {
     fun isHiddenPackage(packageName: String): Boolean {
         val normalizedPackageName = packageName.lowercase()
         return packageName in hiddenPackages ||
+            SafetyGate.isSystemInteractionPackage(packageName) ||
             hiddenPackageFragments.any { fragment -> fragment in normalizedPackageName }
     }
 
     fun clearsForegroundSession(packageName: String): Boolean {
         val normalizedPackageName = packageName.lowercase()
-        return normalizedPackageName == "android" ||
+        return SafetyGate.isSystemInteractionPackage(packageName) ||
+            normalizedPackageName == "android" ||
             normalizedPackageName == "com.android.settings" ||
             normalizedPackageName == "com.android.systemui" ||
             normalizedPackageName == "com.google.android.apps.nexuslauncher" ||

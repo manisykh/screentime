@@ -1,4 +1,4 @@
 <resources>
+    <string name="monitoring_notification_title">폰 쉼 · 사용 시간 관리 중</string>
     <string name="app_name">폰쉼</string>
-    <string name="notification_listener_service_label">폰쉼 알림 접근</string>
 </resources>

@@ -4,12 +4,16 @@ import android.content.Context
 import com.google.android.gms.tasks.Task
 import com.google.firebase.Timestamp
 import com.google.firebase.FirebaseApp
+import com.google.firebase.FirebaseNetworkException
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseAuthException
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.MetadataChanges
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.SetOptions
+import com.google.firebase.functions.FirebaseFunctions
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -18,6 +22,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.Date
+import java.io.IOException
+import java.security.MessageDigest
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -36,6 +42,7 @@ object ParentRemoteSyncDataSourceFactory {
             FirebaseParentRemoteSyncDataSource(
                 auth = FirebaseAuth.getInstance(app),
                 firestore = FirebaseFirestore.getInstance(app),
+                functions = FirebaseFunctions.getInstance(app, "asia-northeast3"),
             )
         } catch (_: Throwable) {
             LocalOnlyParentRemoteSyncDataSource
@@ -46,6 +53,7 @@ object ParentRemoteSyncDataSourceFactory {
 class FirebaseParentRemoteSyncDataSource(
     private val auth: FirebaseAuth,
     private val firestore: FirebaseFirestore,
+    private val functions: FirebaseFunctions,
 ) : ParentRemoteSyncDataSource {
     private val mutableSyncState = MutableStateFlow(
         ParentRemoteSyncState(
@@ -56,7 +64,10 @@ class FirebaseParentRemoteSyncDataSource(
 
     override val syncState: StateFlow<ParentRemoteSyncState> = mutableSyncState
 
-    override fun observeChanges(childDeviceIds: Set<String>): Flow<ParentRemoteChange> = callbackFlow {
+    override fun observeChanges(
+        childDeviceIds: Set<String>,
+        deviceRole: ParentDeviceRole,
+    ): Flow<ParentRemoteChange> = callbackFlow {
         val cleanChildIds = childDeviceIds
             .map { childDeviceId -> childDeviceId.trim() }
             .filter { childDeviceId -> childDeviceId.isNotBlank() }
@@ -94,6 +105,8 @@ class FirebaseParentRemoteSyncDataSource(
                     }
                 }
             val requestRegistration = requestsCollection(childDeviceId)
+                .orderBy("createdAtMillis", Query.Direction.DESCENDING)
+                .limit(REMOTE_LISTENER_DOCUMENT_LIMIT)
                 .addSnapshotListener(MetadataChanges.INCLUDE) { snapshot, error ->
                     if (error != null) {
                         updateFailed(error)
@@ -110,24 +123,30 @@ class FirebaseParentRemoteSyncDataSource(
                         )
                     }
                 }
-            val commandRegistration = commandsCollection(childDeviceId)
-                .addSnapshotListener(MetadataChanges.INCLUDE) { snapshot, error ->
-                    if (error != null) {
-                        updateFailed(error)
-                        close(error)
-                    } else if (snapshot != null) {
-                        updateConnected()
-                        trySend(
-                            ParentRemoteChange(
-                                childDeviceId = childDeviceId,
-                                type = ParentRemoteChangeType.RemoteCommands,
-                                fromCache = snapshot.metadata.isFromCache,
-                                hasPendingWrites = snapshot.metadata.hasPendingWrites(),
-                            ),
-                        )
+            val commandRegistration = if (deviceRole == ParentDeviceRole.Child) {
+                commandsCollection(childDeviceId)
+                    .orderBy("timestampMillis", Query.Direction.DESCENDING)
+                    .limit(REMOTE_LISTENER_DOCUMENT_LIMIT)
+                    .addSnapshotListener(MetadataChanges.INCLUDE) { snapshot, error ->
+                        if (error != null) {
+                            updateFailed(error)
+                            close(error)
+                        } else if (snapshot != null) {
+                            updateConnected()
+                            trySend(
+                                ParentRemoteChange(
+                                    childDeviceId = childDeviceId,
+                                    type = ParentRemoteChangeType.RemoteCommands,
+                                    fromCache = snapshot.metadata.isFromCache,
+                                    hasPendingWrites = snapshot.metadata.hasPendingWrites(),
+                                ),
+                            )
+                        }
                     }
-                }
-            listOf(childRegistration, requestRegistration, commandRegistration)
+            } else {
+                null
+            }
+            listOfNotNull(childRegistration, requestRegistration, commandRegistration)
         }
 
         awaitClose {
@@ -139,8 +158,10 @@ class FirebaseParentRemoteSyncDataSource(
         pairingCode: String,
         childDeviceId: String,
         childDeviceName: String,
+        previousPairingCode: String,
     ): ParentRemoteSyncResult {
         val cleanCode = pairingCode.trim().uppercase()
+        val cleanPreviousCode = previousPairingCode.trim().uppercase()
         if (cleanCode.isBlank() || childDeviceId.isBlank()) {
             return ParentRemoteSyncResult.Failed("Pairing code or child device id is blank")
         }
@@ -149,37 +170,58 @@ class FirebaseParentRemoteSyncDataSource(
             val childUid = currentUid()
             val childRef = childrenCollection().document(childDeviceId)
             val pairingRef = pairingCodesCollection().document(cleanCode)
-            firestore.runTransaction { transaction ->
-                transaction.set(
-                    childRef,
-                    mapOf(
-                        "childDeviceId" to childDeviceId,
-                        "childDeviceName" to childDeviceName,
-                        "childUid" to childUid,
-                        "activePairingCode" to cleanCode,
-                        "status" to "active",
-                        "updatedAtMillis" to now,
-                    ),
-                    SetOptions.merge(),
-                )
-                transaction.set(
-                    pairingRef,
-                    mapOf(
-                        "pairingCode" to cleanCode,
-                        "childDeviceId" to childDeviceId,
-                        "childDeviceName" to childDeviceName,
-                        "childUid" to childUid,
-                        "createdAtMillis" to now,
-                        "expiresAtMillis" to now + PAIRING_CODE_TTL_MILLIS,
-                        "expiresAt" to Timestamp(Date(now + PAIRING_CODE_TTL_MILLIS)),
-                        "status" to "active",
-                        "used" to false,
-                        "updatedAtMillis" to now,
-                    ),
-                    SetOptions.merge(),
-                )
-                null
-            }.awaitResult()
+            childRef.set(
+                mapOf(
+                    "childDeviceId" to childDeviceId,
+                    "childDeviceName" to childDeviceName,
+                    "childUid" to childUid,
+                    "activePairingCode" to cleanCode,
+                    "status" to "active",
+                    "updatedAtMillis" to now,
+                ),
+                SetOptions.merge(),
+            ).awaitResult()
+
+            // Release rules inspect these arrays before an unlinked parent may read the
+            // child document. Older and newly created child documents may not have them.
+            // Add only missing fields so regenerating a code never erases existing parents.
+            val childSnapshot = childRef.get().awaitResult()
+            val missingRelationFields = buildMap<String, Any> {
+                if (!childSnapshot.contains("parentUids")) {
+                    put("parentUids", emptyList<String>())
+                }
+                if (!childSnapshot.contains("linkedParents")) {
+                    put("linkedParents", emptyList<Map<String, Any>>())
+                }
+            }
+            if (missingRelationFields.isNotEmpty()) {
+                childRef.set(missingRelationFields, SetOptions.merge()).awaitResult()
+            }
+
+            pairingRef.set(
+                mapOf(
+                    "pairingCode" to cleanCode,
+                    "childDeviceId" to childDeviceId,
+                    "childDeviceName" to childDeviceName,
+                    "childUid" to childUid,
+                    "createdAtMillis" to now,
+                    "expiresAtMillis" to now + PAIRING_CODE_TTL_MILLIS,
+                    "expiresAt" to Timestamp(Date(now + PAIRING_CODE_TTL_MILLIS)),
+                    "status" to "active",
+                    "used" to false,
+                    "updatedAtMillis" to now,
+                ),
+                SetOptions.merge(),
+            ).awaitResult()
+
+            if (cleanPreviousCode.isNotBlank() && cleanPreviousCode != cleanCode) {
+                runCatching {
+                    pairingCodesCollection()
+                        .document(cleanPreviousCode)
+                        .delete()
+                        .awaitResult()
+                }
+            }
         }
     }
 
@@ -191,9 +233,19 @@ class FirebaseParentRemoteSyncDataSource(
         pairingCode: String,
         parentDisplayName: String,
     ): ParentRemotePairingRecord? {
+        return when (val result = resolvePairingCodeDetailed(pairingCode, parentDisplayName)) {
+            is ParentRemotePairingResolution.Success -> result.record
+            else -> null
+        }
+    }
+
+    override suspend fun resolvePairingCodeDetailed(
+        pairingCode: String,
+        parentDisplayName: String,
+    ): ParentRemotePairingResolution {
         val cleanCode = pairingCode.trim().uppercase()
         if (cleanCode.isBlank()) {
-            return null
+            return ParentRemotePairingResolution.NotFound
         }
         return try {
             ensureSignedIn()
@@ -203,7 +255,7 @@ class FirebaseParentRemoteSyncDataSource(
             val record = firestore.runTransaction { transaction ->
                 val snapshot = transaction.get(pairingRef)
                 if (!snapshot.exists()) {
-                    return@runTransaction null
+                    return@runTransaction ParentRemotePairingResolution.NotFound
                 }
                 val expiresAtMillis = snapshot.getLong("expiresAtMillis") ?: 0L
                 val used = snapshot.getBoolean("used") ?: false
@@ -219,12 +271,13 @@ class FirebaseParentRemoteSyncDataSource(
                         ),
                         SetOptions.merge(),
                     )
-                    return@runTransaction null
+                    return@runTransaction ParentRemotePairingResolution.Expired
                 }
                 if (used && !usedByCurrentParent) {
-                    return@runTransaction null
+                    return@runTransaction ParentRemotePairingResolution.AlreadyUsed
                 }
-                val pairingRecord = snapshot.toPairingRecord() ?: return@runTransaction null
+                val pairingRecord = snapshot.toPairingRecord()
+                    ?: return@runTransaction ParentRemotePairingResolution.NotFound
                 val linkedParent = mapOf(
                     "parentUid" to parentUid,
                     "parentDisplayName" to parentDisplayName.trim().ifBlank { "Parent device" },
@@ -265,13 +318,17 @@ class FirebaseParentRemoteSyncDataSource(
                     ),
                     SetOptions.merge(),
                 )
-                pairingRecord
+                ParentRemotePairingResolution.Success(pairingRecord)
             }.awaitResult()
             updateConnected()
             record
         } catch (error: Throwable) {
             updateFailed(error)
-            null
+            ParentRemotePairingResolution.Failed(
+                reason = error.message.orEmpty(),
+                retryable = error.isRetryableRemoteFailure(),
+                kind = error.remoteFailureKind(),
+            )
         }
     }
 
@@ -312,6 +369,40 @@ class FirebaseParentRemoteSyncDataSource(
                             .ifBlank { "Child device" },
                         pairingCode = "",
                         linkedAtMillis = snapshot.getLong("linkedAtMillis") ?: 0L,
+                    )
+                }
+            }
+            updateConnected()
+            children
+        } catch (error: Throwable) {
+            updateFailed(error)
+            emptyList()
+        }
+    }
+
+    override suspend fun fetchLinkedChildDevicesForCurrentParent(): List<LinkedChildDevice> {
+        return try {
+            ensureSignedIn()
+            val uid = currentUid()
+            if (uid.isBlank() || auth.currentUser?.isAnonymous != false) {
+                return emptyList()
+            }
+            val snapshot = childrenCollection()
+                .whereArrayContains("parentUids", uid)
+                .limit(RECOVERED_CHILD_DOCUMENT_LIMIT)
+                .get()
+                .awaitResult()
+            val children = snapshot.documents.mapNotNull { document ->
+                if (!document.exists()) {
+                    null
+                } else {
+                    LinkedChildDevice(
+                        childDeviceId = document.id,
+                        childDeviceName = document.getString("childDeviceName")
+                            .orEmpty()
+                            .ifBlank { "Child device" },
+                        pairingCode = "",
+                        linkedAtMillis = document.getLong("linkedAtMillis") ?: 0L,
                     )
                 }
             }
@@ -463,11 +554,13 @@ class FirebaseParentRemoteSyncDataSource(
                     ),
                     SetOptions.merge(),
                 )
-                transaction.set(
-                    commandsCollection(request.childDeviceId).document(command.id),
-                    command.toRemoteMap() + mapOf("parentUid" to parentUid),
-                    SetOptions.merge(),
-                )
+                if (decision.approved) {
+                    transaction.set(
+                        commandsCollection(request.childDeviceId).document(command.id),
+                        command.toRemoteMap() + mapOf("parentUid" to parentUid),
+                        SetOptions.merge(),
+                    )
+                }
                 null
             }.awaitResult()
         }
@@ -484,7 +577,7 @@ class FirebaseParentRemoteSyncDataSource(
             ensureSignedIn()
             val snapshot = requestsCollection(childDeviceId)
                 .orderBy("createdAtMillis", Query.Direction.DESCENDING)
-                .limit(30)
+                .limit(REMOTE_QUERY_DOCUMENT_LIMIT)
                 .get()
                 .awaitResult()
             updateConnected()
@@ -495,15 +588,69 @@ class FirebaseParentRemoteSyncDataSource(
         }
     }
 
-    override suspend fun fetchChildCommands(childDeviceId: String): List<RemoteParentCommand> {
+    override suspend fun fetchChildRequest(
+        childDeviceId: String,
+        requestId: String,
+    ): RemoteUnlockRequest? {
+        if (childDeviceId.isBlank() || requestId.isBlank()) {
+            return null
+        }
+        return try {
+            ensureSignedIn()
+            val snapshot = requestsCollection(childDeviceId)
+                .document(requestId)
+                .get()
+                .awaitResult()
+            updateConnected()
+            snapshot.toRemoteUnlockRequest()
+        } catch (error: Throwable) {
+            updateFailed(error)
+            null
+        }
+    }
+
+    override suspend fun fetchChildCommand(
+        childDeviceId: String,
+        commandId: String,
+    ): RemoteParentCommand? {
+        if (childDeviceId.isBlank() || commandId.isBlank()) {
+            return null
+        }
+        return try {
+            ensureSignedIn()
+            val snapshot = commandsCollection(childDeviceId)
+                .document(commandId)
+                .get()
+                .awaitResult()
+            updateConnected()
+            snapshot.toRemoteParentCommand()
+        } catch (error: Throwable) {
+            updateFailed(error)
+            null
+        }
+    }
+
+    override suspend fun fetchChildCommands(
+        childDeviceId: String,
+        afterTimestampMillis: Long,
+    ): List<RemoteParentCommand> {
         if (childDeviceId.isBlank()) {
             return emptyList()
         }
         return try {
             ensureSignedIn()
-            val snapshot = commandsCollection(childDeviceId)
-                .orderBy("timestampMillis", Query.Direction.DESCENDING)
-                .limit(30)
+            val baseQuery = commandsCollection(childDeviceId)
+                .orderBy(
+                    "timestampMillis",
+                    if (afterTimestampMillis > 0L) Query.Direction.ASCENDING else Query.Direction.DESCENDING,
+                )
+            val query = if (afterTimestampMillis > 0L) {
+                baseQuery.whereGreaterThanOrEqualTo("timestampMillis", afterTimestampMillis)
+            } else {
+                baseQuery
+            }
+            val snapshot = query
+                .limit(REMOTE_QUERY_DOCUMENT_LIMIT)
                 .get()
                 .awaitResult()
             updateConnected()
@@ -511,6 +658,45 @@ class FirebaseParentRemoteSyncDataSource(
         } catch (error: Throwable) {
             updateFailed(error)
             emptyList()
+        }
+    }
+
+    override suspend fun cleanupExpiredRemoteData(
+        childDeviceId: String,
+        olderThanMillis: Long,
+    ): ParentRemoteSyncResult {
+        if (childDeviceId.isBlank() || olderThanMillis <= 0L) {
+            return ParentRemoteSyncResult.Failed("Remote cleanup target is invalid")
+        }
+        return try {
+            ensureSignedIn()
+            val expiredRequests = requestsCollection(childDeviceId)
+                .whereLessThanOrEqualTo("createdAtMillis", olderThanMillis)
+                .orderBy("createdAtMillis", Query.Direction.ASCENDING)
+                .limit(REMOTE_CLEANUP_DOCUMENT_LIMIT)
+                .get()
+                .awaitResult()
+            val expiredCommands = commandsCollection(childDeviceId)
+                .whereLessThanOrEqualTo("timestampMillis", olderThanMillis)
+                .orderBy("timestampMillis", Query.Direction.ASCENDING)
+                .limit(REMOTE_CLEANUP_DOCUMENT_LIMIT)
+                .get()
+                .awaitResult()
+            val documents = expiredRequests.documents + expiredCommands.documents
+            if (documents.isNotEmpty()) {
+                val batch = firestore.batch()
+                documents.forEach { document -> batch.delete(document.reference) }
+                batch.commit().awaitResult()
+            }
+            ParentRemoteSyncResult.Success
+        } catch (error: Throwable) {
+            // Retention is best-effort maintenance. A missing release rule or a
+            // temporary network failure must not make normal parent sync appear offline.
+            ParentRemoteSyncResult.Failed(
+                reason = "remote cleanup failed: ${error.message.orEmpty()}",
+                retryable = error.isRetryableRemoteFailure(),
+                kind = error.remoteFailureKind(),
+            )
         }
     }
 
@@ -595,6 +781,71 @@ class FirebaseParentRemoteSyncDataSource(
         }
     }
 
+    override suspend fun synchronizePushToken(
+        registrationId: String,
+        token: String,
+        desiredTargets: Set<RemotePushTokenTarget>,
+        obsoleteTargets: Set<RemotePushTokenTarget>,
+    ): ParentRemoteSyncResult {
+        if (registrationId.isBlank() || token.isBlank()) {
+            return ParentRemoteSyncResult.Failed("Push registration id or token is blank")
+        }
+        if (desiredTargets.isEmpty() && obsoleteTargets.isEmpty()) {
+            return ParentRemoteSyncResult.Success
+        }
+        return runRemote("synchronize push token") {
+            val uid = currentUid()
+            val tokenDocumentId = pushTokenDocumentId(uid, registrationId)
+            val batch = firestore.batch()
+            val desiredChildIds = desiredTargets.mapTo(hashSetOf()) { target -> target.childDeviceId }
+            obsoleteTargets
+                .filterNot { target -> target.childDeviceId in desiredChildIds }
+                .forEach { target ->
+                if (target.childDeviceId.isNotBlank()) {
+                    batch.delete(
+                        pushTokensCollection(target.childDeviceId).document(tokenDocumentId),
+                    )
+                }
+            }
+            val now = System.currentTimeMillis()
+            desiredTargets.forEach { target ->
+                if (target.childDeviceId.isNotBlank()) {
+                    batch.set(
+                        pushTokensCollection(target.childDeviceId).document(tokenDocumentId),
+                        mapOf(
+                            "uid" to uid,
+                            "token" to token,
+                            "role" to target.role.storageValue,
+                            "platform" to "android",
+                            "updatedAtMillis" to now,
+                        ),
+                        SetOptions.merge(),
+                    )
+                }
+            }
+            batch.commit().awaitResult()
+        }
+    }
+
+    override suspend fun deleteCurrentUserCloudData(): ParentRemoteSyncResult {
+        return try {
+            ensureSignedIn()
+            functions.getHttpsCallable("deleteCurrentUserData")
+                .call(emptyMap<String, Any>())
+                .awaitResult()
+            auth.signOut()
+            updateConnected()
+            ParentRemoteSyncResult.Success
+        } catch (error: Throwable) {
+            updateFailed(error)
+            ParentRemoteSyncResult.Failed(
+                reason = "delete current user data failed: ${error.message.orEmpty()}",
+                retryable = error.isRetryableRemoteFailure(),
+                kind = error.remoteFailureKind(),
+            )
+        }
+    }
+
     private suspend fun runRemote(action: String, block: suspend () -> Unit): ParentRemoteSyncResult {
         return try {
             ensureSignedIn()
@@ -603,7 +854,11 @@ class FirebaseParentRemoteSyncDataSource(
             ParentRemoteSyncResult.Success
         } catch (error: Throwable) {
             updateFailed(error)
-            ParentRemoteSyncResult.Failed("$action failed: ${error.message.orEmpty()}")
+            ParentRemoteSyncResult.Failed(
+                reason = "$action failed: ${error.message.orEmpty()}",
+                retryable = error.isRetryableRemoteFailure(),
+                kind = error.remoteFailureKind(),
+            )
         }
     }
 
@@ -645,6 +900,64 @@ class FirebaseParentRemoteSyncDataSource(
         firestore.collection("screenrest_children")
             .document(childDeviceId)
             .collection("remote_commands")
+
+    private fun pushTokensCollection(childDeviceId: String) =
+        firestore.collection("screenrest_children")
+            .document(childDeviceId)
+            .collection("push_tokens")
+}
+
+private fun pushTokenDocumentId(uid: String, registrationId: String): String {
+    val bytes = MessageDigest.getInstance("SHA-256")
+        .digest("$uid:$registrationId".toByteArray(Charsets.UTF_8))
+    return bytes.joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
+}
+
+private fun Throwable.remoteFailureKind(): ParentRemoteFailureKind {
+    return when (this) {
+        is FirebaseNetworkException,
+        is IOException -> ParentRemoteFailureKind.Network
+
+        is FirebaseAuthException -> ParentRemoteFailureKind.Authentication
+
+        is FirebaseFirestoreException -> when (code) {
+            FirebaseFirestoreException.Code.PERMISSION_DENIED -> ParentRemoteFailureKind.PermissionDenied
+            FirebaseFirestoreException.Code.UNAUTHENTICATED -> ParentRemoteFailureKind.Authentication
+            FirebaseFirestoreException.Code.NOT_FOUND -> ParentRemoteFailureKind.NotFound
+            FirebaseFirestoreException.Code.ABORTED,
+            FirebaseFirestoreException.Code.CANCELLED,
+            FirebaseFirestoreException.Code.DEADLINE_EXCEEDED,
+            FirebaseFirestoreException.Code.INTERNAL,
+            FirebaseFirestoreException.Code.RESOURCE_EXHAUSTED,
+            FirebaseFirestoreException.Code.UNAVAILABLE,
+            FirebaseFirestoreException.Code.UNKNOWN -> ParentRemoteFailureKind.Network
+            else -> ParentRemoteFailureKind.Unknown
+        }
+
+        else -> cause
+            ?.takeIf { causeError -> causeError !== this }
+            ?.remoteFailureKind()
+            ?: ParentRemoteFailureKind.Unknown
+    }
+}
+
+private fun Throwable.isRetryableRemoteFailure(): Boolean {
+    return when (this) {
+        is FirebaseNetworkException,
+        is IOException -> true
+
+        is FirebaseFirestoreException -> code in setOf(
+            FirebaseFirestoreException.Code.ABORTED,
+            FirebaseFirestoreException.Code.CANCELLED,
+            FirebaseFirestoreException.Code.DEADLINE_EXCEEDED,
+            FirebaseFirestoreException.Code.INTERNAL,
+            FirebaseFirestoreException.Code.RESOURCE_EXHAUSTED,
+            FirebaseFirestoreException.Code.UNAVAILABLE,
+            FirebaseFirestoreException.Code.UNKNOWN,
+        )
+
+        else -> cause?.takeIf { causeError -> causeError !== this }?.isRetryableRemoteFailure() == true
+    }
 }
 
 private fun ParentRemoteUnlockDecision.toRemoteCommand(request: RemoteUnlockRequest): RemoteParentCommand {
@@ -888,3 +1201,7 @@ private suspend fun <T> Task<T>.awaitResult(): T {
 }
 
 private const val PAIRING_CODE_TTL_MILLIS = 10L * 60L * 1_000L
+private const val REMOTE_LISTENER_DOCUMENT_LIMIT = 30L
+private const val REMOTE_QUERY_DOCUMENT_LIMIT = 30L
+private const val REMOTE_CLEANUP_DOCUMENT_LIMIT = 20L
+private const val RECOVERED_CHILD_DOCUMENT_LIMIT = 100L

@@ -26,6 +26,24 @@ class UsageHistoryStore(context: Context) {
         cachedUsageByDay
     }
 
+    fun replaceDays(
+        usageByDay: Map<Long, Map<String, Long>>,
+        forceWrite: Boolean = false,
+    ): Map<Long, Map<String, Long>> = synchronized(sharedLock) {
+        ensureLoaded()
+        val replaced = replaceUsageHistoryDays(
+            existing = cachedUsageByDay,
+            replacements = usageByDay,
+            maxDays = MAX_HISTORY_DAYS,
+        )
+        if (replaced != cachedUsageByDay) {
+            cachedUsageByDay = replaced
+            dirty = true
+        }
+        writeIfDue(force = forceWrite)
+        cachedUsageByDay
+    }
+
     fun snapshot(dayStarts: Collection<Long>): Map<Long, Map<String, Long>> = synchronized(sharedLock) {
         ensureLoaded()
         dayStarts
@@ -112,6 +130,29 @@ internal fun mergeUsageHistory(
 
     val retainedDays = merged.keys.sortedDescending().take(maxDays.coerceAtLeast(1)).toSet()
     return merged
+        .filterKeys { dayStartMillis -> dayStartMillis in retainedDays }
+        .toSortedMap()
+        .mapValues { (_, usageByPackage) -> usageByPackage.toSortedMap() }
+}
+
+internal fun replaceUsageHistoryDays(
+    existing: Map<Long, Map<String, Long>>,
+    replacements: Map<Long, Map<String, Long>>,
+    maxDays: Int,
+): Map<Long, Map<String, Long>> {
+    val replaced = existing
+        .filterKeys { dayStartMillis -> dayStartMillis > 0L }
+        .mapValues { (_, usageByPackage) -> sanitizeHistoryDay(usageByPackage) }
+        .toMutableMap()
+
+    replacements.forEach { (dayStartMillis, usageByPackage) ->
+        if (dayStartMillis > 0L) {
+            replaced[dayStartMillis] = sanitizeHistoryDay(usageByPackage)
+        }
+    }
+
+    val retainedDays = replaced.keys.sortedDescending().take(maxDays.coerceAtLeast(1)).toSet()
+    return replaced
         .filterKeys { dayStartMillis -> dayStartMillis in retainedDays }
         .toSortedMap()
         .mapValues { (_, usageByPackage) -> usageByPackage.toSortedMap() }

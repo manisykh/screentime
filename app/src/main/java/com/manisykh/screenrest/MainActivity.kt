@@ -11,11 +11,17 @@ import android.provider.Settings
 import android.Manifest
 import android.util.LruCache
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.credentials.CredentialManager
+import androidx.credentials.CustomCredential
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.GetCredentialException
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -77,6 +83,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -85,6 +92,8 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchColors
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldColors
@@ -118,10 +127,12 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -133,6 +144,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.core.graphics.drawable.toBitmap
 import com.manisykh.screenrest.blocking.BlockedActivity
@@ -142,8 +154,14 @@ import com.manisykh.screenrest.data.AppLanguage
 import com.manisykh.screenrest.data.AppGroupPolicy
 import com.manisykh.screenrest.data.EventLogEntry
 import com.manisykh.screenrest.data.ForegroundDetectionStatus
+import com.manisykh.screenrest.data.HardshipLevel
+import com.manisykh.screenrest.data.HardshipPolicyKey
+import com.manisykh.screenrest.data.HardshipPolicyType
+import com.manisykh.screenrest.data.HardshipRuntimeState
 import com.manisykh.screenrest.data.ParentManagementState
+import com.manisykh.screenrest.data.ParentAccountAuthState
 import com.manisykh.screenrest.data.ParentDeviceRole
+import com.manisykh.screenrest.data.ParentNotificationState
 import com.manisykh.screenrest.data.LinkedChildDevice
 import com.manisykh.screenrest.data.LinkedParentDevice
 import com.manisykh.screenrest.data.RemoteRequestBlockReason
@@ -159,23 +177,45 @@ import com.manisykh.screenrest.data.activeScheduleTemplate
 import com.manisykh.screenrest.data.isScheduleBlockingNow
 import com.manisykh.screenrest.data.normalizedAppGroups
 import com.manisykh.screenrest.data.normalizedScheduleTemplates
+import com.manisykh.screenrest.data.overlappingSchedulePairs
 import com.manisykh.screenrest.data.scheduleDaySet
+import com.manisykh.screenrest.data.selectedScheduleTemplate
 import com.manisykh.screenrest.data.toScheduleDaysEncoded
 import com.manisykh.screenrest.data.toScheduleTemplatesEncoded
 import com.manisykh.screenrest.data.toAppGroupsEncoded
+import com.manisykh.screenrest.data.hardshipLevelFor
+import com.manisykh.screenrest.data.configurationReflectionReadyAtMillis
+import com.manisykh.screenrest.data.withHardshipLevel
+import com.manisykh.screenrest.data.allowOnlyHardshipKey
+import com.manisykh.screenrest.data.appGroupHardshipKey
+import com.manisykh.screenrest.data.appLimitHardshipKey
+import com.manisykh.screenrest.data.appLimitActiveDayMap
+import com.manisykh.screenrest.data.currentPolicyDayOfWeek
+import com.manisykh.screenrest.data.normalizedPolicyDays
+import com.manisykh.screenrest.data.toAppLimitActiveDaysEncoded
+import com.manisykh.screenrest.data.dailyHardshipKey
+import com.manisykh.screenrest.data.scheduleHardshipKey
+import com.manisykh.screenrest.data.nextOccurrenceEndMillis
+import com.manisykh.screenrest.data.encodeOptionalLimitMinutes
+import com.manisykh.screenrest.data.limitMinutesOrNull
 import com.manisykh.screenrest.notification.UsageNotificationHelper
 import com.manisykh.screenrest.safety.BlockDecision
 import com.manisykh.screenrest.safety.BlockDecisionResult
+import com.manisykh.screenrest.safety.AndroidSystemInteractionResolver
+import com.manisykh.screenrest.safety.LinkedAppFamily
 import com.manisykh.screenrest.safety.SafetyGate
 import com.manisykh.screenrest.ui.safety.AppGroupSummary
 import com.manisykh.screenrest.ui.safety.AppLimitSummary
 import com.manisykh.screenrest.ui.safety.AutoRecoveryStatus
 import com.manisykh.screenrest.ui.safety.BlockingReadiness
-import com.manisykh.screenrest.ui.safety.EmergencyUnlockStatus
+import com.manisykh.screenrest.ui.safety.SafeRecoveryStatus
 import com.manisykh.screenrest.ui.safety.LimitStatus
 import com.manisykh.screenrest.ui.safety.PinChangeStatus
 import com.manisykh.screenrest.ui.safety.PolicyBudgetValidation
 import com.manisykh.screenrest.ui.safety.PolicySummary
+import com.manisykh.screenrest.ui.safety.EffectiveAppAccess
+import com.manisykh.screenrest.ui.safety.EffectiveAppPolicySummary
+import com.manisykh.screenrest.ui.safety.EffectiveTimeLimiter
 import com.manisykh.screenrest.ui.safety.PolicySaveStatus
 import com.manisykh.screenrest.ui.safety.SafeModeUiState
 import com.manisykh.screenrest.ui.safety.SafeModePinStatus
@@ -185,6 +225,7 @@ import com.manisykh.screenrest.ui.safety.TemporaryAllowedAppSummary
 import com.manisykh.screenrest.ui.safety.TopAppsUsageSet
 import com.manisykh.screenrest.ui.safety.buildTemporaryAllowedAppSummaries
 import com.manisykh.screenrest.ui.safety.appLimitMap
+import com.manisykh.screenrest.ui.safety.dailyLimitMinutesByDayOrNull
 import com.manisykh.screenrest.ui.safety.toAppLimitRules
 import com.manisykh.screenrest.ui.theme.ScreenTimeManagerTheme
 import com.manisykh.screenrest.ui.theme.AppOver
@@ -192,16 +233,20 @@ import com.manisykh.screenrest.ui.theme.AppSafe
 import com.manisykh.screenrest.ui.theme.AppWarn
 import com.manisykh.screenrest.usage.AppUsageInfo
 import com.manisykh.screenrest.usage.DailyUsageInfo
+import com.manisykh.screenrest.usage.ForegroundAppTracker
 import com.manisykh.screenrest.usage.InstalledAppInfo
 import com.manisykh.screenrest.worker.SystemHealthCheckWorker
 import com.manisykh.screenrest.worker.UsageMonitorRecoveryWorker
 import com.manisykh.screenrest.worker.UsagePolicyCheckWorker
 import com.manisykh.screenrest.worker.RemoteParentSyncWorker
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -215,43 +260,69 @@ import kotlin.math.roundToInt
 class MainActivity : ComponentActivity() {
     private val safeModeViewModel: SafeModeViewModel by viewModels()
     private val suppressPermissionSetupAutoDialog = mutableStateOf(false)
-    private var stoppedAtElapsedRealtime: Long = 0L
+    private val openParentRequestsSignal = mutableStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applyLaunchIntent(intent)
         UsageNotificationHelper(this).ensureChannel()
-        UsagePolicyCheckWorker.schedule(this)
-        SystemHealthCheckWorker.scheduleNow(this)
-        SystemHealthCheckWorker.schedulePeriodic(this)
-        RemoteParentSyncWorker.schedule(this)
-        BootRecoveryReceiver.scheduleDailyRolloverAlarm(this)
-        UsageMonitorRecoveryWorker.schedulePeriodic(this)
+        UsageNotificationHelper(this).ensureParentRequestChannel()
         enableEdgeToEdge()
         setContent {
             ScreenTimeManagerTheme {
                 val uiState by safeModeViewModel.uiState.collectAsStateWithLifecycle()
-                LaunchedEffect(
-                    uiState.safeModeEnabled,
-                    uiState.policyEnforcementEnabled,
-                ) {
-                    if (!uiState.safeModeEnabled && uiState.policyEnforcementEnabled) {
-                        UsageMonitorForegroundService.managerVisible(this@MainActivity)
+                if (!uiState.monitoringDisclosureLoaded) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.background,
+                        modifier = Modifier.fillMaxSize(),
+                    ) {}
+                } else if (!uiState.monitoringDisclosureAccepted) {
+                    MonitoringDisclosureScreen(
+                        appLanguage = uiState.appLanguage,
+                        onAccept = safeModeViewModel::acceptMonitoringDisclosure,
+                        onExit = ::finishAffinity,
+                    )
+                } else if (!uiState.securityPinsConfigured) {
+                    InitialPinSetupScreen(
+                        appLanguage = uiState.appLanguage,
+                        onConfigure = safeModeViewModel::configureInitialAdminPin,
+                        onExit = ::finishAffinity,
+                    )
+                } else {
+                    val parentAccountAuthState by safeModeViewModel.parentAccountAuthState
+                        .collectAsStateWithLifecycle()
+                    LaunchedEffect(Unit) {
+                        AndroidSystemInteractionResolver(this@MainActivity)
+                            .refreshDetectedRelationships()
+                        UsagePolicyCheckWorker.schedule(this@MainActivity)
+                        SystemHealthCheckWorker.scheduleNow(this@MainActivity)
+                        SystemHealthCheckWorker.schedulePeriodic(this@MainActivity)
+                        RemoteParentSyncWorker.schedule(this@MainActivity)
+                        BootRecoveryReceiver.scheduleDailyRolloverAlarm(this@MainActivity)
+                        UsageMonitorRecoveryWorker.schedulePeriodic(this@MainActivity)
                     }
-                }
-                val notificationPermissionLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.RequestPermission(),
-                    onResult = {
-                        safeModeViewModel.refreshForForeground(force = true)
-                    },
-                )
+                    LaunchedEffect(
+                        uiState.safeModeEnabled,
+                        uiState.policyEnforcementEnabled,
+                    ) {
+                        if (!uiState.safeModeEnabled && uiState.policyEnforcementEnabled) {
+                            UsageMonitorForegroundService.managerVisible(this@MainActivity)
+                        }
+                    }
+                    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.RequestPermission(),
+                        onResult = {
+                            safeModeViewModel.refreshForForeground(force = true)
+                        },
+                    )
 
-                Box(modifier = Modifier.fillMaxSize()) {
-                    Scaffold(
-                        containerColor = MaterialTheme.colorScheme.background,
-                    ) { innerPadding ->
-                        ScreenTimeManagerScreen(
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        Scaffold(
+                            containerColor = MaterialTheme.colorScheme.background,
+                        ) { innerPadding ->
+                            ScreenTimeManagerScreen(
                             uiState = uiState,
+                            parentAccountAuthState = parentAccountAuthState,
                             onSafeModeChanged = safeModeViewModel::setSafeModeEnabled,
                             onSafeModeEnableWithPin = safeModeViewModel::enableSafeModeWithAdminPin,
                             onSafeModePinStatusSeen = safeModeViewModel::clearSafeModePinStatus,
@@ -260,9 +331,11 @@ class MainActivity : ComponentActivity() {
                             onAppLanguageChanged = safeModeViewModel::setAppLanguage,
                             onWarningNotificationsChanged = safeModeViewModel::setWarningNotificationsEnabled,
                             onLimitNotificationsChanged = safeModeViewModel::setLimitNotificationsEnabled,
-                            onEmergencyUnlock = safeModeViewModel::submitEmergencyPin,
-                            onEmergencyPinChanged = safeModeViewModel::clearEmergencyUnlockStatus,
+                            onSafeRecovery = safeModeViewModel::submitSafeRecoveryAdminPin,
+                            onSafeRecoveryPinChanged = safeModeViewModel::clearSafeRecoveryStatus,
                             onAllowedAppsChanged = safeModeViewModel::setAllowedAppPackages,
+                            onAllRestrictionsExemptAppsChanged =
+                                safeModeViewModel::setAllRestrictionsExemptPackages,
                             onOpenUsageAccessSettings = ::openUsageAccessSettings,
                             onOpenNotificationAccessSettings = ::openNotificationAccessSettings,
                             onOpenExactAlarmSettings = ::openExactAlarmSettings,
@@ -270,6 +343,8 @@ class MainActivity : ComponentActivity() {
                             onRefreshUsageStats = { safeModeViewModel.refreshUsageStats(force = true) },
                             onRefreshStatistics = { safeModeViewModel.refreshStatistics() },
                             onPolicyDraftChanged = safeModeViewModel::updatePolicyDraft,
+                            onStartHardshipConfigurationReflection =
+                                safeModeViewModel::startHardshipConfigurationReflection,
                             onResetPolicyDraft = safeModeViewModel::resetPolicyDraft,
                             onSaveUsagePolicy = safeModeViewModel::savePolicyDraft,
                             onPolicySaveStatusSeen = safeModeViewModel::clearPolicySaveStatus,
@@ -284,13 +359,15 @@ class MainActivity : ComponentActivity() {
                                 }
                             },
                             onUpdateAdminPin = safeModeViewModel::updateAdminPin,
-                            onUpdateEmergencyPin = safeModeViewModel::updateEmergencyPin,
                             onPinInputChanged = safeModeViewModel::clearPinChangeStatus,
                             onPairParentAccount = safeModeViewModel::pairParentAccount,
                             onParentProfileNameChanged = safeModeViewModel::setParentProfileName,
                             onParentDeviceRoleChanged = safeModeViewModel::setParentDeviceRole,
                             onGenerateChildPairingCode = safeModeViewModel::generateChildPairingCode,
                             onRegisterChildPairingCode = safeModeViewModel::registerChildPairingCode,
+                            onParentGoogleSignIn = ::launchParentGoogleSignIn,
+                            onDeleteAccountAndCloudData =
+                                safeModeViewModel::deleteCurrentAccountAndCloudData,
                             onUnlinkParentAccount = safeModeViewModel::unlinkParentAccount,
                             onUnlinkLinkedChildDevice = safeModeViewModel::unlinkLinkedChildDevice,
                             onUnlinkLinkedParentDevice = safeModeViewModel::unlinkLinkedParentDevice,
@@ -314,6 +391,7 @@ class MainActivity : ComponentActivity() {
                             onSettingsParentManagementExpandedChange = safeModeViewModel::setSettingsParentManagementExpanded,
                             onSettingsEventLogExpandedChange = safeModeViewModel::setSettingsEventLogExpanded,
                             suppressPermissionSetupAutoDialog = this@MainActivity.suppressPermissionSetupAutoDialog.value,
+                            openParentRequestsSignal = this@MainActivity.openParentRequestsSignal.value,
                             modifier = Modifier
                                 .padding(innerPadding)
                                 .padding(
@@ -321,9 +399,58 @@ class MainActivity : ComponentActivity() {
                                         .only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top)
                                         .asPaddingValues(),
                                 ),
-                        )
+                            )
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    private fun launchParentGoogleSignIn() {
+        val clientIdResource = resources.getIdentifier(
+            "default_web_client_id",
+            "string",
+            packageName,
+        )
+        if (clientIdResource == 0) {
+            safeModeViewModel.reportParentGoogleSignInFailure("default_web_client_id is missing")
+            return
+        }
+        val serverClientId = getString(clientIdResource).trim()
+        if (serverClientId.isBlank()) {
+            safeModeViewModel.reportParentGoogleSignInFailure("default_web_client_id is blank")
+            return
+        }
+        lifecycleScope.launch {
+            try {
+                val googleOption = GetSignInWithGoogleOption.Builder(serverClientId).build()
+                val request = GetCredentialRequest.Builder()
+                    .addCredentialOption(googleOption)
+                    .build()
+                val credential = CredentialManager.create(this@MainActivity)
+                    .getCredential(
+                        context = this@MainActivity,
+                        request = request,
+                    )
+                    .credential
+                if (
+                    credential is CustomCredential &&
+                    credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+                ) {
+                    val googleCredential = GoogleIdTokenCredential.createFrom(credential.data)
+                    safeModeViewModel.signInParentWithGoogleIdToken(googleCredential.idToken)
+                } else {
+                    safeModeViewModel.reportParentGoogleSignInFailure("Unexpected credential type")
+                }
+            } catch (error: GetCredentialException) {
+                safeModeViewModel.reportParentGoogleSignInFailure(
+                    "${error.javaClass.simpleName}: ${error.message.orEmpty()}",
+                )
+            } catch (error: RuntimeException) {
+                safeModeViewModel.reportParentGoogleSignInFailure(
+                    "${error.javaClass.simpleName}: ${error.message.orEmpty()}",
+                )
             }
         }
     }
@@ -336,24 +463,28 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        val nowElapsed = SystemClock.elapsedRealtime()
-        val forceRefresh = stoppedAtElapsedRealtime > 0L &&
-            nowElapsed - stoppedAtElapsedRealtime >= FOREGROUND_FORCE_REFRESH_AFTER_MILLIS
-        stoppedAtElapsedRealtime = 0L
+        ForegroundAppTracker.clear()
         val currentUiState = safeModeViewModel.uiState.value
         if (
+            currentUiState.monitoringDisclosureAccepted &&
             !currentUiState.safeModeEnabled &&
             currentUiState.policyEnforcementEnabled
         ) {
             UsageMonitorForegroundService.managerVisible(this)
         }
-        safeModeViewModel.refreshForForeground(force = forceRefresh)
+        safeModeViewModel.refreshForForeground(
+            force = true,
+            settleUsageEvents = true,
+        )
     }
 
     override fun onStop() {
-        stoppedAtElapsedRealtime = SystemClock.elapsedRealtime()
         val currentUiState = safeModeViewModel.uiState.value
-        if (!currentUiState.safeModeEnabled && currentUiState.policyEnforcementEnabled) {
+        if (
+            currentUiState.monitoringDisclosureAccepted &&
+            !currentUiState.safeModeEnabled &&
+            currentUiState.policyEnforcementEnabled
+        ) {
             UsageMonitorForegroundService.start(this)
         }
         safeModeViewModel.markAppStoppedCleanly()
@@ -363,6 +494,10 @@ class MainActivity : ComponentActivity() {
     private fun applyLaunchIntent(intent: Intent?) {
         if (intent?.getBooleanExtra(EXTRA_SUPPRESS_PERMISSION_SETUP_AUTO_DIALOG, false) == true) {
             suppressPermissionSetupAutoDialog.value = true
+        }
+        if (intent?.getBooleanExtra(EXTRA_OPEN_PARENT_REQUESTS, false) == true) {
+            openParentRequestsSignal.value += 1
+            intent.removeExtra(EXTRA_OPEN_PARENT_REQUESTS)
         }
     }
 
@@ -419,6 +554,246 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val EXTRA_SUPPRESS_PERMISSION_SETUP_AUTO_DIALOG =
             "com.manisykh.screenrest.extra.SUPPRESS_PERMISSION_SETUP_AUTO_DIALOG"
+        const val EXTRA_OPEN_PARENT_REQUESTS =
+            "com.manisykh.screenrest.extra.OPEN_PARENT_REQUESTS"
+    }
+}
+
+@Composable
+private fun MonitoringDisclosureScreen(
+    appLanguage: AppLanguage,
+    onAccept: () -> Unit,
+    onExit: () -> Unit,
+) {
+    val korean = appLanguage == AppLanguage.Korean
+    BackHandler(onBack = onExit)
+    Surface(
+        color = MaterialTheme.colorScheme.background,
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Column(
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(WindowInsets.safeDrawing.asPaddingValues())
+                .padding(horizontal = 24.dp, vertical = 28.dp),
+        ) {
+            Text(
+                text = if (korean) "사용 시간 관리 안내" else "Screen time monitoring notice",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = if (korean) {
+                    "폰 쉼은 사용 시간 제한과 자녀·부모 승인을 제공하기 위해 기기 사용 정보를 지속적으로 확인합니다."
+                } else {
+                    "ScreenRest continuously checks device usage to enforce screen-time limits and support parent approvals."
+                },
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                    modifier = Modifier.padding(20.dp),
+                ) {
+                    MonitoringDisclosureItem(
+                        title = if (korean) "기기에서 확인" else "Checked on this device",
+                        body = if (korean) {
+                            "설치된 앱 이름, 앱별 사용 시간, 현재 실행 앱과 화면 켜짐 상태를 확인합니다. 화면이 꺼진 시간은 사용 시간에 포함하지 않습니다."
+                        } else {
+                            "Installed app names, per-app usage time, the foreground app, and screen-on state are checked. Screen-off time is not counted."
+                        },
+                    )
+                    MonitoringDisclosureItem(
+                        title = if (korean) "연결된 부모에게 전송" else "Shared with a linked parent",
+                        body = if (korean) {
+                            "자녀 기기를 연결한 경우 차단 대상, 사용·제한 시간, 승인 요청과 처리 상태, 기기 연결 식별자 및 알림 토큰을 Firebase를 통해 연결된 부모에게만 전송합니다."
+                        } else {
+                            "When a child device is linked, blocked targets, used and limited time, approval request status, a device-link identifier, and notification token are sent through Firebase only to the linked parent."
+                        },
+                    )
+                    MonitoringDisclosureItem(
+                        title = if (korean) "백그라운드 동작" else "Background operation",
+                        body = if (korean) {
+                            "앱을 닫아도 제한 적용과 승인 알림을 유지하기 위해 감시 서비스가 백그라운드에서 실행되며 지속 알림이 표시될 수 있습니다."
+                        } else {
+                            "A monitoring service can run in the background and show a persistent notification so limits and approval alerts continue after the app is closed."
+                        },
+                    )
+                    MonitoringDisclosureItem(
+                        title = if (korean) "오류 진단" else "Crash diagnostics",
+                        body = if (korean) {
+                            "앱 충돌과 응답 없음 문제를 개선하기 위해 충돌 시각, 기기·OS 정보와 오류 기록을 Firebase Crashlytics로 전송합니다. Google Analytics는 사용하지 않습니다."
+                        } else {
+                            "To improve crashes and ANRs, crash time, device and OS information, and error logs are sent to Firebase Crashlytics. Google Analytics is not used."
+                        },
+                    )
+                }
+            }
+            Text(
+                text = if (korean) {
+                    "이 정보는 화면 시간 관리와 부모 승인 목적으로만 사용됩니다. 동의하기 전에는 감시, 원격 동기화 및 푸시 토큰 등록을 시작하지 않습니다."
+                } else {
+                    "This information is used only for screen-time management and parent approvals. Monitoring, remote sync, and push-token registration do not start before consent."
+                },
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Button(
+                onClick = onAccept,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+            ) {
+                Text(if (korean) "동의하고 계속" else "Agree and continue")
+            }
+            OutlinedButton(
+                onClick = onExit,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+            ) {
+                Text(if (korean) "앱 종료" else "Exit app")
+            }
+        }
+    }
+}
+
+@Composable
+private fun MonitoringDisclosureItem(
+    title: String,
+    body: String,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Text(
+            text = body,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    }
+}
+
+@Composable
+private fun InitialPinSetupScreen(
+    appLanguage: AppLanguage,
+    onConfigure: (String) -> Unit,
+    onExit: () -> Unit,
+) {
+    val korean = appLanguage == AppLanguage.Korean
+    var adminPin by rememberSaveable { mutableStateOf("") }
+    var adminPinConfirm by rememberSaveable { mutableStateOf("") }
+    var errorMessage by rememberSaveable { mutableStateOf("") }
+    BackHandler(onBack = onExit)
+
+    fun updatePin(value: String): String = value.filter(Char::isDigit).take(8)
+    fun submit() {
+        errorMessage = when {
+            adminPin.length !in 4..8 -> if (korean) {
+                "관리 PIN을 숫자 4~8자리로 입력하세요."
+            } else {
+                "Enter 4 to 8 digits for the Admin PIN."
+            }
+            adminPin != adminPinConfirm -> if (korean) {
+                "관리 PIN 확인 값이 일치하지 않습니다."
+            } else {
+                "Admin PIN confirmation does not match."
+            }
+            else -> ""
+        }
+        if (errorMessage.isEmpty()) {
+            onConfigure(adminPin)
+        }
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.background,
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Column(
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(WindowInsets.safeDrawing.asPaddingValues())
+                .padding(horizontal = 24.dp, vertical = 28.dp),
+        ) {
+            Text(
+                text = if (korean) "관리 PIN 설정" else "Set Admin PIN",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = if (korean) {
+                    "관리 PIN은 설정 변경, 부모 연결, 차단 해제 확인에 사용됩니다. 고행 3단계는 관리 PIN만으로 즉시 종료할 수 없습니다."
+                } else {
+                    "The Admin PIN confirms settings, pairing, and allowed recovery actions. It cannot immediately end active hardship level 3."
+                },
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            OutlinedTextField(
+                value = adminPin,
+                onValueChange = { adminPin = updatePin(it); errorMessage = "" },
+                label = { Text(if (korean) "관리 PIN" else "Admin PIN") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = adminPinConfirm,
+                onValueChange = { adminPinConfirm = updatePin(it); errorMessage = "" },
+                label = { Text(if (korean) "관리 PIN 확인" else "Confirm admin PIN") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (errorMessage.isNotEmpty()) {
+                Text(
+                    text = errorMessage,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            Text(
+                text = if (korean) {
+                    "관리 PIN은 복구할 수 없습니다. 안전한 곳에 보관하세요. 5회 연속 오류 시 30초 동안 입력이 잠깁니다."
+                } else {
+                    "The Admin PIN cannot be recovered. Keep it in a safe place. Five failed attempts lock input for 30 seconds."
+                },
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Button(
+                onClick = ::submit,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+            ) {
+                Text(if (korean) "PIN 저장" else "Save PIN")
+            }
+            OutlinedButton(
+                onClick = onExit,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+            ) {
+                Text(if (korean) "앱 종료" else "Exit app")
+            }
+        }
     }
 }
 
@@ -458,6 +833,7 @@ private fun ScreenTab.previous(): ScreenTab {
 @Composable
 fun ScreenTimeManagerScreen(
     uiState: SafeModeUiState,
+    parentAccountAuthState: ParentAccountAuthState,
     onSafeModeChanged: (Boolean) -> Unit,
     onSafeModeEnableWithPin: (String) -> Unit,
     onSafeModePinStatusSeen: () -> Unit,
@@ -466,9 +842,10 @@ fun ScreenTimeManagerScreen(
     onAppLanguageChanged: (AppLanguage) -> Unit,
     onWarningNotificationsChanged: (Boolean) -> Unit,
     onLimitNotificationsChanged: (Boolean) -> Unit,
-    onEmergencyUnlock: (String) -> Unit,
-    onEmergencyPinChanged: () -> Unit,
+    onSafeRecovery: (String) -> Unit,
+    onSafeRecoveryPinChanged: () -> Unit,
     onAllowedAppsChanged: (Set<String>) -> Unit,
+    onAllRestrictionsExemptAppsChanged: (Set<String>) -> Unit,
     onOpenUsageAccessSettings: () -> Unit,
     onOpenNotificationAccessSettings: () -> Unit,
     onOpenExactAlarmSettings: () -> Unit,
@@ -476,18 +853,20 @@ fun ScreenTimeManagerScreen(
     onRefreshUsageStats: () -> Unit,
     onRefreshStatistics: () -> Unit,
     onPolicyDraftChanged: (UsagePolicySettings) -> Unit,
+    onStartHardshipConfigurationReflection: (HardshipPolicyKey) -> Unit,
     onResetPolicyDraft: () -> Unit,
     onSaveUsagePolicy: (String) -> Unit,
     onPolicySaveStatusSeen: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onUpdateAdminPin: (String, String) -> Unit,
-    onUpdateEmergencyPin: (String, String) -> Unit,
     onPinInputChanged: () -> Unit,
     onPairParentAccount: (String, String, String) -> Unit,
     onParentProfileNameChanged: (String) -> Unit,
     onParentDeviceRoleChanged: (ParentDeviceRole, String) -> Unit,
     onGenerateChildPairingCode: (String) -> Unit,
     onRegisterChildPairingCode: (String, String, String) -> Unit,
+    onParentGoogleSignIn: () -> Unit,
+    onDeleteAccountAndCloudData: (String) -> Unit,
     onUnlinkParentAccount: (String) -> Unit,
     onUnlinkLinkedChildDevice: (String, String) -> Unit,
     onUnlinkLinkedParentDevice: (String, String) -> Unit,
@@ -511,12 +890,13 @@ fun ScreenTimeManagerScreen(
     onSettingsParentManagementExpandedChange: (Boolean) -> Unit,
     onSettingsEventLogExpandedChange: (Boolean) -> Unit,
     suppressPermissionSetupAutoDialog: Boolean,
+    openParentRequestsSignal: Int = 0,
     modifier: Modifier = Modifier,
 ) {
     var selectedTab by remember { mutableStateOf(ScreenTab.Overview) }
     var previousTab by remember { mutableStateOf<ScreenTab?>(null) }
     var tabTransitionDirection by remember { mutableStateOf(1) }
-    var emergencyPin by remember { mutableStateOf("") }
+    var safeRecoveryAdminPin by remember { mutableStateOf("") }
     var policyAdminPin by remember { mutableStateOf("") }
     var pendingParentManagementAction by remember { mutableStateOf<ParentManagementPendingAction?>(null) }
     var showPolicySaveDialog by remember { mutableStateOf(false) }
@@ -527,14 +907,16 @@ fun ScreenTimeManagerScreen(
     val context = LocalContext.current
     val permissionSetupRequired = !uiState.hasUsageAccess ||
         !uiState.blockingReadiness.overlayPermissionReady ||
-        !uiState.blockingReadiness.notificationPermissionReady ||
-        !uiState.blockingReadiness.notificationAccessReady ||
-        !uiState.blockingReadiness.exactAlarmReady
+        !uiState.blockingReadiness.notificationPermissionReady
     val permissionSetupAutoPromptRequired = permissionSetupRequired &&
         !uiState.permissionSetupCompletedOnce
     val hasPolicySaveProblem = uiState.policyBudgetValidation.hasOverflow ||
         uiState.policySaveStatus == PolicySaveStatus.InvalidAdminPin ||
-        uiState.policySaveStatus == PolicySaveStatus.BudgetExceeded
+        uiState.policySaveStatus == PolicySaveStatus.BudgetExceeded ||
+        uiState.policySaveStatus == PolicySaveStatus.PolicyConflict ||
+        uiState.policySaveStatus == PolicySaveStatus.HardshipLocked ||
+        uiState.policySaveStatus == PolicySaveStatus.HardshipReflectionRequired ||
+        uiState.policySaveStatus == PolicySaveStatus.HardshipReflectionWaiting
     val hasPendingParentManagementAction = pendingParentManagementAction != null
     val hasSaveChanges = uiState.policyDraftHasChanges || hasPendingParentManagementAction
     val saveBudgetValidation = if (uiState.policyDraftHasChanges) {
@@ -556,6 +938,21 @@ fun ScreenTimeManagerScreen(
         if (uiState.policySaveStatus == PolicySaveStatus.Saved) {
             delay(1_200L)
             onPolicySaveStatusSeen()
+        }
+    }
+
+    LaunchedEffect(showPolicySaveDialog, uiState.policySaveStatus) {
+        if (showPolicySaveDialog && uiState.policySaveStatus == PolicySaveStatus.Saved) {
+            delay(450L)
+            showPolicySaveDialog = false
+            policyAdminPin = ""
+        }
+    }
+
+    LaunchedEffect(uiState.parentManagementState.deviceRole, pendingParentManagementAction) {
+        val pendingRole = pendingParentManagementAction as? ParentManagementPendingAction.ChangeRole
+        if (pendingRole != null && uiState.parentManagementState.deviceRole == pendingRole.role) {
+            pendingParentManagementAction = null
         }
     }
 
@@ -622,6 +1019,13 @@ fun ScreenTimeManagerScreen(
         selectedTab = nextTab
     }
 
+    LaunchedEffect(openParentRequestsSignal) {
+        if (openParentRequestsSignal > 0) {
+            selectTab(ScreenTab.Settings)
+            onSettingsParentManagementExpandedChange(true)
+        }
+    }
+
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
@@ -635,7 +1039,8 @@ fun ScreenTimeManagerScreen(
         val bottomBarOuterVerticalPadding = if (isLandscape && isExpanded) 2.dp else 10.dp
         val contentBottomPadding = when {
             isKeyboardVisible -> 28.dp
-            isLandscape && isExpanded -> 88.dp
+            isLandscape && isExpanded -> if (hasSaveChanges) 158.dp else 88.dp
+            hasSaveChanges -> 184.dp
             else -> 112.dp
         }
 
@@ -674,8 +1079,11 @@ fun ScreenTimeManagerScreen(
                         ScreenTab.Time -> UsagePolicySection(
                             settings = uiState.policyDraftSettings,
                             temporaryUnlockState = uiState.temporaryUnlockState,
+                            activeHardshipPolicyKeys = uiState.hardshipRuntimeState.activePolicyKeys,
+                            hardshipRuntimeState = uiState.hardshipRuntimeState,
                             installedApps = uiState.installedApps,
                             allowedAppPackages = uiState.allowedAppPackages,
+                            allRestrictionsExemptPackages = uiState.allRestrictionsExemptPackages,
                             text = text,
                             isExpanded = isExpanded,
                             contentMode = PolicyContentMode.TimeControls,
@@ -690,14 +1098,24 @@ fun ScreenTimeManagerScreen(
                             allowOnlyModeExpanded = uiState.allowOnlyModeExpanded,
                             onAllowOnlyModeExpandedChange = onAllowOnlyModeExpandedChange,
                             onPolicyDraftChanged = onPolicyDraftChanged,
+                            onStartHardshipConfigurationReflection = onStartHardshipConfigurationReflection,
+                            onHardshipPolicyDraftChanged = { nextSettings, adminPin ->
+                                onPolicyDraftChanged(nextSettings)
+                                policyAdminPin = adminPin
+                                showPolicySaveDialog = true
+                            },
                             onAllowedAppsChanged = onAllowedAppsChanged,
+                            onAllRestrictionsExemptAppsChanged = onAllRestrictionsExemptAppsChanged,
                         )
 
                         ScreenTab.Blocking -> UsagePolicySection(
                             settings = uiState.policyDraftSettings,
                             temporaryUnlockState = uiState.temporaryUnlockState,
+                            activeHardshipPolicyKeys = uiState.hardshipRuntimeState.activePolicyKeys,
+                            hardshipRuntimeState = uiState.hardshipRuntimeState,
                             installedApps = uiState.installedApps,
                             allowedAppPackages = uiState.allowedAppPackages,
+                            allRestrictionsExemptPackages = uiState.allRestrictionsExemptPackages,
                             text = text,
                             isExpanded = isExpanded,
                             contentMode = PolicyContentMode.BlockingControls,
@@ -712,7 +1130,14 @@ fun ScreenTimeManagerScreen(
                             allowOnlyModeExpanded = uiState.allowOnlyModeExpanded,
                             onAllowOnlyModeExpandedChange = onAllowOnlyModeExpandedChange,
                             onPolicyDraftChanged = onPolicyDraftChanged,
+                            onStartHardshipConfigurationReflection = onStartHardshipConfigurationReflection,
+                            onHardshipPolicyDraftChanged = { nextSettings, adminPin ->
+                                onPolicyDraftChanged(nextSettings)
+                                policyAdminPin = adminPin
+                                showPolicySaveDialog = true
+                            },
                             onAllowedAppsChanged = onAllowedAppsChanged,
+                            onAllRestrictionsExemptAppsChanged = onAllRestrictionsExemptAppsChanged,
                         )
 
                         ScreenTab.Stats -> StatisticsContent(
@@ -723,7 +1148,7 @@ fun ScreenTimeManagerScreen(
 
                         ScreenTab.Safety -> SafetyContent(
                             uiState = uiState,
-                            emergencyPin = emergencyPin,
+                            safeRecoveryAdminPin = safeRecoveryAdminPin,
                             text = text,
                             isExpanded = isExpanded,
                             onSafeModeChanged = onSafeModeChanged,
@@ -744,18 +1169,19 @@ fun ScreenTimeManagerScreen(
                                     ),
                                 )
                             },
-                            onPinChanged = { value ->
-                                emergencyPin = value
-                                onEmergencyPinChanged()
+                            onSafeRecoveryPinChanged = { value ->
+                                safeRecoveryAdminPin = value
+                                onSafeRecoveryPinChanged()
                             },
-                            onUnlockClick = {
-                                onEmergencyUnlock(emergencyPin)
-                                emergencyPin = ""
+                            onSafeRecoveryClick = {
+                                onSafeRecovery(safeRecoveryAdminPin)
+                                safeRecoveryAdminPin = ""
                             },
                         )
 
                         ScreenTab.Settings -> SettingsContent(
                             uiState = uiState,
+                            parentAccountAuthState = parentAccountAuthState,
                             text = text,
                             isExpanded = isExpanded,
                             onAppLanguageChanged = onAppLanguageChanged,
@@ -767,13 +1193,14 @@ fun ScreenTimeManagerScreen(
                             onOpenExactAlarmSettings = onOpenExactAlarmSettings,
                             onRequestNotificationPermission = onRequestNotificationPermission,
                             onUpdateAdminPin = onUpdateAdminPin,
-                            onUpdateEmergencyPin = onUpdateEmergencyPin,
                             onPinInputChanged = onPinInputChanged,
                             onPairParentAccount = onPairParentAccount,
                             onParentProfileNameChanged = onParentProfileNameChanged,
                             onParentDeviceRoleChanged = onParentDeviceRoleChanged,
                             onGenerateChildPairingCode = onGenerateChildPairingCode,
                             onRegisterChildPairingCode = onRegisterChildPairingCode,
+                            onParentGoogleSignIn = onParentGoogleSignIn,
+                            onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
                             onUnlinkParentAccount = onUnlinkParentAccount,
                             onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
                             onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
@@ -800,6 +1227,17 @@ fun ScreenTimeManagerScreen(
         }
 
         if (!isKeyboardVisible) {
+            if (hasSaveChanges) {
+                PendingPolicySaveBanner(
+                    text = text,
+                    onSaveClick = { showPolicySaveDialog = true },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(horizontal = 20.dp)
+                        .padding(bottom = if (isLandscape && isExpanded) 74.dp else 82.dp)
+                        .widthIn(max = 680.dp),
+                )
+            }
             BottomTabBar(
                 selectedTab = selectedTab,
                 text = text,
@@ -822,7 +1260,12 @@ fun ScreenTimeManagerScreen(
                 policySaveStatus = uiState.policySaveStatus,
                 hasPolicyChanges = hasSaveChanges,
                 budgetValidation = saveBudgetValidation,
-                onAdminPinChanged = { policyAdminPin = it },
+                onAdminPinChanged = { value ->
+                    policyAdminPin = value
+                    if (uiState.policySaveStatus == PolicySaveStatus.InvalidAdminPin) {
+                        onPolicySaveStatusSeen()
+                    }
+                },
                 onResetPolicyDraft = onResetPolicyDraft,
                 onResetParentManagementAction = { pendingParentManagementAction = null },
                 onDismiss = {
@@ -830,6 +1273,7 @@ fun ScreenTimeManagerScreen(
                     policyAdminPin = ""
                 },
                 onSave = {
+                    val savingPolicyDraft = uiState.policyDraftHasChanges
                     if (uiState.policyDraftHasChanges) {
                         onSaveUsagePolicy(policyAdminPin)
                     }
@@ -838,26 +1282,24 @@ fun ScreenTimeManagerScreen(
                             is ParentManagementPendingAction.ChangeRole -> {
                                 onParentDeviceRoleChanged(action.role, policyAdminPin)
                             }
-                            ParentManagementPendingAction.GenerateChildPairingCode -> {
-                                onGenerateChildPairingCode(policyAdminPin)
-                            }
-                            is ParentManagementPendingAction.RegisterChildDevice -> {
-                                onRegisterChildPairingCode(action.pairingCode, "", policyAdminPin)
-                            }
                             ParentManagementPendingAction.UnlinkParentAccount -> {
                                 onUnlinkParentAccount(policyAdminPin)
+                                pendingParentManagementAction = null
                             }
                             is ParentManagementPendingAction.UnlinkLinkedChild -> {
                                 onUnlinkLinkedChildDevice(action.childDeviceId, policyAdminPin)
+                                pendingParentManagementAction = null
                             }
                             is ParentManagementPendingAction.UnlinkLinkedParent -> {
                                 onUnlinkLinkedParentDevice(action.parentUid, policyAdminPin)
+                                pendingParentManagementAction = null
                             }
                         }
-                        pendingParentManagementAction = null
                     }
-                    policyAdminPin = ""
-                    showPolicySaveDialog = false
+                    if (!savingPolicyDraft) {
+                        policyAdminPin = ""
+                        showPolicySaveDialog = false
+                    }
                 },
             )
         }
@@ -980,21 +1422,6 @@ private fun PermissionSetupDialog(
                     actionLabel = text.allowPermission,
                     onClick = onRequestNotificationPermission,
                 )
-                PermissionSetupRow(
-                    title = text.notificationAccessPermission,
-                    ready = readiness.notificationAccessReady,
-                    readyLabel = text.ready,
-                    actionLabel = text.allowPermission,
-                    onClick = onOpenNotificationAccessSettings,
-                )
-                PermissionSetupRow(
-                    title = text.exactAlarmPermission,
-                    ready = readiness.exactAlarmReady,
-                    readyLabel = text.ready,
-                    actionLabel = text.allowPermission,
-                    onClick = onOpenExactAlarmSettings,
-                )
-
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.End,
@@ -1066,6 +1493,11 @@ fun PolicySaveDialog(
         hasBudgetOverflow -> LimitStatus.Exceeded
         policySaveStatus == PolicySaveStatus.InvalidAdminPin -> LimitStatus.Exceeded
         policySaveStatus == PolicySaveStatus.BudgetExceeded -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.PolicyConflict -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.HardshipLocked -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.HardshipReflectionRequired -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.HardshipReflectionWaiting -> LimitStatus.Warning
+        policySaveStatus == PolicySaveStatus.Saving -> LimitStatus.Warning
         hasPolicyChanges -> LimitStatus.Warning
         else -> LimitStatus.Normal
     }
@@ -1074,10 +1506,29 @@ fun PolicySaveDialog(
         policySaveStatus == PolicySaveStatus.Saved -> text.policySaved
         policySaveStatus == PolicySaveStatus.InvalidAdminPin -> text.invalidAdminPin
         policySaveStatus == PolicySaveStatus.BudgetExceeded -> text.policyBudgetExceeded
+        policySaveStatus == PolicySaveStatus.PolicyConflict -> if (text.appLanguage == AppLanguage.Korean) {
+            "설정 충돌을 확인해 주세요"
+        } else {
+            "Review setting conflicts"
+        }
+        policySaveStatus == PolicySaveStatus.HardshipLocked -> text.hardshipLockedLabel()
+        policySaveStatus == PolicySaveStatus.HardshipReflectionRequired ->
+            if (text.appLanguage == AppLanguage.Korean) "고행 종료 숙고를 먼저 시작하세요" else "Start hardship exit reflection first"
+        policySaveStatus == PolicySaveStatus.HardshipReflectionWaiting ->
+            if (text.appLanguage == AppLanguage.Korean) "고행 종료 숙고가 아직 끝나지 않았습니다" else "Hardship exit reflection is still active"
+        policySaveStatus == PolicySaveStatus.Saving -> text.savingChanges
         hasPolicyChanges -> text.unsavedChanges
         else -> text.policyUpToDate
     }
-    val canSave = adminPin.isNotBlank() && hasPolicyChanges && !hasBudgetOverflow
+    val canSave = adminPin.isNotBlank() &&
+        hasPolicyChanges &&
+        !hasBudgetOverflow &&
+        policySaveStatus != PolicySaveStatus.Saving &&
+        policySaveStatus != PolicySaveStatus.BudgetExceeded &&
+        policySaveStatus != PolicySaveStatus.PolicyConflict &&
+        policySaveStatus != PolicySaveStatus.HardshipLocked &&
+        policySaveStatus != PolicySaveStatus.HardshipReflectionRequired &&
+        policySaveStatus != PolicySaveStatus.HardshipReflectionWaiting
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -1099,6 +1550,23 @@ fun PolicySaveDialog(
                     StatusBadge(label = statusLabel, status = status)
                 }
 
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.34f),
+                    border = BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.18f),
+                    ),
+                ) {
+                    Text(
+                        text = text.saveInstructions,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
                 policyValidationMessage(budgetValidation, text)?.let { message ->
                     Surface(
                         shape = RoundedCornerShape(18.dp),
@@ -1110,6 +1578,24 @@ fun PolicySaveDialog(
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.SemiBold,
                             color = AppOver,
+                        )
+                    }
+                }
+                policyAdvisoryMessage(budgetValidation, text)?.let { message ->
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.12f),
+                        border = BorderStroke(
+                            1.dp,
+                            MaterialTheme.colorScheme.tertiary.copy(alpha = 0.34f),
+                        ),
+                    ) {
+                        Text(
+                            message,
+                            modifier = Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
                         )
                     }
                 }
@@ -1152,7 +1638,7 @@ fun PolicySaveDialog(
                             onResetParentManagementAction()
                             onDismiss()
                         },
-                        enabled = hasPolicyChanges,
+                        enabled = hasPolicyChanges && policySaveStatus != PolicySaveStatus.Saving,
                         shape = RoundedCornerShape(18.dp),
                         modifier = Modifier.weight(1f),
                     ) {
@@ -1181,7 +1667,7 @@ fun PolicySaveDialog(
                         .height(54.dp),
                 ) {
                     Text(
-                        text.savePolicy,
+                        if (policySaveStatus == PolicySaveStatus.Saving) text.savingChanges else text.savePolicy,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
@@ -1207,13 +1693,20 @@ fun SafetyAdminPinDialog(
     val focusManager = LocalFocusManager.current
     val status = when (safeModePinStatus) {
         SafeModePinStatus.Accepted -> LimitStatus.Normal
-        SafeModePinStatus.TooShort, SafeModePinStatus.InvalidAdminPin -> LimitStatus.Exceeded
+        SafeModePinStatus.TooShort,
+        SafeModePinStatus.InvalidAdminPin,
+        SafeModePinStatus.HardshipLocked -> LimitStatus.Exceeded
         SafeModePinStatus.Idle -> LimitStatus.Warning
     }
     val statusLabel = when (safeModePinStatus) {
         SafeModePinStatus.Accepted -> acceptedLabel
         SafeModePinStatus.TooShort -> text.pinTooShort
         SafeModePinStatus.InvalidAdminPin -> text.invalidAdminPin
+        SafeModePinStatus.HardshipLocked -> if (text.appLanguage == AppLanguage.Korean) {
+            "고행 3단계 적용 중 · 다음 날 해제 가능"
+        } else {
+            "Hardship level 3 active · available next day"
+        }
         SafeModePinStatus.Idle -> text.adminPin
     }
     val canConfirm = adminPin.isNotBlank()
@@ -1308,12 +1801,44 @@ private fun policyValidationMessage(
     if (!budgetValidation.hasOverflow) {
         return null
     }
+    if (budgetValidation.duplicateGroupPackageNames.isNotEmpty()) {
+        return if (text.appLanguage == AppLanguage.Korean) {
+            "같은 앱이 여러 앱 그룹에 포함되어 있습니다. 중복 앱 ${budgetValidation.duplicateGroupPackageNames.size}개를 한 그룹에만 남겨 주세요."
+        } else {
+            "${budgetValidation.duplicateGroupPackageNames.size} apps belong to multiple groups. Keep each app in one group."
+        }
+    }
+    if (budgetValidation.overlappingSchedulePairs.isNotEmpty()) {
+        val pairs = budgetValidation.overlappingSchedulePairs
+            .take(2)
+            .joinToString(", ") { (first, second) -> "$first ↔ $second" }
+        return if (text.appLanguage == AppLanguage.Korean) {
+            "스케줄 시간이 겹칩니다: $pairs. 겹치지 않도록 수정해야 저장할 수 있습니다."
+        } else {
+            "Schedule times overlap: $pairs. Adjust them before saving."
+        }
+    }
     if (budgetValidation.appGroupLimitConflictCount > 0) {
         return text.appGroupLimitConflict(budgetValidation.appGroupLimitConflictCount)
     }
     val overflowingDays = budgetValidation.overflowingDayIndexes
         .joinToString(", ") { index -> text.dayLabels.getOrElse(index) { "" } }
     return "${text.policyBudgetExceeded}: $overflowingDays - ${text.appLimits} ${formatLimitMinutesLabel(budgetValidation.appLimitTotalMinutes)}, ${text.appGroups} ${formatLimitMinutesLabel(budgetValidation.groupBudgetTotalMinutes)}"
+}
+
+private fun policyAdvisoryMessage(
+    validation: PolicyBudgetValidation,
+    text: AppStrings,
+): String? {
+    val affectedCount = (
+        validation.exemptAppLimitPackages + validation.exemptGroupPackages
+        ).size
+    if (affectedCount == 0) return null
+    return if (text.appLanguage == AppLanguage.Korean) {
+        "제한 없음 앱 ${affectedCount}개에는 설정된 앱별 또는 그룹 제한이 적용되지 않습니다. 의도한 설정인지 확인한 후 저장해 주세요."
+    } else {
+        "$affectedCount apps excluded from all restrictions also have app or group limits. Those limits will not apply."
+    }
 }
 
 @Composable
@@ -1360,6 +1885,56 @@ fun Header(
 }
 
 @Composable
+private fun PendingPolicySaveBanner(
+    text: AppStrings,
+    onSaveClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = AppOver.copy(alpha = 0.95f),
+        tonalElevation = 2.dp,
+        shadowElevation = 4.dp,
+        border = BorderStroke(1.dp, AppOver.copy(alpha = 0.70f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = text.unsavedChanges,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                )
+                Text(
+                    text = text.pendingChangesHint,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White.copy(alpha = 0.92f),
+                )
+            }
+            Button(
+                onClick = onSaveClick,
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color.White,
+                    contentColor = AppOver,
+                ),
+            ) {
+                Text(text.saveNow, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
 private fun BottomTabBar(
     selectedTab: ScreenTab,
     text: AppStrings,
@@ -1400,7 +1975,7 @@ private fun BottomTabBar(
                 hasPolicyChanges = hasPolicyChanges,
                 hasBudgetOverflow = budgetValidation.hasOverflow,
                 onClick = onRequestSavePolicy,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1.35f),
             )
         }
     }
@@ -1430,6 +2005,10 @@ private fun BottomSaveAction(
         hasBudgetOverflow -> LimitStatus.Exceeded
         policySaveStatus == PolicySaveStatus.InvalidAdminPin -> LimitStatus.Exceeded
         policySaveStatus == PolicySaveStatus.BudgetExceeded -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.PolicyConflict -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.HardshipLocked -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.HardshipReflectionRequired -> LimitStatus.Exceeded
+        policySaveStatus == PolicySaveStatus.HardshipReflectionWaiting -> LimitStatus.Warning
         hasPolicyChanges -> LimitStatus.Exceeded
         else -> LimitStatus.Normal
     }
@@ -1459,7 +2038,7 @@ private fun BottomSaveAction(
     }
     Surface(
         onClick = onClick,
-        modifier = modifier.height(56.dp),
+        modifier = modifier.height(60.dp),
         shape = RoundedCornerShape(14.dp),
         color = containerColor,
         border = BorderStroke(1.dp, borderColor),
@@ -1467,7 +2046,7 @@ private fun BottomSaveAction(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 10.dp),
+                .padding(horizontal = 4.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
@@ -1481,12 +2060,16 @@ private fun BottomSaveAction(
             }
             Spacer(modifier = Modifier.height(3.dp))
             Text(
-                text = text.savePolicy,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.Bold,
+                text = if (hasPolicyChanges) text.shortSaveLabel() else text.shortPolicyUpToDateLabel(),
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                ),
+                fontWeight = if (hasPolicyChanges || hasBudgetOverflow) FontWeight.Bold else FontWeight.SemiBold,
                 color = contentColor,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                maxLines = 2,
+                overflow = TextOverflow.Clip,
+                textAlign = TextAlign.Center,
             )
         }
     }
@@ -1518,7 +2101,10 @@ private fun BottomTabItem(
             Spacer(modifier = Modifier.height(3.dp))
             Text(
                 text = label,
-                style = MaterialTheme.typography.labelMedium,
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                ),
                 fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
                 color = contentColor,
                 maxLines = 1,
@@ -1801,7 +2387,7 @@ private fun StatisticsSummaryCard(
             AppRow(
                 appName = topApp.appName,
                 packageName = topApp.packageName,
-                supportingText = text.usedMinutes(topApp.totalTimeMillis.toDisplayMinutes()),
+                supportingText = "",
                 trailingContent = {
                     LimitTimeChip(formatDuration(topApp.totalTimeMillis))
                 },
@@ -1818,6 +2404,7 @@ private fun DailyTrendCard(
     text: AppStrings,
 ) {
     val hasDailyUsageData = dailyUsage.any { usage -> usage.totalTimeMillis > 0L }
+    val recordedDayCount = dailyUsage.count { usage -> usage.hasRecordedData }
     val maxUsageMillis = dailyUsage.maxOfOrNull { usage -> usage.totalTimeMillis }?.coerceAtLeast(1L) ?: 1L
     val listState = rememberLazyListState()
 
@@ -1834,7 +2421,7 @@ private fun DailyTrendCard(
         ) {
             SectionTitle(text.dailyTrend, Modifier.weight(1f))
             Text(
-                text.statsScrollHint,
+                text.recordedDaysLabel(recordedDayCount, dailyUsage.size),
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.Bold,
@@ -2037,29 +2624,26 @@ private fun GroupStatsCard(
                     status = groupSummary.status,
                     text = text,
                     extraMinutes = groupSummary.extraMinutes,
+                    limitEnabled = groupSummary.limitEnabled,
+                    limitTextOverride = if (groupSummary.activeToday) null else text.todayNotAppliedLabel(),
                 )
                 val topGroupApps = groupSummary.appUsages
                     .filter { appUsage -> appUsage.usedMinutes > 0 }
                     .sortedByDescending { appUsage -> appUsage.usedMinutes }
                     .take(3)
                 if (topGroupApps.isNotEmpty()) {
-                    Text(
-                        text.groupTopApps,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
                     topGroupApps.forEach { appUsage ->
                         AppRow(
                             appName = appUsage.appName,
                             packageName = appUsage.packageName,
-                            supportingText = buildString {
-                                append(text.usedMinutes(appUsage.usedMinutes))
-                                appUsage.limitMinutes?.let { limitMinutes ->
-                                    append(" / ")
-                                    append(formatLimitWithAllowance(limitMinutes, appUsage.extraMinutes, appUsage.unlockedForToday, text))
-                                }
-                            },
+                            supportingText = appUsage.limitMinutes?.let { limitMinutes ->
+                                formatLimitWithAllowance(
+                                    limitMinutes,
+                                    appUsage.extraMinutes,
+                                    appUsage.unlockedForToday,
+                                    text,
+                                )
+                            }.orEmpty(),
                             trailingContent = {
                                 LimitTimeChip(formatLimitMinutesLabel(appUsage.usedMinutes))
                             },
@@ -2112,7 +2696,7 @@ fun AdaptiveTwoPane(
 @Composable
 fun StatusCard(uiState: SafeModeUiState, text: AppStrings) {
     val summary = uiState.policySummary
-    val hasTotalLimit = summary.totalLimitMinutes > 0 && !summary.totalUnlockedForToday
+    val hasTotalLimit = summary.totalLimitEnabled && !summary.totalUnlockedForToday
     val effectiveTotalLimitMinutes = (summary.totalLimitMinutes + summary.totalExtraMinutes)
         .coerceAtLeast(summary.totalLimitMinutes)
     val overMinutes = if (!hasTotalLimit) {
@@ -2148,6 +2732,16 @@ fun StatusCard(uiState: SafeModeUiState, text: AppStrings) {
             )
             Spacer(modifier = Modifier.width(24.dp))
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "제한 적용 사용량"
+                    } else {
+                        "Usage counted toward limits"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
                         formatLimitMinutesLabel(summary.totalUsedMinutes),
@@ -2157,7 +2751,11 @@ fun StatusCard(uiState: SafeModeUiState, text: AppStrings) {
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        " / ${formatLimitWithAllowance(summary.totalLimitMinutes, summary.totalExtraMinutes, summary.totalUnlockedForToday, text)}",
+                        " / ${if (summary.totalLimitEnabled) {
+                            formatLimitWithAllowance(summary.totalLimitMinutes, summary.totalExtraMinutes, summary.totalUnlockedForToday, text)
+                        } else {
+                            text.noLimit
+                        }}",
                         style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -2165,13 +2763,30 @@ fun StatusCard(uiState: SafeModeUiState, text: AppStrings) {
                     )
                 }
                 Text(
-                    if (overMinutes > 0) "+${formatLimitMinutesLabel(overMinutes)} over limit" else text.limitStatus(summary.totalStatus),
+                    when {
+                        !summary.dailyPolicyEnabled -> text.scheduleInactiveNow
+                        overMinutes > 0 -> "+${formatLimitMinutesLabel(overMinutes)} over limit"
+                        else -> text.limitStatus(summary.totalStatus)
+                    },
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.Bold,
                     color = if (overMinutes > 0) AppOver else summary.totalStatus.semanticColor(),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                if (summary.actualTotalUsedMinutes != summary.totalUsedMinutes) {
+                    val excludedMinutes =
+                        (summary.actualTotalUsedMinutes - summary.totalUsedMinutes).coerceAtLeast(0)
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "오늘 전체 사용 ${formatLimitMinutesLabel(summary.actualTotalUsedMinutes)} · 제한 미적용 ${formatLimitMinutesLabel(excludedMinutes)}"
+                        } else {
+                            "All usage today ${formatLimitMinutesLabel(summary.actualTotalUsedMinutes)} · excluded ${formatLimitMinutesLabel(excludedMinutes)}"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     DotMetric(AppWarn, "${summary.warningCount} Warning")
                     DotMetric(AppOver, "${summary.exceededCount} Exceeded")
@@ -2187,7 +2802,11 @@ fun UsageProgressRing(
     limitMinutes: Int,
     status: LimitStatus,
 ) {
-    val rawProgress = if (limitMinutes <= 0) 0f else usedMinutes.toFloat() / limitMinutes.toFloat()
+    val rawProgress = if (limitMinutes <= 0) {
+        if (status == LimitStatus.Exceeded) 1f else 0f
+    } else {
+        usedMinutes.toFloat() / limitMinutes.toFloat()
+    }
     val animatedProgress by animateFloatAsState(
         targetValue = rawProgress.coerceIn(0f, 1.5f),
         animationSpec = tween(durationMillis = 600),
@@ -2300,24 +2919,32 @@ fun ProgressLine(
     text: AppStrings,
     extraMinutes: Int = 0,
     unlockedForToday: Boolean = false,
+    limitEnabled: Boolean = true,
+    limitTextOverride: String? = null,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "${formatLimitMinutesLabel(usedMinutes)} / ${formatLimitWithAllowance(limitMinutes, extraMinutes, unlockedForToday, text)}",
+                "${formatLimitMinutesLabel(usedMinutes)} / ${limitTextOverride ?: if (limitEnabled) {
+                    formatLimitWithAllowance(limitMinutes, extraMinutes, unlockedForToday, text)
+                } else {
+                    text.noLimit
+                }}",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        ProgressOnlyBar(
-            usedMinutes = usedMinutes,
-            limitMinutes = limitMinutes,
-            extraMinutes = extraMinutes,
-            unlockedForToday = unlockedForToday,
-            status = status,
-        )
+        if (limitEnabled) {
+            ProgressOnlyBar(
+                usedMinutes = usedMinutes,
+                limitMinutes = limitMinutes,
+                extraMinutes = extraMinutes,
+                unlockedForToday = unlockedForToday,
+                status = status,
+            )
+        }
     }
 }
 
@@ -2329,7 +2956,7 @@ fun formatLimitWithAllowance(
 ): String {
     return when {
         unlockedForToday -> text.unlockedToday
-        limitMinutes <= 0 -> text.noLimit
+        limitMinutes <= 0 -> text.zeroMinuteBlockLabel()
         extraMinutes > 0 -> "${formatLimitMinutesLabel(limitMinutes)}+${formatLimitMinutesLabel(extraMinutes)}"
         else -> formatLimitMinutesLabel(limitMinutes)
     }
@@ -2391,7 +3018,7 @@ fun LimitStatus.semanticColor(): Color {
 @Composable
 fun SafetyContent(
     uiState: SafeModeUiState,
-    emergencyPin: String,
+    safeRecoveryAdminPin: String,
     text: AppStrings,
     isExpanded: Boolean,
     onSafeModeChanged: (Boolean) -> Unit,
@@ -2400,11 +3027,12 @@ fun SafetyContent(
     onPolicyEnforcementChanged: (Boolean) -> Unit,
     onPolicyEnforcementDisableWithPin: (String) -> Unit,
     onOpenBlockScreenPreview: (BlockDecisionResult) -> Unit,
-    onPinChanged: (String) -> Unit,
-    onUnlockClick: () -> Unit,
+    onSafeRecoveryPinChanged: (String) -> Unit,
+    onSafeRecoveryClick: () -> Unit,
 ) {
     var pendingSafetyPinAction by remember { mutableStateOf<SafetyPinAction?>(null) }
     var safetyAdminPin by remember { mutableStateOf("") }
+    var diagnosticsExpanded by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(
         uiState.safeModeEnabled,
@@ -2475,19 +3103,14 @@ fun SafetyContent(
                             (
                                 uiState.blockingReadiness.usageAccessReady &&
                                     uiState.blockingReadiness.overlayPermissionReady &&
-                                    uiState.blockingReadiness.notificationPermissionReady &&
-                                    uiState.blockingReadiness.notificationAccessReady &&
-                                    uiState.blockingReadiness.exactAlarmReady
+                                    uiState.blockingReadiness.notificationPermissionReady
                                 )
                         ),
             )
         }
-        Text(
-            when (uiState.autoRecoveryStatus) {
-                AutoRecoveryStatus.Idle -> text.autoRecoveryReady
-                AutoRecoveryStatus.RecoveredToSafeMode -> text.autoRecoveryEnabledSafeMode
-            },
-        )
+        if (uiState.autoRecoveryStatus == AutoRecoveryStatus.RecoveredToSafeMode) {
+            Text(text.autoRecoveryEnabledSafeMode)
+        }
         }
 
         BlockingReadinessSection(
@@ -2500,58 +3123,84 @@ fun SafetyContent(
             text = text,
         )
 
-        MonitorStatusSection(
-            monitorStatus = uiState.usageMonitorStatus,
-            text = text,
-        )
+        OutlinedButton(
+            onClick = { diagnosticsExpanded = !diagnosticsExpanded },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                if (diagnosticsExpanded) {
+                    if (text.appLanguage == AppLanguage.Korean) "상세 진단 닫기" else "Hide diagnostics"
+                } else {
+                    if (text.appLanguage == AppLanguage.Korean) "상세 진단 보기" else "View diagnostics"
+                },
+            )
+        }
 
-        UsageConsistencySection(
-            monitorStatus = uiState.usageMonitorStatus,
-            todayUsage = uiState.todayUsage,
-            text = text,
-        )
+        if (diagnosticsExpanded) {
+            MonitorStatusSection(
+                monitorStatus = uiState.usageMonitorStatus,
+                text = text,
+            )
 
-        BlockSafetyStatusSection(
-            results = uiState.blockDecisionResults,
-            temporaryUnlockState = uiState.temporaryUnlockState,
-            policySummary = uiState.policySummary,
-            installedApps = uiState.installedApps,
-            text = text,
-        )
+            UsageConsistencySection(
+                monitorStatus = uiState.usageMonitorStatus,
+                todayUsage = uiState.todayUsage,
+                text = text,
+            )
 
-        DetectionStatusSection(
-            detectionStatus = uiState.foregroundDetectionStatus,
-            text = text,
-        )
+            BlockSafetyStatusSection(
+                results = uiState.blockDecisionResults,
+                temporaryUnlockState = uiState.temporaryUnlockState,
+                policySummary = uiState.policySummary,
+                installedApps = uiState.installedApps,
+                text = text,
+            )
 
-        BlockDecisionSimulationSection(
-            results = uiState.blockDecisionResults,
-            text = text,
-        )
+            DetectionStatusSection(
+                detectionStatus = uiState.foregroundDetectionStatus,
+                text = text,
+            )
 
-        BlockScreenPreviewSection(
-            results = uiState.blockDecisionResults,
-            text = text,
-            onOpenPreview = onOpenBlockScreenPreview,
-        )
+            BlockDecisionSimulationSection(
+                results = uiState.blockDecisionResults,
+                text = text,
+            )
+
+            BlockScreenPreviewSection(
+                results = uiState.blockDecisionResults,
+                text = text,
+                onOpenPreview = onOpenBlockScreenPreview,
+            )
+        }
     }
 
-    val emergencyUnlock: @Composable ColumnScope.() -> Unit = {
+    val safeRecovery: @Composable ColumnScope.() -> Unit = {
         SimpleCard {
-        SectionTitle(text.emergencyUnlock)
+        SectionTitle(if (text.appLanguage == AppLanguage.Korean) "안전 복구" else "Safe Recovery")
         SecurePinTextField(
-            value = emergencyPin,
-            onValueChange = onPinChanged,
-            label = text.developerPin,
+            value = safeRecoveryAdminPin,
+            onValueChange = onSafeRecoveryPinChanged,
+            label = text.adminPin,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
             modifier = Modifier.fillMaxWidth(),
         )
-        Button(onClick = onUnlockClick) { Text(text.unlock) }
+        Button(onClick = onSafeRecoveryClick) {
+            Text(if (text.appLanguage == AppLanguage.Korean) "안전 복구" else "Recover safely")
+        }
         Text(
-            when (uiState.emergencyUnlockStatus) {
-                EmergencyUnlockStatus.Idle -> text.offlinePinAvailable
-                EmergencyUnlockStatus.Unlocked -> text.safeModeEnabled
-                EmergencyUnlockStatus.InvalidPin -> text.invalidPin
+            when (uiState.safeRecoveryStatus) {
+                SafeRecoveryStatus.Idle -> if (text.appLanguage == AppLanguage.Korean) {
+                    "오작동 시 관리 PIN으로 Safe Mode를 켜고 정책 감시를 안전하게 중단합니다."
+                } else {
+                    "Use the Admin PIN to enter Safe Mode and stop enforcement when the app malfunctions."
+                }
+                SafeRecoveryStatus.Unlocked -> text.safeModeEnabled
+                SafeRecoveryStatus.InvalidPin -> text.invalidAdminPin
+                SafeRecoveryStatus.HardshipLocked -> if (text.appLanguage == AppLanguage.Korean) {
+                    "고행 3단계에서는 블록 화면의 Emergency Pass만 사용할 수 있습니다."
+                } else {
+                    "During hardship level 3, use Emergency Pass from the block screen."
+                }
             },
         )
         }
@@ -2560,7 +3209,7 @@ fun SafetyContent(
     AdaptiveTwoPane(
         isExpanded = isExpanded,
         leftContent = safetyCore,
-        rightContent = emergencyUnlock,
+        rightContent = safeRecovery,
     )
 
     pendingSafetyPinAction?.let { action ->
@@ -2608,6 +3257,7 @@ fun SafetyContent(
 @Composable
 fun SettingsContent(
     uiState: SafeModeUiState,
+    parentAccountAuthState: ParentAccountAuthState,
     text: AppStrings,
     isExpanded: Boolean,
     onAppLanguageChanged: (AppLanguage) -> Unit,
@@ -2619,13 +3269,14 @@ fun SettingsContent(
     onOpenExactAlarmSettings: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onUpdateAdminPin: (String, String) -> Unit,
-    onUpdateEmergencyPin: (String, String) -> Unit,
     onPinInputChanged: () -> Unit,
     onPairParentAccount: (String, String, String) -> Unit,
     onParentProfileNameChanged: (String) -> Unit,
     onParentDeviceRoleChanged: (ParentDeviceRole, String) -> Unit,
     onGenerateChildPairingCode: (String) -> Unit,
     onRegisterChildPairingCode: (String, String, String) -> Unit,
+    onParentGoogleSignIn: () -> Unit,
+    onDeleteAccountAndCloudData: (String) -> Unit,
     onUnlinkParentAccount: (String) -> Unit,
     onUnlinkLinkedChildDevice: (String, String) -> Unit,
     onUnlinkLinkedParentDevice: (String, String) -> Unit,
@@ -2648,9 +3299,6 @@ fun SettingsContent(
 ) {
     var currentAdminPin by remember { mutableStateOf("") }
     var newAdminPin by remember { mutableStateOf("") }
-    var currentEmergencyPin by remember { mutableStateOf("") }
-    var newEmergencyPin by remember { mutableStateOf("") }
-    var pinFeedbackTarget by remember { mutableStateOf<PinFeedbackTarget?>(null) }
 
     val preferences: @Composable ColumnScope.() -> Unit = {
         PermissionSettingsSection(
@@ -2665,7 +3313,6 @@ fun SettingsContent(
 
         CollapsiblePolicyCard(
             title = text.language,
-            description = text.language,
             icon = PolicySectionIcon.Language,
             expanded = uiState.settingsLanguageExpanded,
             onExpandedChange = onSettingsLanguageExpandedChange,
@@ -2687,7 +3334,6 @@ fun SettingsContent(
 
         CollapsiblePolicyCard(
             title = text.notificationSettings,
-            description = text.limitNotificationsDescription,
             icon = PolicySectionIcon.Notifications,
             expanded = uiState.settingsNotificationExpanded,
             onExpandedChange = onSettingsNotificationExpandedChange,
@@ -2695,13 +3341,11 @@ fun SettingsContent(
         ) {
             NotificationPreferenceRow(
                 title = text.warningNotifications,
-                description = text.warningNotificationsDescription,
                 checked = uiState.warningNotificationsEnabled,
                 onCheckedChange = onWarningNotificationsChanged,
             )
             NotificationPreferenceRow(
                 title = text.limitNotifications,
-                description = text.limitNotificationsDescription,
                 checked = uiState.limitNotificationsEnabled,
                 onCheckedChange = onLimitNotificationsChanged,
             )
@@ -2709,7 +3353,6 @@ fun SettingsContent(
 
         CollapsiblePolicyCard(
             title = text.pinSettings,
-            description = text.adminPinRole,
             icon = PolicySectionIcon.Pin,
             expanded = uiState.settingsPinExpanded,
             onExpandedChange = onSettingsPinExpandedChange,
@@ -2722,67 +3365,58 @@ fun SettingsContent(
                 newLabel = text.newAdminPin,
                 onCurrentChanged = {
                     currentAdminPin = it
-                    pinFeedbackTarget = null
                     onPinInputChanged()
                 },
                 onNewChanged = {
                     newAdminPin = it
-                    pinFeedbackTarget = null
                     onPinInputChanged()
                 },
                 onSave = {
-                    pinFeedbackTarget = PinFeedbackTarget.Admin
                     onUpdateAdminPin(currentAdminPin, newAdminPin)
                     currentAdminPin = ""
                     newAdminPin = ""
                 },
-                status = if (pinFeedbackTarget == PinFeedbackTarget.Admin) {
-                    uiState.pinChangeStatus
-                } else {
-                    PinChangeStatus.Idle
-                },
+                status = uiState.pinChangeStatus,
                 text = text,
             )
-            PinChangeFields(
-                currentPin = currentEmergencyPin,
-                newPin = newEmergencyPin,
-                currentLabel = text.currentEmergencyPin,
-                newLabel = text.newEmergencyPin,
-                onCurrentChanged = {
-                    currentEmergencyPin = it
-                    pinFeedbackTarget = null
-                    onPinInputChanged()
-                },
-                onNewChanged = {
-                    newEmergencyPin = it
-                    pinFeedbackTarget = null
-                    onPinInputChanged()
-                },
-                onSave = {
-                    pinFeedbackTarget = PinFeedbackTarget.Emergency
-                    onUpdateEmergencyPin(currentEmergencyPin, newEmergencyPin)
-                    currentEmergencyPin = ""
-                    newEmergencyPin = ""
-                },
-                status = if (pinFeedbackTarget == PinFeedbackTarget.Emergency) {
-                    uiState.pinChangeStatus
+            Text(
+                text = if (text.appLanguage == AppLanguage.Korean) {
+                    "관리 PIN은 설정 변경, 부모 연결, 허용된 차단 해제와 안전 복구에 사용됩니다. 고행 3단계는 PIN만으로 종료할 수 없습니다."
                 } else {
-                    PinChangeStatus.Idle
+                    "The Admin PIN confirms settings, pairing, allowed unlocks, and Safe Recovery. It cannot end active hardship level 3 by itself."
                 },
-                text = text,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
 
         CollapsiblePolicyCard(
             title = text.parentManagement,
-            description = text.parentManagementDescription,
             icon = PolicySectionIcon.ParentManagement,
             expanded = uiState.settingsParentManagementExpanded,
             onExpandedChange = onSettingsParentManagementExpandedChange,
             text = text,
+            headerTrailing = {
+                CompactStatusBadge(
+                    label = if (uiState.parentManagementState.paired) {
+                        text.parentLinked
+                    } else {
+                        text.parentNotLinked
+                    },
+                    status = if (uiState.parentManagementState.paired) {
+                        LimitStatus.Normal
+                    } else {
+                        LimitStatus.Warning
+                    },
+                )
+            },
         ) {
             ParentManagementSection(
                 parentState = uiState.parentManagementState,
+                parentAccountAuthState = parentAccountAuthState,
+                notificationState = uiState.parentNotificationState,
+                parentRequestNotificationReady = uiState.parentRequestNotificationReady,
+                parentRequestNotificationIssue = uiState.parentRequestNotificationIssue,
                 installedApps = uiState.installedApps,
                 policySummary = uiState.policySummary,
                 text = text,
@@ -2791,6 +3425,8 @@ fun SettingsContent(
                 onParentDeviceRoleChanged = onParentDeviceRoleChanged,
                 onGenerateChildPairingCode = onGenerateChildPairingCode,
                 onRegisterChildPairingCode = onRegisterChildPairingCode,
+                onParentGoogleSignIn = onParentGoogleSignIn,
+                onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
                 onUnlinkParentAccount = onUnlinkParentAccount,
                 onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
                 onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
@@ -2812,7 +3448,6 @@ fun SettingsContent(
     val logs: @Composable ColumnScope.() -> Unit = {
         CollapsiblePolicyCard(
             title = text.eventLog,
-            description = text.eventLog,
             icon = PolicySectionIcon.EventLog,
             expanded = uiState.settingsEventLogExpanded,
             onExpandedChange = onSettingsEventLogExpandedChange,
@@ -2851,9 +3486,7 @@ fun PermissionSettingsSection(
 ) {
     val permissionsReady = readiness.usageAccessReady &&
         readiness.overlayPermissionReady &&
-        readiness.notificationPermissionReady &&
-        readiness.notificationAccessReady &&
-        readiness.exactAlarmReady
+        readiness.notificationPermissionReady
     val statusColor = if (permissionsReady) AppSafe else AppOver
     val sectionBackground = if (permissionsReady) {
         AppSafe.copy(alpha = 0.08f)
@@ -2873,16 +3506,6 @@ fun PermissionSettingsSection(
         },
         if (!readiness.notificationPermissionReady) {
             PermissionActionItem(text.notificationPermission, onRequestNotificationPermission)
-        } else {
-            null
-        },
-        if (!readiness.notificationAccessReady) {
-            PermissionActionItem(text.notificationAccessPermission, onOpenNotificationAccessSettings)
-        } else {
-            null
-        },
-        if (!readiness.exactAlarmReady) {
-            PermissionActionItem(text.exactAlarmPermission, onOpenExactAlarmSettings)
         } else {
             null
         },
@@ -2919,12 +3542,13 @@ fun PermissionSettingsSection(
                     status = if (permissionsReady) LimitStatus.Normal else LimitStatus.Exceeded,
                 )
             }
-            Text(
-                if (permissionsReady) text.permissionSettingsComplete else text.permissionSettingsRequired,
-                style = MaterialTheme.typography.bodySmall,
-                color = if (permissionsReady) AppSafe else MaterialTheme.colorScheme.onSurfaceVariant,
-                fontWeight = if (permissionsReady) FontWeight.SemiBold else FontWeight.Normal,
-            )
+            if (!permissionsReady) {
+                Text(
+                    text.permissionSettingsRequired,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
 
             if (!permissionsReady) {
                 Surface(
@@ -3016,6 +3640,10 @@ private fun PermissionActionRow(
 @Composable
 fun ParentManagementSection(
     parentState: ParentManagementState,
+    parentAccountAuthState: ParentAccountAuthState,
+    notificationState: ParentNotificationState,
+    parentRequestNotificationReady: Boolean,
+    parentRequestNotificationIssue: String,
     installedApps: List<InstalledAppInfo>,
     policySummary: PolicySummary,
     text: AppStrings,
@@ -3024,6 +3652,8 @@ fun ParentManagementSection(
     onParentDeviceRoleChanged: (ParentDeviceRole, String) -> Unit,
     onGenerateChildPairingCode: (String) -> Unit,
     onRegisterChildPairingCode: (String, String, String) -> Unit,
+    onParentGoogleSignIn: () -> Unit,
+    onDeleteAccountAndCloudData: (String) -> Unit,
     onUnlinkParentAccount: (String) -> Unit,
     onUnlinkLinkedChildDevice: (String, String) -> Unit,
     onUnlinkLinkedParentDevice: (String, String) -> Unit,
@@ -3039,6 +3669,7 @@ fun ParentManagementSection(
     onRejectRemoteUnlockRequest: (String) -> Unit,
     wrapInCard: Boolean = true,
 ) {
+    val focusManager = LocalFocusManager.current
     var profileName by remember(parentState.localProfileName, parentState.deviceRole) {
         mutableStateOf(
             parentState.localProfileName.ifBlank {
@@ -3054,11 +3685,18 @@ fun ParentManagementSection(
     var profileSaveAcknowledged by rememberSaveable { mutableStateOf(false) }
     var selectedRoleDraft by remember { mutableStateOf(parentState.deviceRole) }
     var childPairingCodeInput by remember { mutableStateOf("") }
-    val roleContainerColor = when (parentState.deviceRole) {
+    var showGeneratePairingCodePinDialog by remember { mutableStateOf(false) }
+    var pairingCodePendingRegistration by remember { mutableStateOf("") }
+    var showDeleteAccountPinDialog by remember { mutableStateOf(false) }
+    val parentRoleConfirmed = parentState.deviceRole == ParentDeviceRole.Parent
+    val profileSavedVisible = parentState.localProfileName.isNotBlank() &&
+        profileName.trim() == parentState.localProfileName
+    val visibleRole = selectedRoleDraft
+    val roleContainerColor = when (visibleRole) {
         ParentDeviceRole.Child -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.18f)
         ParentDeviceRole.Parent -> AppSafe.copy(alpha = 0.12f)
     }
-    val roleBorderColor = when (parentState.deviceRole) {
+    val roleBorderColor = when (visibleRole) {
         ParentDeviceRole.Child -> MaterialTheme.colorScheme.primary.copy(alpha = 0.20f)
         ParentDeviceRole.Parent -> AppSafe.copy(alpha = 0.28f)
     }
@@ -3082,24 +3720,22 @@ fun ParentManagementSection(
         ) {
             profileSaveAcknowledged = true
             profileSaveRequested = false
+            focusManager.clearFocus(force = true)
         }
     }
 
     OptionalSimpleCard(wrapInCard = wrapInCard) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            SectionTitle(text.parentManagement, Modifier.weight(1f))
-            StatusBadge(
-                label = if (parentState.paired) text.parentLinked else text.parentNotLinked,
-                status = if (parentState.paired) LimitStatus.Normal else LimitStatus.Warning,
-            )
+        if (wrapInCard) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                SectionTitle(text.parentManagement, Modifier.weight(1f))
+                StatusBadge(
+                    label = if (parentState.paired) text.parentLinked else text.parentNotLinked,
+                    status = if (parentState.paired) LimitStatus.Normal else LimitStatus.Warning,
+                )
+            }
         }
-        Text(
-            text.parentManagementDescription,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
 
-        if (parentState.deviceRole == ParentDeviceRole.Parent) {
+        if (visibleRole == ParentDeviceRole.Parent) {
             RemoteUnlockRequestList(
                 requests = parentState.remoteUnlockRequests,
                 text = text,
@@ -3113,19 +3749,6 @@ fun ParentManagementSection(
                     onRejectRemoteUnlockRequest(request.id)
                 },
             )
-        }
-
-        Surface(
-            shape = RoundedCornerShape(18.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-        ) {
-            Column(
-                modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(text.adminPinRole, style = MaterialTheme.typography.bodyMedium)
-                Text(text.emergencyPinRole, style = MaterialTheme.typography.bodyMedium)
-            }
         }
 
         Surface(
@@ -3189,9 +3812,14 @@ fun ParentManagementSection(
                         modifier = Modifier.weight(1f),
                         singleLine = true,
                         shape = RoundedCornerShape(18.dp),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(
+                            onDone = { focusManager.clearFocus(force = true) },
+                        ),
                     )
                     Button(
                         onClick = {
+                            focusManager.clearFocus(force = true)
                             profileSaveRequested = true
                             profileSaveAcknowledged = false
                             onParentProfileNameChanged(profileName)
@@ -3201,38 +3829,29 @@ fun ParentManagementSection(
                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
                     ) {
                         Text(
-                            if (profileSaveAcknowledged) text.profileSaved else text.savePolicy,
+                            if (profileSaveAcknowledged || profileSavedVisible) text.profileSaved else text.savePolicy,
                             maxLines = 1,
                         )
                     }
                 }
-                if (profileSaveAcknowledged) {
+                if (profileSaveAcknowledged || profileSavedVisible) {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(16.dp),
                         color = AppSafe.copy(alpha = 0.12f),
                         border = BorderStroke(1.dp, AppSafe.copy(alpha = 0.26f)),
                     ) {
-                        Column(
+                        Text(
+                            text.profileSaved,
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                            verticalArrangement = Arrangement.spacedBy(2.dp),
-                        ) {
-                            Text(
-                                text.profileSaved,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = AppSafe,
-                                fontWeight = FontWeight.Bold,
-                            )
-                            Text(
-                                text.profileSyncHint,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = AppSafe,
+                            fontWeight = FontWeight.Bold,
+                        )
                     }
                 }
 
-                if (parentState.deviceRole == ParentDeviceRole.Child) {
+                if (visibleRole == ParentDeviceRole.Child) {
                     ParentLinkDetailRow(
                         text.childPairingCode,
                         parentState.pairingCode.ifBlank { "-" },
@@ -3246,23 +3865,92 @@ fun ParentManagementSection(
                             )
                         },
                     )
-                    Text(
-                        text.childPairingCodeHint,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
                     Button(
-                        onClick = {
-                            onPendingParentManagementActionChanged(
-                                ParentManagementPendingAction.GenerateChildPairingCode,
-                            )
-                        },
+                        onClick = { showGeneratePairingCodePinDialog = true },
                         shape = RoundedCornerShape(18.dp),
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text(text.generatePairingCode, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 } else {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        color = if (parentAccountAuthState.recoverable) {
+                            AppSafe.copy(alpha = 0.12f)
+                        } else {
+                            AppWarn.copy(alpha = 0.12f)
+                        },
+                        border = BorderStroke(
+                            1.dp,
+                            if (parentAccountAuthState.recoverable) {
+                                AppSafe.copy(alpha = 0.28f)
+                            } else {
+                                AppWarn.copy(alpha = 0.28f)
+                            },
+                        ),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = if (parentAccountAuthState.recoverable) {
+                                    if (text.appLanguage == AppLanguage.Korean) {
+                                        "부모 Google 계정 연결됨"
+                                    } else {
+                                        "Parent Google account connected"
+                                    }
+                                } else {
+                                    if (text.appLanguage == AppLanguage.Korean) {
+                                        "재설치 후에도 자녀 연결을 복구하려면 Google 로그인이 필요합니다."
+                                    } else {
+                                        "Google sign-in is required to restore child links after reinstalling."
+                                    }
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (parentAccountAuthState.recoverable) AppSafe else AppWarn,
+                            )
+                            if (parentAccountAuthState.recoverable) {
+                                Text(
+                                    text = parentAccountAuthState.email
+                                        .ifBlank { parentAccountAuthState.displayName }
+                                        .ifBlank { parentAccountAuthState.uid },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            } else {
+                                Button(
+                                    onClick = onParentGoogleSignIn,
+                                    enabled = parentRoleConfirmed && parentAccountAuthState.available,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(16.dp),
+                                ) {
+                                    Text(
+                                        if (text.appLanguage == AppLanguage.Korean) {
+                                            "Google 계정으로 로그인"
+                                        } else {
+                                            "Sign in with Google"
+                                        },
+                                    )
+                                }
+                                if (!parentRoleConfirmed) {
+                                    Text(
+                                        text = if (text.appLanguage == AppLanguage.Korean) {
+                                            "먼저 부모 기기 모드를 관리 PIN으로 저장해 주세요."
+                                        } else {
+                                            "Save parent device mode with the admin PIN first."
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
                     OutlinedTextField(
                         value = childPairingCodeInput,
                         onValueChange = { value ->
@@ -3287,11 +3975,10 @@ fun ParentManagementSection(
                     )
                     Button(
                         onClick = {
-                            onPendingParentManagementActionChanged(
-                                ParentManagementPendingAction.RegisterChildDevice("SR-$childPairingCodeInput"),
-                            )
+                            pairingCodePendingRegistration = "SR-$childPairingCodeInput"
                         },
-                        enabled = childPairingCodeInput.isNotBlank(),
+                        enabled = childPairingCodeInput.length == 6 &&
+                            parentAccountAuthState.recoverable && parentRoleConfirmed,
                         shape = RoundedCornerShape(18.dp),
                         modifier = Modifier.fillMaxWidth(),
                     ) {
@@ -3384,18 +4071,148 @@ fun ParentManagementSection(
             }
         }
 
+        OutlinedButton(
+            onClick = { showDeleteAccountPinDialog = true },
+            enabled = parentAccountAuthState.authenticated &&
+                (parentState.paired || parentAccountAuthState.recoverable),
+            shape = RoundedCornerShape(18.dp),
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.outlinedButtonColors(
+                contentColor = MaterialTheme.colorScheme.error,
+            ),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.45f)),
+        ) {
+            Text(
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "계정 및 클라우드 데이터 삭제"
+                } else {
+                    "Delete account and cloud data"
+                },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
         ParentLinkDetailRow(text.childDeviceId, parentState.childDeviceId.ifBlank { "-" })
         ParentLinkDetailRow(
             text.lastSync,
             if (parentState.lastSyncMillis > 0L) formatClockTime(parentState.lastSyncMillis) else "-",
         )
+        ParentLinkDetailRow(
+            if (text.appLanguage == AppLanguage.Korean) "요청 알림 상태" else "Request alerts",
+            if (parentRequestNotificationReady) {
+                if (text.appLanguage == AppLanguage.Korean) "사용 가능" else "Available"
+            } else {
+                text.parentNotificationIssueLabel(parentRequestNotificationIssue)
+            },
+        )
+        ParentLinkDetailRow(
+            if (text.appLanguage == AppLanguage.Korean) "마지막 요청 알림" else "Last request alert",
+            if (notificationState.lastSuccessMillis > 0L) {
+                formatClockTime(notificationState.lastSuccessMillis)
+            } else {
+                if (text.appLanguage == AppLanguage.Korean) "아직 없음" else "None yet"
+            },
+        )
+        if (!parentRequestNotificationReady && notificationState.lastError.isNotBlank()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f),
+                border = BorderStroke(
+                    1.dp,
+                    MaterialTheme.colorScheme.error.copy(alpha = 0.24f),
+                ),
+            ) {
+                Text(
+                    text = if (text.appLanguage == AppLanguage.Korean) {
+                        "최근 요청 알림 문제: ${text.parentNotificationIssueLabel(notificationState.lastError)}"
+                    } else {
+                        "Recent request alert issue: ${text.parentNotificationIssueLabel(notificationState.lastError)}"
+                    },
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+            }
+        }
+    }
+
+    if (showGeneratePairingCodePinDialog) {
+        AdminPinConfirmDialog(
+            title = text.generatePairingCode,
+            description = text.generatePairingCodePinInstruction(),
+            confirmLabel = text.generatePairingCode,
+            text = text,
+            onDismiss = { showGeneratePairingCodePinDialog = false },
+            onConfirm = { adminPin ->
+                showGeneratePairingCodePinDialog = false
+                onGenerateChildPairingCode(adminPin)
+            },
+        )
+    }
+    if (pairingCodePendingRegistration.isNotBlank()) {
+        AdminPinConfirmDialog(
+            title = text.registerChildDevice,
+            description = text.registerChildDevicePinInstruction(),
+            confirmLabel = text.registerChildDevice,
+            text = text,
+            onDismiss = { pairingCodePendingRegistration = "" },
+            onConfirm = { adminPin ->
+                val pairingCode = pairingCodePendingRegistration
+                pairingCodePendingRegistration = ""
+                onRegisterChildPairingCode(pairingCode, "", adminPin)
+            },
+        )
+    }
+    if (showDeleteAccountPinDialog) {
+        AdminPinConfirmDialog(
+            title = if (text.appLanguage == AppLanguage.Korean) {
+                "계정 및 클라우드 데이터 삭제"
+            } else {
+                "Delete account and cloud data"
+            },
+            description = if (text.appLanguage == AppLanguage.Korean) {
+                "이 기기의 Firebase 계정, 부모·자녀 연결, 요청, 명령과 알림 토큰을 삭제합니다. 삭제한 클라우드 데이터는 복구할 수 없습니다."
+            } else {
+                "This deletes the Firebase account, parent-child links, requests, commands, and notification tokens. Deleted cloud data cannot be restored."
+            },
+            confirmLabel = if (text.appLanguage == AppLanguage.Korean) "삭제" else "Delete",
+            text = text,
+            onDismiss = { showDeleteAccountPinDialog = false },
+            onConfirm = { adminPin ->
+                showDeleteAccountPinDialog = false
+                onDeleteAccountAndCloudData(adminPin)
+            },
+        )
+    }
+}
+
+private fun AppStrings.parentNotificationIssueLabel(issue: String): String {
+    val korean = appLanguage == AppLanguage.Korean
+    return when (issue.trim()) {
+        "notification permission denied" ->
+            if (korean) "알림 권한이 꺼져 있음" else "Notification permission is off"
+
+        "app notifications disabled" ->
+            if (korean) "앱 알림이 꺼져 있음" else "App notifications are off"
+
+        "parent request notification channel disabled" ->
+            if (korean) "부모 승인 요청 알림이 꺼져 있음" else "Parent request alerts are off"
+
+        "notification manager rejected the request" ->
+            if (korean) "알림 전송 실패" else "Notification delivery failed"
+
+        "notification readiness check failed" ->
+            if (korean) "알림 상태 확인 실패" else "Could not check notification status"
+
+        "" -> if (korean) "확인 필요" else "Needs attention"
+        else -> issue
     }
 }
 
 sealed class ParentManagementPendingAction {
     data class ChangeRole(val role: ParentDeviceRole) : ParentManagementPendingAction()
-    object GenerateChildPairingCode : ParentManagementPendingAction()
-    data class RegisterChildDevice(val pairingCode: String) : ParentManagementPendingAction()
     object UnlinkParentAccount : ParentManagementPendingAction()
     data class UnlinkLinkedChild(val childDeviceId: String) : ParentManagementPendingAction()
     data class UnlinkLinkedParent(val parentUid: String) : ParentManagementPendingAction()
@@ -3404,8 +4221,6 @@ sealed class ParentManagementPendingAction {
 private fun ParentManagementPendingAction.parentManagementActionTitle(text: AppStrings): String {
     return when (this) {
         is ParentManagementPendingAction.ChangeRole -> "${text.parentDeviceRole} ${text.savePolicy}"
-        ParentManagementPendingAction.GenerateChildPairingCode -> text.generatePairingCode
-        is ParentManagementPendingAction.RegisterChildDevice -> text.registerChildDevice
         ParentManagementPendingAction.UnlinkParentAccount,
         is ParentManagementPendingAction.UnlinkLinkedChild,
         is ParentManagementPendingAction.UnlinkLinkedParent -> text.unlinkParent
@@ -3566,21 +4381,26 @@ private fun RemoteUnlockRequestRow(
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier.weight(1f),
                     ) {
-                        Text(text.remoteAddTime, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(text.remoteAddTime, maxLines = 1)
                     }
                     OutlinedButton(
                         onClick = { onApproveUnlockToday(request) },
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier.weight(1f),
                     ) {
-                        Text(text.remoteUnlockToday, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(text.remoteUnlockToday, maxLines = 1)
                     }
-                    TextButton(
-                        onClick = { onReject(request) },
-                        modifier = Modifier.weight(0.72f),
-                    ) {
-                        Text(text.reject, maxLines = 1)
-                    }
+                }
+                OutlinedButton(
+                    onClick = { onReject(request) },
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.65f)),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) {
+                    Text(text.reject, maxLines = 1)
                 }
             }
         }
@@ -3789,7 +4609,6 @@ private fun CompactStatusBadge(label: String, status: LimitStatus) {
 @Composable
 fun NotificationPreferenceRow(
     title: String,
-    description: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
 ) {
@@ -3797,14 +4616,12 @@ fun NotificationPreferenceRow(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text(
-                description,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+        Text(
+            title,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
         Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
@@ -3813,6 +4630,7 @@ fun NotificationPreferenceRow(
 fun AlwaysAllowedAppsSection(
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    allRestrictionsExemptPackages: Set<String> = emptySet(),
     temporaryAllowedApps: List<TemporaryAllowedAppSummary> = emptyList(),
     text: AppStrings,
     onAllowedAppsChanged: (Set<String>) -> Unit,
@@ -3821,6 +4639,7 @@ fun AlwaysAllowedAppsSection(
         AlwaysAllowedAppsContent(
             installedApps = installedApps,
             allowedAppPackages = allowedAppPackages,
+            allRestrictionsExemptPackages = allRestrictionsExemptPackages,
             temporaryAllowedApps = temporaryAllowedApps,
             text = text,
             onAllowedAppsChanged = onAllowedAppsChanged,
@@ -3832,16 +4651,39 @@ fun AlwaysAllowedAppsSection(
 fun ColumnScope.AlwaysAllowedAppsContent(
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    allRestrictionsExemptPackages: Set<String> = emptySet(),
     temporaryAllowedApps: List<TemporaryAllowedAppSummary> = emptyList(),
     text: AppStrings,
     onAllowedAppsChanged: (Set<String>) -> Unit,
+    preventAdditions: Boolean = false,
+    appLimitMinutesByPackage: Map<String, Int> = emptyMap(),
+    appLimitActiveDaysByPackage: Map<String, Set<Int>> = emptyMap(),
 ) {
-    val userAllowedPackages = allowedAppPackages - SafetyGate.neverBlockPackages
+    val directlyUnrestrictedPackages =
+        allRestrictionsExemptPackages - SafetyGate.neverBlockPackages
+    val unrestrictedPackages =
+        SafetyGate.expandedUserAllowedPackages(directlyUnrestrictedPackages)
+    val userAllowedPackages =
+        (allowedAppPackages - SafetyGate.neverBlockPackages) - unrestrictedPackages
     val temporaryAllowanceByPackage = temporaryAllowedApps.associateBy { allowance -> allowance.packageName }
-    val effectiveUserAllowedPackages = userAllowedPackages + temporaryAllowanceByPackage.keys
+    val visibleInstalledPackages = installedApps
+        .map { app -> app.packageName }
+        .filterNot { packageName -> packageName in SafetyGate.neverBlockPackages }
+        .toSet()
+    val effectiveUserAllowedPackages = (
+        userAllowedPackages + temporaryAllowanceByPackage.keys + unrestrictedPackages
+    ) intersect visibleInstalledPackages
     var listsExpanded by remember { mutableStateOf(false) }
+    var appSearchQuery by remember { mutableStateOf("") }
     Row(verticalAlignment = Alignment.CenterVertically) {
-        SectionTitle(text.alwaysAllowedApps, Modifier.weight(1f))
+        SectionTitle(
+            if (text.appLanguage == AppLanguage.Korean) {
+                "허용앱만 모드의 허용 앱"
+            } else {
+                "Apps allowed in allow-only mode"
+            },
+            Modifier.weight(1f),
+        )
         StatusBadge(text.allowedAppCount(effectiveUserAllowedPackages.size), LimitStatus.Normal)
         Spacer(modifier = Modifier.width(8.dp))
         Surface(
@@ -3859,47 +4701,53 @@ fun ColumnScope.AlwaysAllowedAppsContent(
         }
     }
     Text(
-        text.alwaysAllowedDescription,
+        if (text.appLanguage == AppLanguage.Korean) {
+            "선택 앱과 제한 없음 앱이 실행됩니다. 시간 제한은 유지됩니다."
+        } else {
+            "Selected and unrestricted apps can open. Time limits still apply."
+        },
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+    if (preventAdditions) {
+        Text(
+            text = if (text.appLanguage == AppLanguage.Korean) {
+                "고행 모드 중에는 앱을 추가할 수 없습니다."
+            } else {
+                "Apps cannot be added while hardship mode is active."
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = AppOver,
+        )
+    }
 
     if (!listsExpanded) {
         return
     }
 
     Text(
-        text.requiredAllowedApps,
+        if (text.appLanguage == AppLanguage.Korean) "실행 허용 앱" else "Allowed to open",
         style = MaterialTheme.typography.titleMedium,
         fontWeight = FontWeight.Bold,
     )
-    val requiredPackageNames = remember {
-        SafetyGate.neverBlockPackages.sorted()
-    }
-    ContainedLazyColumn(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 220.dp),
-        resetKey = requiredPackageNames,
+    SearchBox(
+        value = appSearchQuery,
+        placeholder = text.searchApps,
+        onValueChange = { query -> appSearchQuery = query },
+    )
+    val sortedApps = remember(
+        installedApps,
+        appSearchQuery,
+        effectiveUserAllowedPackages,
     ) {
-        items(requiredPackageNames, key = { packageName -> packageName }) { packageName ->
-            RequiredAllowedPackageRow(packageName = packageName)
-        }
-    }
-
-    Text(
-        text.userAllowedApps,
-        style = MaterialTheme.typography.titleMedium,
-        fontWeight = FontWeight.Bold,
-    )
-    val sortedApps = remember(installedApps, userAllowedPackages, temporaryAllowanceByPackage) {
         installedApps
             .filterNot { app -> app.packageName in SafetyGate.neverBlockPackages }
+            .filter { app -> app.matchesAppSearch(appSearchQuery) }
             .sortedWith(
-                compareByDescending<InstalledAppInfo> { app -> app.packageName in userAllowedPackages }
-                    .thenByDescending { app -> app.packageName in temporaryAllowanceByPackage }
-                    .thenByDescending { app -> app.packageName in SafetyGate.communicationAppPackages }
-                    .thenBy { app -> app.appName.lowercase() },
+                compareByDescending<InstalledAppInfo> { app ->
+                    app.packageName in effectiveUserAllowedPackages
+                }.thenBy { app -> app.appName.lowercase() },
             )
     }
     if (sortedApps.isEmpty()) {
@@ -3909,30 +4757,56 @@ fun ColumnScope.AlwaysAllowedAppsContent(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(max = 360.dp),
-            resetKey = sortedApps.map { app -> app.packageName } +
-                userAllowedPackages.sorted() + temporaryAllowanceByPackage.keys.sorted(),
+            resetKey = appSearchQuery,
         ) {
             items(sortedApps, key = { app -> app.packageName }) { app ->
+                val unrestricted = app.packageName in unrestrictedPackages
+                val directlyUnrestricted = app.packageName in directlyUnrestrictedPackages
+                val linkedFamily = SafetyGate.linkedAppFamily(
+                    targetPackageName = app.packageName,
+                    directlyAllowedPackages = directlyUnrestrictedPackages,
+                )
                 val permanentlyAllowed = app.packageName in userAllowedPackages
                 val temporaryAllowance = temporaryAllowanceByPackage[app.packageName]
-                val selected = permanentlyAllowed || temporaryAllowance != null
+                val selected = unrestricted || permanentlyAllowed || temporaryAllowance != null
                 UserAllowedAppRow(
                     app = app,
                     selected = selected,
                     text = text,
-                    enabled = temporaryAllowance == null,
+                    enabled = !unrestricted &&
+                        temporaryAllowance == null &&
+                        (!preventAdditions || permanentlyAllowed),
                     statusLabel = when {
-                        permanentlyAllowed -> text.allowed
+                        directlyUnrestricted -> if (text.appLanguage == AppLanguage.Korean) {
+                            "제한 없음"
+                        } else {
+                            "Unrestricted"
+                        }
+                        linkedFamily != null -> linkedUnrestrictedLabel(linkedFamily, text)
+                        permanentlyAllowed -> appLimitMinutesByPackage[app.packageName]
+                            ?.let { minutes ->
+                                val limitLabel = if (minutes == 0) {
+                                    text.zeroMinuteBlockLabel()
+                                } else {
+                                    formatLimitMinutesLabel(minutes)
+                                }
+                                val days = appLimitActiveDaysByPackage[app.packageName]
+                                    ?: (1..7).toSet()
+                                "${text.allowed} · $limitLabel · ${scheduleDaysSummary(days, text)}"
+                            }
+                            ?: text.allowed
                         temporaryAllowance != null -> temporaryAllowanceStatusLabel(temporaryAllowance, text)
                         else -> text.allow
                     },
                     onToggle = {
-                        val nextPackages = if (permanentlyAllowed) {
-                            userAllowedPackages - app.packageName
-                        } else {
-                            userAllowedPackages + app.packageName
+                        if (!unrestricted) {
+                            val nextPackages = if (permanentlyAllowed) {
+                                userAllowedPackages - app.packageName
+                            } else {
+                                userAllowedPackages + app.packageName
+                            }
+                            onAllowedAppsChanged(nextPackages)
                         }
-                        onAllowedAppsChanged(nextPackages)
                     },
                 )
             }
@@ -3941,40 +4815,297 @@ fun ColumnScope.AlwaysAllowedAppsContent(
 }
 
 @Composable
-private fun RequiredAllowedPackageRow(packageName: String) {
-    val context = LocalContext.current
-    val appName = remember(packageName) {
-        runCatching {
-            val packageManager = context.packageManager
-            val applicationInfo = packageManager.getApplicationInfo(packageName, 0)
-            packageManager.getApplicationLabel(applicationInfo).toString()
-        }.getOrDefault(packageName)
+private fun PolicyExceptionAppsCard(
+    settings: UsagePolicySettings,
+    installedApps: List<InstalledAppInfo>,
+    exemptPackages: Set<String>,
+    activeHardshipPolicyKeys: Set<HardshipPolicyKey>,
+    text: AppStrings,
+    onExemptPackagesChanged: (Set<String>) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    var pendingAddition by remember { mutableStateOf<InstalledAppInfo?>(null) }
+    var appSearchQuery by remember { mutableStateOf("") }
+    val cleanExemptPackages = exemptPackages - SafetyGate.neverBlockPackages
+    val effectiveExemptPackages = SafetyGate.expandedUserAllowedPackages(cleanExemptPackages)
+    val effectiveVisibleExemptCount = installedApps.count { app ->
+        app.packageName in effectiveExemptPackages &&
+            app.packageName !in SafetyGate.neverBlockPackages
     }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 7.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        AppIcon(packageName = packageName, contentDescription = appName, size = 34.dp)
-        Spacer(modifier = Modifier.width(12.dp))
-        Column(modifier = Modifier.weight(1f)) {
+    val additionsLocked = activeHardshipPolicyKeys.any { key ->
+        settings.hardshipLevelFor(key) == HardshipLevel.Level3
+    }
+    val conflictingLimitedPackages = remember(settings, cleanExemptPackages) {
+        val expandedExemptPackages =
+            SafetyGate.expandedUserAllowedPackages(cleanExemptPackages)
+        val limitedByApp = settings.appLimitMap().keys
+        val limitedByGroup = settings.normalizedAppGroups()
+            .flatMap { group -> group.packageNames }
+            .toSet()
+        expandedExemptPackages intersect (limitedByApp + limitedByGroup)
+    }
+
+    SimpleCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
             Text(
-                appName,
+                if (text.appLanguage == AppLanguage.Korean) "제한 없는 앱" else "Unrestricted apps",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            StatusBadge(
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "제한 없음 $effectiveVisibleExemptCount"
+                } else {
+                    "$effectiveVisibleExemptCount unrestricted"
+                },
+                LimitStatus.Normal,
+            )
+            OutlinedButton(onClick = { expanded = !expanded }) {
+                Text(if (expanded) text.collapseSection else text.expandSection)
+            }
+        }
+
+        if (expanded) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.36f),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (text.appLanguage == AppLanguage.Korean) "시스템 자동 허용" else "Automatically allowed",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        StatusBadge(
+                            if (text.appLanguage == AppLanguage.Korean) "자동 관리" else "Managed",
+                            LimitStatus.Normal,
+                        )
+                    }
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "설정·키보드·사진 선택 등 차단하면 안 되는 시스템 기능"
+                        } else {
+                            "Settings, keyboard, photo picker, and other required system functions"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            Text(
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "전화·메시지·갤러리·카메라를 제한 없이 사용하면 필요한 보조 앱도 ‘연동 제한 없음’으로 표시됩니다. 대표 앱을 해제하면 연동 허용도 함께 해제됩니다."
+                } else {
+                    "Phone, Messages, Gallery, and Camera companion apps are marked as linked unrestricted. Removing the main app removes its linked allowance too."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Text(
+                if (text.appLanguage == AppLanguage.Korean) "제한 없음 앱" else "Excluded from all restrictions",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
             Text(
-                packageName,
-                style = MaterialTheme.typography.bodySmall,
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "모든 차단 제외 · 통계에는 기록"
+                } else {
+                    "Bypasses all blocking · remains in statistics"
+                },
+                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
+            if (additionsLocked) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = AppOver.copy(alpha = 0.10f),
+                    border = BorderStroke(1.dp, AppOver.copy(alpha = 0.32f)),
+                ) {
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "고행 3단계 중에는 앱을 추가할 수 없습니다."
+                        } else {
+                            "Apps cannot be added during hardship level 3."
+                        },
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AppOver,
+                    )
+                }
+            }
+            if (conflictingLimitedPackages.isNotEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.38f)),
+                ) {
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "제한 없음 ${conflictingLimitedPackages.size}개 · 앱별·그룹 제한 미적용"
+                        } else {
+                            "${conflictingLimitedPackages.size} unrestricted · app and group limits ignored"
+                        },
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                }
+            }
+
+            SearchBox(
+                value = appSearchQuery,
+                placeholder = if (text.appLanguage == AppLanguage.Korean) {
+                    "제한 없는 앱 검색"
+                } else {
+                    "Search exception apps"
+                },
+                onValueChange = { query -> appSearchQuery = query },
+            )
+            val selectableApps = remember(installedApps, appSearchQuery) {
+                installedApps
+                    .filterNot { app -> app.packageName in SafetyGate.neverBlockPackages }
+                    .filter { app -> app.matchesAppSearch(appSearchQuery) }
+                    .sortedBy { app -> app.appName.lowercase() }
+            }
+            if (selectableApps.isEmpty()) {
+                Text(
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "검색 결과가 없습니다."
+                    } else {
+                        "No apps match your search."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                ContainedLazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp),
+                    resetKey = appSearchQuery to selectableApps.map { app -> app.packageName },
+                ) {
+                    items(selectableApps, key = { app -> app.packageName }) { app ->
+                        val directlySelected = app.packageName in cleanExemptPackages
+                        val linkedFamily = SafetyGate.linkedAppFamily(
+                            targetPackageName = app.packageName,
+                            directlyAllowedPackages = cleanExemptPackages,
+                        )
+                        val selected = app.packageName in effectiveExemptPackages
+                        UserAllowedAppRow(
+                            app = app,
+                            selected = selected,
+                            text = text,
+                            enabled = linkedFamily == null && (directlySelected || !additionsLocked),
+                            statusLabel = when {
+                                directlySelected && text.appLanguage == AppLanguage.Korean -> "제한 없음"
+                                directlySelected -> "Unrestricted"
+                                linkedFamily != null -> linkedUnrestrictedLabel(linkedFamily, text)
+                                else -> text.allow
+                            },
+                            onToggle = {
+                                if (directlySelected) {
+                                    onExemptPackagesChanged(cleanExemptPackages - app.packageName)
+                                } else {
+                                    pendingAddition = app
+                                }
+                            },
+                        )
+                    }
+                }
+            }
         }
-        StatusBadge("LOCK", LimitStatus.Normal)
+    }
+
+    pendingAddition?.let { app ->
+        Dialog(onDismissRequest = { pendingAddition = null }) {
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface,
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "이 앱을 제한 없이 사용할까요?"
+                        } else {
+                            "Exclude from all restrictions?"
+                        },
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "${app.appName}은 요일별·앱 그룹·앱별·스케줄·허용앱만 제한과 고행 차단을 모두 우회합니다. 사용 기록은 통계에 계속 표시됩니다."
+                        } else {
+                            "${app.appName} will bypass daily, group, app, schedule, allow-only, and hardship blocking. Its usage will remain visible in statistics."
+                        },
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = { pendingAddition = null },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text(text.cancel)
+                        }
+                        Button(
+                            onClick = {
+                                onExemptPackagesChanged(cleanExemptPackages + app.packageName)
+                                pendingAddition = null
+                            },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(containerColor = AppOver),
+                        ) {
+                            Text(
+                                if (text.appLanguage == AppLanguage.Korean) {
+                                    "제한 없이 사용"
+                                } else {
+                                    "Add exemption"
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun linkedUnrestrictedLabel(family: LinkedAppFamily, text: AppStrings): String {
+    return if (text.appLanguage == AppLanguage.Korean) {
+        when (family) {
+            LinkedAppFamily.Phone -> "전화 연동 · 제한 없음"
+            LinkedAppFamily.Messaging -> "메시지 연동 · 제한 없음"
+            LinkedAppFamily.Gallery -> "갤러리 연동 · 제한 없음"
+            LinkedAppFamily.Camera -> "카메라 연동 · 제한 없음"
+        }
+    } else {
+        when (family) {
+            LinkedAppFamily.Phone -> "Linked to Phone · Unrestricted"
+            LinkedAppFamily.Messaging -> "Linked to Messages · Unrestricted"
+            LinkedAppFamily.Gallery -> "Linked to Gallery · Unrestricted"
+            LinkedAppFamily.Camera -> "Linked to Camera · Unrestricted"
+        }
     }
 }
 
@@ -4127,11 +5258,6 @@ fun PinVisibilityToggleButton(
     }
 }
 
-private enum class PinFeedbackTarget {
-    Admin,
-    Emergency,
-}
-
 @Composable
 fun PinChangeFields(
     currentPin: String,
@@ -4260,8 +5386,6 @@ fun BlockingReadinessSection(
         ReadinessRow(text.usageAccessReady, readiness.usageAccessReady)
         ReadinessRow(text.overlayPermission, readiness.overlayPermissionReady)
         ReadinessRow(text.notificationPermission, readiness.notificationPermissionReady)
-        ReadinessRow(text.notificationAccessPermission, readiness.notificationAccessReady)
-        ReadinessRow(text.exactAlarmPermission, readiness.exactAlarmReady)
         ReadinessRow(text.whitelistReady, readiness.whitelistReady)
         ReadinessRow(text.emergencyUnlockReady, readiness.emergencyUnlockReady)
     }
@@ -4316,8 +5440,6 @@ fun SystemHealthStatusSection(
         ReadinessRow(text.usageAccessReady, healthStatus.usageAccessReady)
         ReadinessRow(text.overlayPermission, healthStatus.overlayPermissionReady)
         ReadinessRow(text.notificationPermission, healthStatus.notificationPermissionReady)
-        ReadinessRow(text.notificationAccessPermission, healthStatus.notificationAccessReady)
-        ReadinessRow(text.exactAlarmPermission, healthStatus.exactAlarmReady)
         ReadinessRow(text.foregroundServiceHealth, !healthStatus.foregroundServiceExpected || (healthStatus.foregroundServiceRunning && healthStatus.foregroundServiceFresh))
         SafetyStatusRow(
             title = text.systemHealthIssue,
@@ -4956,13 +6078,26 @@ fun UsageStatsSection(
             }
         }
 
-        if (todayUsage.isNotEmpty()) {
+        if (usageAccessChecking && hasUsageAccess) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(96.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text.usageAccessChecking,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        } else if (todayUsage.isNotEmpty()) {
             val topUsage = todayUsage.first()
             val remainingUsage = todayUsage.drop(1)
             val totalUsageMillis = todayUsage.sumOf { appUsage -> appUsage.totalTimeMillis }.coerceAtLeast(1L)
             TodayUsageHero(
                 appUsage = topUsage,
-                text = text,
                 totalUsageMillis = totalUsageMillis,
                 status = policySummary.statusForPackage(topUsage.packageName),
             )
@@ -4992,13 +6127,6 @@ fun UsageStatsSection(
             }
         } else if (!hasUsageAccess) {
             Text(text.usageAccessRequired)
-            Text(
-                text.permissionSettingsInSettings,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else if (usageAccessChecking) {
-            Text(text.usageAccessChecking, color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else if (todayUsage.isEmpty()) {
             Text(text.noUsageRecorded)
         }
@@ -5016,7 +6144,6 @@ private fun usageLastUpdatedLabel(lastUpdatedAtMillis: Long, text: AppStrings): 
 @Composable
 fun TodayUsageHero(
     appUsage: AppUsageInfo,
-    text: AppStrings,
     totalUsageMillis: Long,
     status: LimitStatus,
 ) {
@@ -5037,7 +6164,6 @@ fun TodayUsageHero(
                 Spacer(modifier = Modifier.width(18.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(appUsage.appName, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("Most used today", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Text(
                     formatDuration(appUsage.totalTimeMillis),
@@ -5097,6 +6223,8 @@ fun MiniUsageBar(
 }
 
 fun PolicySummary.statusForPackage(packageName: String): LimitStatus {
+    effectiveAppSummaries.firstOrNull { summary -> summary.packageName == packageName }
+        ?.let { summary -> return summary.status }
     val appStatus = appLimitSummaries.firstOrNull { summary -> summary.packageName == packageName }?.status
     if (appStatus != null) {
         return appStatus
@@ -5112,49 +6240,68 @@ fun PolicySummary.statusForPackage(packageName: String): LimitStatus {
 @Composable
 fun PolicySummarySection(summary: PolicySummary, text: AppStrings) {
     var selectedGroupSummary by remember { mutableStateOf<AppGroupSummary?>(null) }
+    var showPolicyDetails by remember { mutableStateOf(false) }
     SimpleCard {
         SectionTitle(text.policySummary)
-        if (summary.allowOnlyModeEnabled) {
-            AllowOnlyPolicySummaryLine(summary = summary, text = text)
+        CompactPolicyOverview(summary = summary, text = text)
+        EffectiveAppResultsSection(summary = summary, text = text)
+        OutlinedButton(
+            onClick = { showPolicyDetails = !showPolicyDetails },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                if (showPolicyDetails) {
+                    if (text.appLanguage == AppLanguage.Korean) "정책 상세 닫기" else "Hide policy details"
+                } else {
+                    if (text.appLanguage == AppLanguage.Korean) "정책 상세 보기" else "View policy details"
+                },
+            )
         }
-        if (summary.scheduleSummaries.isNotEmpty()) {
-            Text(text.scheduleBlocking, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            summary.scheduleSummaries.forEach { scheduleSummary ->
-                val isActive = summary.activeScheduleSummary?.id == scheduleSummary.id
-                val isNext = summary.nextScheduleSummary?.id == scheduleSummary.id
-                SchedulePolicySummaryLine(
-                    summary = scheduleSummary,
-                    temporaryAllowedApps = summary.temporaryAllowedApps,
-                    text = text,
-                    status = when {
-                        isActive -> LimitStatus.Exceeded
-                        isNext -> LimitStatus.Warning
-                        else -> LimitStatus.Normal
-                    },
-                    label = when {
-                        isActive -> text.activeSchedule
-                        isNext -> text.nextSchedule
-                        else -> text.scheduleTemplate
-                    },
-                )
+        if (showPolicyDetails) {
+            HardshipPolicySummary(summary = summary, text = text)
+            EffectiveAccessScopeSummary(summary = summary, text = text)
+            if (summary.allowOnlyModeEnabled) {
+                AllowOnlyPolicySummaryLine(summary = summary, text = text)
             }
-        }
-        if (summary.groupSummaries.isNotEmpty()) {
-            Text(text.appGroups, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            summary.groupSummaries.forEach { groupSummary ->
-                PolicyGroupSummaryLine(
-                    summary = groupSummary,
-                    text = text,
-                    onClick = { selectedGroupSummary = groupSummary },
-                )
+            if (summary.scheduleSummaries.isNotEmpty()) {
+                Text(text.scheduleBlocking, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                summary.scheduleSummaries.forEach { scheduleSummary ->
+                    val isActive = summary.activeScheduleSummary?.id == scheduleSummary.id
+                    val isNext = summary.nextScheduleSummary?.id == scheduleSummary.id
+                    SchedulePolicySummaryLine(
+                        summary = scheduleSummary,
+                        temporaryAllowedApps = summary.temporaryAllowedApps,
+                        text = text,
+                        status = when {
+                            isActive -> LimitStatus.Exceeded
+                            isNext -> LimitStatus.Warning
+                            else -> LimitStatus.Normal
+                        },
+                        label = when {
+                            isActive -> text.activeSchedule
+                            isNext -> text.nextSchedule
+                            else -> text.scheduleTemplate
+                        },
+                    )
+                }
             }
-        }
-        if (summary.appLimitSummaries.isEmpty()) {
-            Text(text.noAppLimits, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else {
-            Text(text.appLimits, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            summary.appLimitSummaries.forEach { appSummary ->
-                PolicyAppSummaryLine(appSummary, text)
+            if (summary.groupSummaries.isNotEmpty()) {
+                Text(text.appGroups, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                summary.groupSummaries.forEach { groupSummary ->
+                    PolicyGroupSummaryLine(
+                        summary = groupSummary,
+                        text = text,
+                        onClick = { selectedGroupSummary = groupSummary },
+                    )
+                }
+            }
+            if (summary.appLimitSummaries.isEmpty()) {
+                Text(text.noAppLimits, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Text(text.appLimits, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                summary.appLimitSummaries.forEach { appSummary ->
+                    PolicyAppSummaryLine(appSummary, text)
+                }
             }
         }
     }
@@ -5164,6 +6311,689 @@ fun PolicySummarySection(summary: PolicySummary, text: AppStrings) {
             text = text,
             onDismiss = { selectedGroupSummary = null },
         )
+    }
+}
+
+@Composable
+private fun CompactPolicyOverview(
+    summary: PolicySummary,
+    text: AppStrings,
+) {
+    val currentMode = when {
+        summary.activeScheduleSummary != null -> summary.activeScheduleSummary.name
+        summary.allowOnlyModeEnabled ->
+            if (text.appLanguage == AppLanguage.Korean) "허용앱만" else "Allow-only"
+        else ->
+            if (text.appLanguage == AppLanguage.Korean) "일반" else "Normal"
+    }
+    val modeType = when {
+        summary.activeScheduleSummary != null ->
+            if (text.appLanguage == AppLanguage.Korean) "스케줄" else "Schedule"
+        summary.allowOnlyModeEnabled ->
+            if (text.appLanguage == AppLanguage.Korean) "실행 범위" else "Access"
+        else ->
+            if (text.appLanguage == AppLanguage.Korean) "현재 상태" else "Current"
+    }
+    val timeLimitCount =
+        (if (summary.dailyPolicyEnabled && summary.totalLimitEnabled) 1 else 0) +
+            summary.groupSummaries.count { group -> group.limitConfigured } +
+            summary.appLimitSummaries.size
+    val summaryLine = if (text.appLanguage == AppLanguage.Korean) {
+        "시간 제한 $timeLimitCount · 제한 없음 ${summary.allRestrictionsExemptAppCount} · 고행 ${summary.hardshipItems.size}"
+    } else {
+        "Time limits $timeLimitCount · Unrestricted ${summary.allRestrictionsExemptAppCount} · Hardship ${summary.hardshipItems.size}"
+    }
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.38f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.20f)),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    currentMode,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    summaryLine,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (
+                    summary.activeScheduleSummary != null &&
+                    summary.allowOnlyModeEnabled
+                ) {
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "종료 후 허용앱만 자동 재개"
+                        } else {
+                            "Allow-only resumes afterward"
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+            StatusBadge(
+                label = modeType,
+                status = if (
+                    summary.activeScheduleSummary != null ||
+                    summary.allowOnlyModeEnabled
+                ) {
+                    LimitStatus.Warning
+                } else {
+                    LimitStatus.Normal
+                },
+            )
+        }
+    }
+}
+
+private enum class EffectiveAppResultFilter {
+    All,
+    Blocked,
+    Limited,
+    Temporary,
+    Allowed,
+    Exempt,
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun EffectiveAppResultsSection(
+    summary: PolicySummary,
+    text: AppStrings,
+) {
+    val apps = summary.effectiveAppSummaries
+    if (apps.isEmpty()) return
+
+    var showAllApps by remember { mutableStateOf(false) }
+    var selectedFilter by remember { mutableStateOf(EffectiveAppResultFilter.All) }
+    var expandedPackageName by remember { mutableStateOf<String?>(null) }
+    fun openAppResults(filter: EffectiveAppResultFilter) {
+        selectedFilter = filter
+        expandedPackageName = null
+        showAllApps = true
+    }
+    val temporaryPackages = remember(summary.temporaryAllowedApps) {
+        summary.temporaryAllowedApps.map { allowance -> allowance.packageName }.toSet()
+    }
+    fun EffectiveAppPolicySummary.isBlocked(): Boolean {
+        return status == LimitStatus.Exceeded ||
+            access == EffectiveAppAccess.BlockedBySchedule ||
+            access == EffectiveAppAccess.BlockedByAllowOnly
+    }
+    fun EffectiveAppPolicySummary.isExempt(): Boolean {
+        return access == EffectiveAppAccess.AllRestrictionsExempt
+    }
+    fun EffectiveAppPolicySummary.isTemporary(): Boolean {
+        return !isBlocked() && !isExempt() && packageName in temporaryPackages
+    }
+    fun EffectiveAppPolicySummary.isLimited(): Boolean {
+        return !isBlocked() &&
+            !isExempt() &&
+            !isTemporary() &&
+            limitingPolicy != EffectiveTimeLimiter.None
+    }
+    fun EffectiveAppPolicySummary.isAvailable(): Boolean {
+        return !isBlocked() && !isExempt() && !isTemporary() && !isLimited()
+    }
+    val blockedCount = apps.count { app -> app.isBlocked() }
+    val limitedCount = apps.count { app -> app.isLimited() }
+    val temporaryCount = apps.count { app -> app.isTemporary() }
+    val exemptCount = apps.count { app -> app.isExempt() }
+    val availableCount = apps.count { app -> app.isAvailable() }
+
+    Text(
+        if (text.appLanguage == AppLanguage.Korean) "앱 상태" else "App status",
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.Bold,
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        EffectiveResultCountChip(
+            label = if (text.appLanguage == AppLanguage.Korean) {
+                "전체 ${apps.size}"
+            } else {
+                "All ${apps.size}"
+            },
+            status = LimitStatus.Normal,
+            onClick = { openAppResults(EffectiveAppResultFilter.All) },
+        )
+        EffectiveResultCountChip(
+            label = if (text.appLanguage == AppLanguage.Korean) {
+                "차단 $blockedCount"
+            } else {
+                "Blocked $blockedCount"
+            },
+            status = if (blockedCount > 0) LimitStatus.Exceeded else LimitStatus.Normal,
+            onClick = { openAppResults(EffectiveAppResultFilter.Blocked) },
+        )
+        EffectiveResultCountChip(
+            label = if (text.appLanguage == AppLanguage.Korean) {
+                "시간 제한 $limitedCount"
+            } else {
+                "Time limited $limitedCount"
+            },
+            status = if (limitedCount > 0) LimitStatus.Warning else LimitStatus.Normal,
+            onClick = { openAppResults(EffectiveAppResultFilter.Limited) },
+        )
+        EffectiveResultCountChip(
+            label = if (text.appLanguage == AppLanguage.Korean) {
+                "일시 허용 $temporaryCount"
+            } else {
+                "Temporary $temporaryCount"
+            },
+            status = LimitStatus.Normal,
+            onClick = { openAppResults(EffectiveAppResultFilter.Temporary) },
+        )
+        EffectiveResultCountChip(
+            label = if (text.appLanguage == AppLanguage.Korean) {
+                "제한 없음 $exemptCount"
+            } else {
+                "Exempt $exemptCount"
+            },
+            status = if (exemptCount > 0) LimitStatus.Warning else LimitStatus.Normal,
+            onClick = { openAppResults(EffectiveAppResultFilter.Exempt) },
+        )
+        EffectiveResultCountChip(
+            label = if (text.appLanguage == AppLanguage.Korean) {
+                "사용 가능 $availableCount"
+            } else {
+                "Available $availableCount"
+            },
+            status = LimitStatus.Normal,
+            onClick = { openAppResults(EffectiveAppResultFilter.Allowed) },
+        )
+    }
+
+    if (showAllApps) {
+        val filteredApps = apps.filter { app ->
+            when (selectedFilter) {
+                EffectiveAppResultFilter.All -> true
+                EffectiveAppResultFilter.Blocked -> app.isBlocked()
+                EffectiveAppResultFilter.Limited -> app.isLimited()
+                EffectiveAppResultFilter.Temporary -> app.isTemporary()
+                EffectiveAppResultFilter.Allowed -> app.isAvailable()
+                EffectiveAppResultFilter.Exempt -> app.isExempt()
+            }
+        }
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ModalBottomSheet(
+            onDismissRequest = { showAllApps = false },
+            sheetState = sheetState,
+            containerColor = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 24.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                SectionTitle(
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "앱별 실제 적용 결과"
+                    } else {
+                        "Effective result by app"
+                    },
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    EffectiveAppResultFilter.values().forEach { filter ->
+                        AppFilterChip(
+                            label = filter.label(text),
+                            selected = selectedFilter == filter,
+                        ) {
+                            selectedFilter = filter
+                            expandedPackageName = null
+                        }
+                    }
+                }
+                Text(
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "${filteredApps.size}개 앱"
+                    } else {
+                        "${filteredApps.size} apps"
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (filteredApps.isEmpty()) {
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "이 상태에 해당하는 앱이 없습니다."
+                        } else {
+                            "No apps match this status."
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    ContainedLazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 560.dp),
+                        resetKey = selectedFilter to filteredApps.map { app -> app.packageName },
+                    ) {
+                        items(filteredApps, key = { app -> app.packageName }) { app ->
+                            val expanded = expandedPackageName == app.packageName
+                            EffectiveAppPolicyRow(
+                                summary = app,
+                                text = text,
+                                temporaryAllowed = app.packageName in temporaryPackages,
+                                expanded = expanded,
+                                onClick = {
+                                    expandedPackageName = if (expanded) null else app.packageName
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EffectiveResultCountChip(
+    label: String,
+    status: LimitStatus,
+    onClick: () -> Unit,
+) {
+    val color = status.semanticColor()
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        color = color.copy(alpha = 0.10f),
+        border = BorderStroke(1.dp, color.copy(alpha = 0.26f)),
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+            color = color,
+            maxLines = 1,
+        )
+    }
+}
+
+private fun EffectiveAppResultFilter.label(text: AppStrings): String {
+    return when (this) {
+        EffectiveAppResultFilter.All ->
+            if (text.appLanguage == AppLanguage.Korean) "전체" else "All"
+        EffectiveAppResultFilter.Blocked ->
+            if (text.appLanguage == AppLanguage.Korean) "차단" else "Blocked"
+        EffectiveAppResultFilter.Limited ->
+            if (text.appLanguage == AppLanguage.Korean) "시간 제한" else "Time limited"
+        EffectiveAppResultFilter.Temporary ->
+            if (text.appLanguage == AppLanguage.Korean) "일시 허용" else "Temporary"
+        EffectiveAppResultFilter.Allowed ->
+            if (text.appLanguage == AppLanguage.Korean) "사용 가능" else "Allowed"
+        EffectiveAppResultFilter.Exempt ->
+            if (text.appLanguage == AppLanguage.Korean) "제한 없음" else "Exempt"
+    }
+}
+
+@Composable
+private fun EffectiveAccessScopeSummary(
+    summary: PolicySummary,
+    text: AppStrings,
+) {
+    val scopeLabel = when {
+        summary.activeScheduleSummary != null -> if (text.appLanguage == AppLanguage.Korean) {
+            "스케줄 · ${summary.activeScheduleSummary.name}"
+        } else {
+            "Schedule · ${summary.activeScheduleSummary.name}"
+        }
+        summary.allowOnlyModeEnabled -> if (text.appLanguage == AppLanguage.Korean) {
+            "허용앱만 모드"
+        } else {
+            "Allow-only mode"
+        }
+        else -> if (text.appLanguage == AppLanguage.Korean) "일반 상태" else "Normal access"
+    }
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.40f),
+        border = BorderStroke(
+            1.dp,
+            MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
+        ),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SafetyStatusRow(
+                title = if (text.appLanguage == AppLanguage.Korean) {
+                    "현재 앱 사용 범위"
+                } else {
+                    "Current app access range"
+                },
+                supportingText = if (
+                    summary.activeScheduleSummary != null &&
+                    summary.allowOnlyModeEnabled
+                ) {
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "스케줄 종료 후 허용앱만 모드가 자동으로 다시 적용됩니다"
+                    } else {
+                        "Allow-only mode resumes automatically when the schedule ends"
+                    }
+                } else {
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "현재 실행 가능 여부를 결정하는 범위 정책입니다"
+                    } else {
+                        "This range policy currently determines which apps may open"
+                    }
+                },
+                statusLabel = scopeLabel,
+                status = if (
+                    summary.activeScheduleSummary != null ||
+                    summary.allowOnlyModeEnabled
+                ) {
+                    LimitStatus.Warning
+                } else {
+                    LimitStatus.Normal
+                },
+            )
+            SafetyStatusRow(
+                title = if (text.appLanguage == AppLanguage.Korean) {
+                    "제한 없음 앱"
+                } else {
+                    "Excluded from all restrictions"
+                },
+                supportingText = if (text.appLanguage == AppLanguage.Korean) {
+                    "통계에는 기록되지만 차단 사용량에는 합산되지 않습니다"
+                } else {
+                    "Tracked in statistics but excluded from enforcement usage"
+                },
+                statusLabel = if (text.appLanguage == AppLanguage.Korean) {
+                    "${summary.allRestrictionsExemptAppCount}개"
+                } else {
+                    "${summary.allRestrictionsExemptAppCount} apps"
+                },
+                status = if (summary.allRestrictionsExemptAppCount > 0) {
+                    LimitStatus.Warning
+                } else {
+                    LimitStatus.Normal
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun EffectiveAppPolicyRow(
+    summary: EffectiveAppPolicySummary,
+    text: AppStrings,
+    temporaryAllowed: Boolean = false,
+    expanded: Boolean = false,
+    onClick: (() -> Unit)? = null,
+) {
+    val accessLabel = when (summary.access) {
+        EffectiveAppAccess.RequiredAllowed ->
+            if (text.appLanguage == AppLanguage.Korean) "필수 허용" else "Required"
+        EffectiveAppAccess.AllRestrictionsExempt ->
+            if (text.appLanguage == AppLanguage.Korean) "제한 없음" else "Exempt"
+        EffectiveAppAccess.ScheduleAllowed ->
+            if (text.appLanguage == AppLanguage.Korean) "스케줄 허용" else "Schedule allowed"
+        EffectiveAppAccess.AllowOnlyAllowed ->
+            if (text.appLanguage == AppLanguage.Korean) "허용앱만 허용" else "Allow-only allowed"
+        EffectiveAppAccess.NormallyAllowed ->
+            if (text.appLanguage == AppLanguage.Korean) "실행 가능" else "Available"
+        EffectiveAppAccess.BlockedBySchedule ->
+            if (text.appLanguage == AppLanguage.Korean) "스케줄 차단" else "Blocked by schedule"
+        EffectiveAppAccess.BlockedByAllowOnly ->
+            if (text.appLanguage == AppLanguage.Korean) "허용앱만 차단" else "Blocked by allow-only"
+    }
+    val limitingLabel = when (summary.limitingPolicy) {
+        EffectiveTimeLimiter.None -> null
+        EffectiveTimeLimiter.Daily ->
+            if (text.appLanguage == AppLanguage.Korean) "요일별 제한" else "Daily limit"
+        EffectiveTimeLimiter.AppGroup ->
+            if (text.appLanguage == AppLanguage.Korean) "그룹 제한" else "Group limit"
+        EffectiveTimeLimiter.App ->
+            if (text.appLanguage == AppLanguage.Korean) "앱별 제한" else "App limit"
+    }
+    val rowContent: @Composable () -> Unit = {
+        Column {
+            AppRow(
+                appName = summary.appName,
+                packageName = summary.packageName,
+                supportingText = listOfNotNull(
+                    if (temporaryAllowed) {
+                        if (text.appLanguage == AppLanguage.Korean) "일시 허용" else "Temporarily allowed"
+                    } else {
+                        null
+                    },
+                    accessLabel,
+                    limitingLabel?.let { label ->
+                        val remaining = summary.remainingMinutes ?: 0
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "$label · ${formatLimitMinutesLabel(remaining)} 남음"
+                        } else {
+                            "$label · ${formatLimitMinutesLabel(remaining)} remaining"
+                        }
+                    },
+                ).joinToString(" · "),
+                trailingContent = {
+                    StatusBadge(
+                        when {
+                            temporaryAllowed ->
+                                if (text.appLanguage == AppLanguage.Korean) "일시 허용" else "Temporary"
+                            summary.status == LimitStatus.Exceeded ->
+                                if (text.appLanguage == AppLanguage.Korean) "차단" else "Blocked"
+                            summary.status == LimitStatus.Warning ->
+                                if (text.appLanguage == AppLanguage.Korean) "곧 종료" else "Ending soon"
+                            else ->
+                                if (text.appLanguage == AppLanguage.Korean) "사용 가능" else "Available"
+                        },
+                        if (temporaryAllowed) LimitStatus.Normal else summary.status,
+                    )
+                },
+            )
+            if (expanded) {
+                Text(
+                    effectiveAppPolicyExplanation(
+                        summary = summary,
+                        temporaryAllowed = temporaryAllowed,
+                        text = text,
+                    ),
+                    modifier = Modifier.padding(start = 52.dp, end = 12.dp, bottom = 10.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+    if (onClick == null) {
+        rowContent()
+    } else {
+        Surface(
+            onClick = onClick,
+            shape = RoundedCornerShape(16.dp),
+            color = if (expanded) {
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f)
+            } else {
+                Color.Transparent
+            },
+        ) {
+            rowContent()
+        }
+    }
+}
+
+private fun effectiveAppPolicyExplanation(
+    summary: EffectiveAppPolicySummary,
+    temporaryAllowed: Boolean,
+    text: AppStrings,
+): String {
+    if (temporaryAllowed) {
+        return if (text.appLanguage == AppLanguage.Korean) {
+            "현재 임시 허용이 적용되어 있습니다. 임시 허용이 끝나면 기존 앱 사용 범위와 시간 제한이 다시 적용됩니다."
+        } else {
+            "Temporary access is active. The normal access range and time limits resume when it ends."
+        }
+    }
+    return when (summary.access) {
+        EffectiveAppAccess.RequiredAllowed ->
+            if (text.appLanguage == AppLanguage.Korean) {
+                "안전과 기기 복구에 필요한 필수 앱이므로 차단하지 않습니다."
+            } else {
+                "This safety-required app is never blocked."
+            }
+        EffectiveAppAccess.AllRestrictionsExempt ->
+            if (text.appLanguage == AppLanguage.Korean) {
+                "제한 없이 사용할 수 있는 앱입니다. 사용량은 통계에 기록되지만 차단 제한에는 합산되지 않습니다."
+            } else {
+                "This app is exempt from all restrictions. Usage is tracked but not counted toward enforcement."
+            }
+        EffectiveAppAccess.BlockedBySchedule ->
+            if (text.appLanguage == AppLanguage.Korean) {
+                "현재 스케줄의 허용 앱 목록에 포함되지 않아 차단됩니다."
+            } else {
+                "Blocked because it is not in the active schedule's allowed-app list."
+            }
+        EffectiveAppAccess.BlockedByAllowOnly ->
+            if (text.appLanguage == AppLanguage.Korean) {
+                "허용앱만 모드의 허용 목록에 포함되지 않아 차단됩니다."
+            } else {
+                "Blocked because it is not in the allow-only list."
+            }
+        else -> when (summary.limitingPolicy) {
+            EffectiveTimeLimiter.Daily ->
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "적용 중인 시간 제한 가운데 요일별 제한이 가장 먼저 끝납니다."
+                } else {
+                    "The daily limit is the first active time limit that will end."
+                }
+            EffectiveTimeLimiter.AppGroup ->
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "적용 중인 시간 제한 가운데 앱 그룹 제한이 가장 먼저 끝납니다."
+                } else {
+                    "The app-group limit is the first active time limit that will end."
+                }
+            EffectiveTimeLimiter.App ->
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "적용 중인 시간 제한 가운데 앱별 제한이 가장 먼저 끝납니다."
+                } else {
+                    "The app limit is the first active time limit that will end."
+                }
+            EffectiveTimeLimiter.None ->
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "현재 이 앱을 차단하는 앱 사용 범위 또는 시간 제한이 없습니다."
+                } else {
+                    "No current access-range or time-limit policy blocks this app."
+                }
+        }
+    }
+}
+
+@Composable
+private fun HardshipPolicySummary(summary: PolicySummary, text: AppStrings) {
+    val configured = summary.hardshipItems
+    if (configured.isEmpty()) return
+
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.38f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.70f)),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = if (text.appLanguage == AppLanguage.Korean) {
+                    "고행 모드 적용 정책 ${configured.size}개"
+                } else {
+                    "${configured.size} hardship policies"
+                },
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            configured.forEach { item ->
+                val policyType = item.policyKey.policyType
+                val level = item.level
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    HardshipMeditationIcon(level = level, modifier = Modifier.size(30.dp))
+                    Text(
+                        text = buildString {
+                            append(text.hardshipPolicyLabel(policyType))
+                            if (item.targetName.isNotBlank()) append(" · ${item.targetName}")
+                        },
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = if (item.policyKey in summary.activeHardshipPolicyKeys) {
+                            if (text.appLanguage == AppLanguage.Korean) {
+                                "${text.hardshipLevelLabel(level)} · 적용 중"
+                            } else {
+                                "${text.hardshipLevelLabel(level)} · active"
+                            }
+                        } else {
+                            text.hardshipLevelLabel(level)
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = hardshipLevelColor(level),
+                    )
+                }
+            }
+            if (configured.any { item -> item.level == HardshipLevel.Level3 }) {
+                val nextAvailableAt = summary.emergencyPassNextAvailableAtMillis
+                Text(
+                    text = when {
+                        nextAvailableAt <= 0L || System.currentTimeMillis() >= nextAvailableAt ->
+                            if (text.appLanguage == AppLanguage.Korean) "Emergency Pass 사용 가능 · 1회" else "Emergency Pass available · 1 use"
+                        else -> if (text.appLanguage == AppLanguage.Korean) {
+                            "Emergency Pass 사용 완료 · 다음 사용 가능 ${formatDateTime(nextAvailableAt)}"
+                        } else {
+                            "Emergency Pass used · available again ${formatDateTime(nextAvailableAt)}"
+                        }
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 
@@ -5302,6 +7132,17 @@ private fun temporaryAllowanceStatusLabel(
 
 @Composable
 fun PolicyGroupSummaryLine(summary: AppGroupSummary, text: AppStrings, onClick: () -> Unit) {
+    val configuredLimitLabel = when {
+        !summary.limitConfigured -> text.noLimit
+        summary.limitMinutes == 0 && summary.extraMinutes <= 0 -> text.zeroMinuteBlockLabel()
+        else -> formatLimitWithAllowance(
+            limitMinutes = summary.limitMinutes,
+            extraMinutes = summary.extraMinutes,
+            unlockedForToday = false,
+            text = text,
+        )
+    }
+    val activeDaysLabel = scheduleDaysSummary(summary.activeDays, text)
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -5323,14 +7164,7 @@ fun PolicyGroupSummaryLine(summary: AppGroupSummary, text: AppStrings, onClick: 
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${formatLimitMinutesLabel(summary.usedMinutes)} / ${
-                    formatLimitWithAllowance(
-                        limitMinutes = summary.limitMinutes,
-                        extraMinutes = summary.extraMinutes,
-                        unlockedForToday = false,
-                        text = text,
-                    )
-                }",
+                "${formatLimitMinutesLabel(summary.usedMinutes)} / $configuredLimitLabel",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -5338,12 +7172,41 @@ fun PolicyGroupSummaryLine(summary: AppGroupSummary, text: AppStrings, onClick: 
                 textAlign = TextAlign.End,
             )
         }
-        ProgressOnlyBar(
-            usedMinutes = summary.usedMinutes,
-            limitMinutes = summary.limitMinutes,
-            extraMinutes = summary.extraMinutes,
-            status = summary.status,
-        )
+        if (summary.limitConfigured) {
+            Text(
+                text = if (summary.activeToday) {
+                    activeDaysLabel
+                } else {
+                    "$activeDaysLabel · ${text.todayNotAppliedLabel()}"
+                },
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = if (summary.activeToday) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+        if (summary.limitEnabled) {
+            ProgressOnlyBar(
+                usedMinutes = summary.usedMinutes,
+                limitMinutes = summary.limitMinutes,
+                extraMinutes = summary.extraMinutes,
+                status = summary.status,
+            )
+        }
+        if (summary.excludedPackageCount > 0) {
+            Text(
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "제한 없음 앱 ${summary.excludedPackageCount}개의 사용량은 그룹 제한에 합산되지 않습니다."
+                } else {
+                    "Usage from ${summary.excludedPackageCount} exempt apps is not counted toward this group limit."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
@@ -5394,6 +7257,8 @@ fun GroupSummarySheet(
                 groupSummary.status,
                 text,
                 extraMinutes = groupSummary.extraMinutes,
+                limitEnabled = groupSummary.limitEnabled,
+                limitTextOverride = if (groupSummary.activeToday) null else text.todayNotAppliedLabel(),
             )
             Text(text.groupApps, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             if (groupSummary.appUsages.isEmpty()) {
@@ -5409,7 +7274,15 @@ fun GroupSummarySheet(
                         AppRow(
                             appName = appUsage.appName,
                             packageName = appUsage.packageName,
-                            supportingText = text.usedMinutes(appUsage.usedMinutes),
+                            supportingText = if (appUsage.excludedFromRestrictions) {
+                                if (text.appLanguage == AppLanguage.Korean) {
+                                    "${text.usedMinutes(appUsage.usedMinutes)} · 제한 없음"
+                                } else {
+                                    "${text.usedMinutes(appUsage.usedMinutes)} · exempt"
+                                }
+                            } else {
+                                text.usedMinutes(appUsage.usedMinutes)
+                            },
                             trailingContent = if (limitMinutes != null || appUsage.extraMinutes > 0 || appUsage.unlockedForToday) {
                                 {
                                     LimitTimeChip(
@@ -5588,33 +7461,72 @@ private object AppIconBitmapCache {
 
 @Composable
 fun PolicyAppSummaryLine(summary: AppLimitSummary, text: AppStrings) {
+    val configuredLimitLabel = if (
+        summary.limitMinutes == 0 &&
+        summary.extraMinutes <= 0 &&
+        !summary.unlockedForToday &&
+        summary.temporaryRemainingMinutes <= 0
+    ) {
+        text.zeroMinuteBlockLabel()
+    } else {
+        formatLimitWithTemporaryAllowance(
+            limitMinutes = summary.limitMinutes,
+            extraMinutes = summary.extraMinutes,
+            unlockedForToday = summary.unlockedForToday,
+            temporaryRemainingMinutes = summary.temporaryRemainingMinutes,
+            text = text,
+        )
+    }
+    val activeDaysLabel = scheduleDaysSummary(summary.activeDays, text)
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             AppIcon(packageName = summary.packageName, contentDescription = summary.appName, size = 24.dp)
             Spacer(modifier = Modifier.width(8.dp))
             Text(summary.appName, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "${formatLimitMinutesLabel(summary.usedMinutes)} / ${
-                    formatLimitWithTemporaryAllowance(
-                        limitMinutes = summary.limitMinutes,
-                        extraMinutes = summary.extraMinutes,
-                        unlockedForToday = summary.unlockedForToday,
-                        temporaryRemainingMinutes = summary.temporaryRemainingMinutes,
-                        text = text,
-                    )
-                }",
+                if (summary.excludedFromRestrictions) {
+                    if (text.appLanguage == AppLanguage.Korean) "제한 없음" else "Excluded"
+                } else {
+                    "${formatLimitMinutesLabel(summary.usedMinutes)} / $configuredLimitLabel"
+                },
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        ProgressOnlyBar(
-            usedMinutes = summary.usedMinutes,
-            limitMinutes = summary.limitMinutes,
-            extraMinutes = summary.extraMinutes,
-            unlockedForToday = summary.unlockedForToday,
-            status = summary.status,
+        Text(
+            text = if (summary.activeToday) {
+                activeDaysLabel
+            } else {
+                "$activeDaysLabel · ${text.todayNotAppliedLabel()}"
+            },
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = if (summary.activeToday) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
         )
+        if (summary.excludedFromRestrictions) {
+            Text(
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "사용량은 통계에 기록되지만 설정된 앱별 제한은 적용되지 않습니다."
+                } else {
+                    "Usage is tracked in statistics, but this app limit is not enforced."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else if (summary.activeToday) {
+            ProgressOnlyBar(
+                usedMinutes = summary.usedMinutes,
+                limitMinutes = summary.limitMinutes,
+                extraMinutes = summary.extraMinutes,
+                unlockedForToday = summary.unlockedForToday,
+                status = summary.status,
+            )
+        }
     }
 }
 
@@ -5627,8 +7539,10 @@ fun ProgressOnlyBar(
     unlockedForToday: Boolean = false,
 ) {
     val effectiveLimitMinutes = (limitMinutes + extraMinutes).coerceAtLeast(limitMinutes)
-    val rawProgress = if (unlockedForToday || effectiveLimitMinutes <= 0) {
+    val rawProgress = if (unlockedForToday) {
         0f
+    } else if (effectiveLimitMinutes <= 0) {
+        if (status == LimitStatus.Exceeded) 1f else 0f
     } else {
         usedMinutes.toFloat() / effectiveLimitMinutes.toFloat()
     }
@@ -5714,8 +7628,12 @@ fun DayLimitChips(
             val selected = selectedDayIndex == index
             val isWeekend = index >= 5
             val minutes = dailyLimits.getOrNull(index).orEmpty()
-            val rawMinutes = minutes.toIntOrNull() ?: 0
-            val formattedMinutes = if (rawMinutes == 0) text.noLimit else formatLimitMinutesLabel(rawMinutes)
+            val rawMinutes = minutes.toIntOrNull()
+            val formattedMinutes = when (rawMinutes) {
+                null -> text.noLimit
+                0 -> text.zeroMinuteBlockLabel()
+                else -> formatLimitMinutesLabel(rawMinutes)
+            }
             val chipMinutes = formattedMinutes.replace(" ", "\n")
             Surface(
                 onClick = { onDaySelected(index) },
@@ -5857,13 +7775,15 @@ fun SmoothMinuteSlider(
 
 @Composable
 fun EditableMinuteValue(
-    valueMinutes: Int,
+    valueMinutes: Int?,
     onValueMinutesChange: (Int) -> Unit,
+    onRemoveLimit: () -> Unit,
     text: AppStrings,
     pickerTitle: String,
     minMinutes: Int = 0,
     maxMinutes: Int = POLICY_MAX_MINUTES,
     includeMaxPreset: Boolean = true,
+    pickerSaveLabel: String? = null,
 ) {
     var showPicker by remember { mutableStateOf(false) }
 
@@ -5877,7 +7797,11 @@ fun EditableMinuteValue(
     ) {
         Box(contentAlignment = Alignment.Center) {
             Text(
-                if (valueMinutes == 0) text.noLimit else formatLimitMinutesLabel(valueMinutes),
+                when (valueMinutes) {
+                    null -> text.noLimit
+                    0 -> text.zeroMinuteBlockLabel()
+                    else -> formatLimitMinutesLabel(valueMinutes)
+                },
                 modifier = Modifier.padding(horizontal = 10.dp),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
@@ -5891,12 +7815,17 @@ fun EditableMinuteValue(
     if (showPicker) {
         DurationPickerSheet(
             title = pickerTitle,
-            valueMinutes = valueMinutes,
+            valueMinutes = valueMinutes ?: 0,
             minMinutes = minMinutes,
             maxMinutes = maxMinutes,
             includeMaxPreset = includeMaxPreset,
             text = text,
             onDismiss = { showPicker = false },
+            onRemoveLimit = {
+                onRemoveLimit()
+                showPicker = false
+            },
+            saveLabel = pickerSaveLabel ?: text.savePolicy,
             onApply = { minutes ->
                 onValueMinutesChange(minutes)
                 showPicker = false
@@ -5915,6 +7844,8 @@ private fun DurationPickerSheet(
     includeMaxPreset: Boolean,
     text: AppStrings,
     onDismiss: () -> Unit,
+    onRemoveLimit: (() -> Unit)? = null,
+    saveLabel: String = text.savePolicy,
     onApply: (Int) -> Unit,
 ) {
     val lowerBound = minMinutes.coerceAtMost(maxMinutes)
@@ -5924,22 +7855,29 @@ private fun DurationPickerSheet(
         valueMinutes = valueMinutes,
         lowerBound = lowerBound,
         upperBound = upperBound,
-        displayValue = { minutes -> if (minutes == 0) text.noLimit else formatLimitMinutesLabel(minutes) },
-        saveLabel = text.savePolicy,
+        displayValue = { minutes ->
+            if (minutes == 0) text.zeroMinuteBlockLabel() else formatLimitMinutesLabel(minutes)
+        },
+        saveLabel = saveLabel,
         onDismiss = onDismiss,
         onApply = onApply,
+        secondaryActionLabel = text.noLimit.takeIf { onRemoveLimit != null },
+        onSecondaryAction = onRemoveLimit,
+        zeroValueWarning = text.zeroMinuteBlockWarning().takeIf { lowerBound == 0 },
     )
 }
 
 @Composable
 fun MinuteControlPanel(
-    valueMinutes: Int,
+    valueMinutes: Int?,
     onValueMinutesChange: (Int) -> Unit,
+    onRemoveLimit: () -> Unit,
     text: AppStrings,
     title: String,
     minMinutes: Int = 0,
     maxMinutes: Int = POLICY_MAX_MINUTES,
     includeMaxPreset: Boolean = true,
+    pickerSaveLabel: String? = null,
 ) {
     Surface(
         shape = RoundedCornerShape(16.dp),
@@ -5957,11 +7895,13 @@ fun MinuteControlPanel(
                 EditableMinuteValue(
                     valueMinutes = valueMinutes,
                     onValueMinutesChange = onValueMinutesChange,
+                    onRemoveLimit = onRemoveLimit,
                     text = text,
                     pickerTitle = title,
                     minMinutes = minMinutes,
                     maxMinutes = maxMinutes,
                     includeMaxPreset = includeMaxPreset,
+                    pickerSaveLabel = pickerSaveLabel,
                 )
             }
         }
@@ -5993,31 +7933,19 @@ private enum class PolicySectionIcon {
 }
 
 @Composable
-private fun PolicyTabIntro(
-    description: String,
-) {
-    Text(
-        text = description,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 4.dp, vertical = 2.dp),
-        style = MaterialTheme.typography.titleMedium,
-        fontWeight = FontWeight.Bold,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-}
-
-@Composable
 private fun CollapsiblePolicyCard(
     title: String,
-    description: String,
     icon: PolicySectionIcon,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     text: AppStrings,
+    helpText: String? = null,
+    hardshipLevel: HardshipLevel = HardshipLevel.Off,
+    reserveHeaderTrailingSpace: Boolean = false,
     headerTrailing: @Composable () -> Unit = {},
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    var helpVisible by rememberSaveable(title) { mutableStateOf(false) }
     SimpleCard {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -6026,11 +7954,24 @@ private fun CollapsiblePolicyCard(
         ) {
             PolicySectionHeader(
                 title = title,
-                description = description,
                 icon = icon,
                 modifier = Modifier.weight(1f),
+                hardshipLevel = hardshipLevel,
+                text = text,
             )
-            headerTrailing()
+            if (!helpText.isNullOrBlank()) {
+                PolicyHelpButton(onClick = { helpVisible = true })
+            }
+            if (reserveHeaderTrailingSpace) {
+                Box(
+                    modifier = Modifier.width(92.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    headerTrailing()
+                }
+            } else {
+                headerTrailing()
+            }
             SectionExpandButton(
                 expanded = expanded,
                 text = text,
@@ -6041,14 +7982,78 @@ private fun CollapsiblePolicyCard(
             content()
         }
     }
+    if (helpVisible && !helpText.isNullOrBlank()) {
+        PolicyHelpDialog(
+            title = title,
+            description = helpText,
+            text = text,
+            onDismiss = { helpVisible = false },
+        )
+    }
+}
+
+@Composable
+private fun PolicyHelpButton(onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.size(34.dp),
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.62f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.28f)),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                "?",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PolicyHelpDialog(
+    title: String,
+    description: String,
+    text: AppStrings,
+    onDismiss: () -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        ) {
+            Column(
+                modifier = Modifier.padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                SectionTitle(title)
+                Text(
+                    description,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Button(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (text.appLanguage == AppLanguage.Korean) "확인" else "OK")
+                }
+            }
+        }
+    }
 }
 
 @Composable
 private fun PolicySectionHeader(
     title: String,
-    description: String,
     icon: PolicySectionIcon,
     modifier: Modifier = Modifier,
+    hardshipLevel: HardshipLevel = HardshipLevel.Off,
+    text: AppStrings,
 ) {
     Row(
         modifier = modifier,
@@ -6056,15 +8061,74 @@ private fun PolicySectionHeader(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         PolicySectionIconBadge(icon = icon)
-        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             SectionTitle(title)
-            Text(
-                text = description,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            if (hardshipLevel != HardshipLevel.Off) {
+                HardshipStageIndicator(level = hardshipLevel, text = text)
+            }
         }
     }
+}
+
+@Composable
+private fun HardshipStageIndicator(
+    level: HardshipLevel,
+    text: AppStrings,
+    modifier: Modifier = Modifier,
+) {
+    if (level == HardshipLevel.Off) return
+    val color = hardshipLevelColor(level)
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        HardshipMeditationIcon(level = level, modifier = Modifier.size(28.dp))
+        Text(
+            text = text.hardshipLevelLabel(level),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = color,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun HardshipMeditationIcon(
+    level: HardshipLevel,
+    modifier: Modifier = Modifier,
+) {
+    val color = hardshipLevelColor(level)
+    Icon(
+        painter = painterResource(R.drawable.ic_hardship_meditation),
+        contentDescription = null,
+        tint = color,
+        modifier = modifier,
+    )
+}
+
+@Composable
+private fun hardshipLevelColor(level: HardshipLevel): Color {
+    return when (level) {
+        HardshipLevel.Off -> MaterialTheme.colorScheme.onSurfaceVariant
+        HardshipLevel.Level1 -> Color(0xFFB07A16)
+        HardshipLevel.Level2 -> Color(0xFFE26822)
+        HardshipLevel.Level3 -> Color(0xFF8E2745)
+    }
+}
+
+@Composable
+private fun hardshipAwareSwitchColors(level: HardshipLevel): SwitchColors {
+    val hardshipColor = hardshipLevelColor(level)
+    return SwitchDefaults.colors(
+        disabledCheckedThumbColor = Color.White.copy(alpha = 0.94f),
+        disabledCheckedTrackColor = hardshipColor.copy(alpha = 0.78f),
+        disabledCheckedBorderColor = hardshipColor,
+    )
 }
 
 @Composable
@@ -6087,6 +8151,736 @@ private fun SectionExpandButton(
             color = MaterialTheme.colorScheme.primary,
             maxLines = 1,
         )
+    }
+}
+
+@Composable
+private fun HardshipModeFooter(
+    policyType: HardshipPolicyType,
+    level: HardshipLevel,
+    enabled: Boolean,
+    text: AppStrings,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(1.dp)
+            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f)),
+    )
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = if (level == HardshipLevel.Off) {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f)
+        } else {
+            hardshipLevelColor(level).copy(alpha = 0.10f)
+        },
+        border = BorderStroke(
+            1.dp,
+            if (level == HardshipLevel.Off) {
+                MaterialTheme.colorScheme.outlineVariant
+            } else {
+                hardshipLevelColor(level).copy(alpha = 0.52f)
+            },
+        ),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                HardshipMeditationIcon(level = level, modifier = Modifier.size(36.dp))
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        text = text.hardshipModeTitle(),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = if (level == HardshipLevel.Off) {
+                            text.hardshipPolicyDescription(policyType)
+                        } else {
+                            text.hardshipConfiguredDescription(level)
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Button(
+                onClick = onClick,
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                colors = if (level == HardshipLevel.Off) {
+                    ButtonDefaults.buttonColors()
+                } else {
+                    ButtonDefaults.buttonColors(
+                        containerColor = hardshipLevelColor(level),
+                        disabledContainerColor = hardshipLevelColor(level).copy(alpha = 0.72f),
+                        disabledContentColor = Color.White.copy(alpha = 0.92f),
+                    )
+                },
+            ) {
+                Text(
+                    text = if (level == HardshipLevel.Off) {
+                        text.hardshipConfigureLabel()
+                    } else {
+                        text.hardshipLevelLabel(level) + " · " + text.hardshipChangeLabel()
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            if (!enabled) {
+                Text(
+                    text = text.hardshipNeedsPolicyLabel(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HardshipModeDialog(
+    policyKey: HardshipPolicyKey,
+    policyType: HardshipPolicyType,
+    targetName: String,
+    currentLevel: HardshipLevel,
+    level3Locked: Boolean,
+    allRestrictionsExemptAppCount: Int,
+    configurationReflectionReadyAtMillis: Long,
+    text: AppStrings,
+    onDismiss: () -> Unit,
+    onStartConfigurationReflection: () -> Unit,
+    onApply: (HardshipLevel, String) -> Unit,
+) {
+    var selectedLevel by remember(policyKey, currentLevel) { mutableStateOf(currentLevel) }
+    var showLevel3FirstWarning by remember(policyType) { mutableStateOf(false) }
+    var showLevel3FinalWarning by remember(policyType) { mutableStateOf(false) }
+    var pendingLevelForPin by remember(policyType) { mutableStateOf<HardshipLevel?>(null) }
+    var countdownNowMillis by remember(configurationReflectionReadyAtMillis) {
+        mutableStateOf(System.currentTimeMillis())
+    }
+    LaunchedEffect(configurationReflectionReadyAtMillis) {
+        while (
+            configurationReflectionReadyAtMillis > 0L &&
+            countdownNowMillis < configurationReflectionReadyAtMillis
+        ) {
+            delay(1_000L)
+            countdownNowMillis = System.currentTimeMillis()
+        }
+    }
+    val reflectionRemainingMillis =
+        (configurationReflectionReadyAtMillis - countdownNowMillis).coerceAtLeast(0L)
+    val reflectionStarted = configurationReflectionReadyAtMillis > 0L
+    val reflectionWaiting = reflectionStarted && reflectionRemainingMillis > 0L
+    val currentLevelNeedsReflection = currentLevel in
+        setOf(HardshipLevel.Level1, HardshipLevel.Level2)
+    val hasSelectedChange = selectedLevel != currentLevel
+    fun countdownLabel(): String {
+        val totalSeconds = (reflectionRemainingMillis + 999L) / 1_000L
+        val minutes = totalSeconds / 60L
+        val seconds = totalSeconds % 60L
+        return "%02d:%02d".format(minutes, seconds)
+    }
+    fun requestWeakening(nextLevel: HardshipLevel) {
+        when {
+            !currentLevelNeedsReflection -> pendingLevelForPin = nextLevel
+            !reflectionStarted -> onStartConfigurationReflection()
+            reflectionWaiting -> Unit
+            else -> pendingLevelForPin = nextLevel
+        }
+    }
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 560.dp)
+                .heightIn(max = 720.dp),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text(
+                    text = text.hardshipDialogTitle(),
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = text.hardshipDialogTarget(policyType) +
+                        targetName.takeIf { value -> value.isNotBlank() }?.let { value -> " · $value" }.orEmpty(),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (level3Locked) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = hardshipLevelColor(HardshipLevel.Level3).copy(alpha = 0.10f),
+                        border = BorderStroke(
+                            1.dp,
+                            hardshipLevelColor(HardshipLevel.Level3).copy(alpha = 0.45f),
+                        ),
+                    ) {
+                        Text(
+                            text = text.hardshipLockedLabel(),
+                            modifier = Modifier.padding(14.dp),
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = hardshipLevelColor(HardshipLevel.Level3),
+                        )
+                    }
+                }
+                listOf(HardshipLevel.Level1, HardshipLevel.Level2, HardshipLevel.Level3).forEach { level ->
+                    val selected = selectedLevel == level
+                    Surface(
+                        onClick = { selectedLevel = level },
+                        enabled = !level3Locked,
+                        shape = RoundedCornerShape(18.dp),
+                        color = if (selected) {
+                            hardshipLevelColor(level).copy(alpha = 0.12f)
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.32f)
+                        },
+                        border = BorderStroke(
+                            if (selected) 2.dp else 1.dp,
+                            if (selected) hardshipLevelColor(level) else MaterialTheme.colorScheme.outlineVariant,
+                        ),
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            HardshipStageIndicator(level = level, text = text)
+                            Text(
+                                text = text.hardshipLevelName(level),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                text = text.hardshipLevelDescription(level, policyType),
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                if (selectedLevel == HardshipLevel.Level3) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = hardshipLevelColor(HardshipLevel.Level3).copy(alpha = 0.10f),
+                    ) {
+                        Text(
+                            text = text.hardshipLevel3Warning(policyType),
+                            modifier = Modifier.padding(14.dp),
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = hardshipLevelColor(HardshipLevel.Level3),
+                        )
+                    }
+                    if (allRestrictionsExemptAppCount > 0) {
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.12f),
+                            border = BorderStroke(
+                                1.dp,
+                                MaterialTheme.colorScheme.tertiary.copy(alpha = 0.34f),
+                            ),
+                        ) {
+                            Text(
+                                if (text.appLanguage == AppLanguage.Korean) {
+                                    "제한 없음 앱 ${allRestrictionsExemptAppCount}개는 3단계가 시작되어도 차단되지 않습니다. 해당 목록을 확인한 후 적용해 주세요."
+                                } else {
+                                    "$allRestrictionsExemptAppCount apps excluded from all restrictions will remain available after level 3 starts. Review the exemption list before applying."
+                                },
+                                modifier = Modifier.padding(14.dp),
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+                    }
+                }
+                if (currentLevel != HardshipLevel.Off && !level3Locked) {
+                    OutlinedButton(
+                        onClick = { requestWeakening(HardshipLevel.Off) },
+                        enabled = !reflectionWaiting,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(
+                            text = when {
+                                !currentLevelNeedsReflection -> text.hardshipDisableLabel()
+                                !reflectionStarted -> if (text.appLanguage == AppLanguage.Korean) {
+                                    "고행 종료 숙고 시작"
+                                } else {
+                                    "Start exit reflection"
+                                }
+                                reflectionWaiting -> if (text.appLanguage == AppLanguage.Korean) {
+                                    "숙고 중 · ${countdownLabel()}"
+                                } else {
+                                    "Reflecting · ${countdownLabel()}"
+                                }
+                                else -> if (text.appLanguage == AppLanguage.Korean) {
+                                    "관리 PIN으로 고행 종료"
+                                } else {
+                                    "End with admin PIN"
+                                }
+                            },
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                    }
+                    if (currentLevelNeedsReflection) {
+                        Text(
+                            text = if (text.appLanguage == AppLanguage.Korean) {
+                                if (currentLevel == HardshipLevel.Level1) {
+                                    "종료 또는 단계 하향 전 2분 숙고와 관리 PIN 확인이 필요합니다."
+                                } else {
+                                    "종료 또는 단계 하향 전 30분 숙고와 관리 PIN 확인이 필요합니다."
+                                }
+                            } else if (currentLevel == HardshipLevel.Level1) {
+                                "Ending or lowering this level requires 2 minutes of reflection and the admin PIN."
+                            } else {
+                                "Ending or lowering this level requires 30 minutes of reflection and the admin PIN."
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(text.cancel, style = MaterialTheme.typography.titleMedium)
+                    }
+                    Button(
+                        onClick = {
+                            if (selectedLevel == HardshipLevel.Level3 && currentLevel != HardshipLevel.Level3) {
+                                showLevel3FirstWarning = true
+                            } else if (
+                                selectedLevel.storageValue < currentLevel.storageValue
+                            ) {
+                                requestWeakening(selectedLevel)
+                            } else {
+                                pendingLevelForPin = selectedLevel
+                            }
+                        },
+                        enabled = selectedLevel != HardshipLevel.Off &&
+                            hasSelectedChange &&
+                            !level3Locked &&
+                            !(selectedLevel.storageValue < currentLevel.storageValue && reflectionWaiting),
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = hardshipLevelColor(
+                                selectedLevel.takeIf { it != HardshipLevel.Off } ?: HardshipLevel.Level1,
+                            ),
+                        ),
+                    ) {
+                        Text(
+                            text = if (
+                                selectedLevel.storageValue < currentLevel.storageValue &&
+                                currentLevelNeedsReflection
+                            ) {
+                                when {
+                                    !reflectionStarted -> if (text.appLanguage == AppLanguage.Korean) {
+                                        "단계 하향 숙고 시작"
+                                    } else {
+                                        "Start downgrade reflection"
+                                    }
+                                    reflectionWaiting -> if (text.appLanguage == AppLanguage.Korean) {
+                                        "숙고 중 · ${countdownLabel()}"
+                                    } else {
+                                        "Reflecting · ${countdownLabel()}"
+                                    }
+                                    else -> text.hardshipApplyLabel(selectedLevel)
+                                }
+                            } else {
+                                text.hardshipApplyLabel(selectedLevel)
+                            },
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 2,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                }
+            }
+        }
+    }
+    if (showLevel3FirstWarning) {
+        Dialog(onDismissRequest = { showLevel3FirstWarning = false }) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 500.dp),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(
+                    modifier = Modifier.padding(22.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    HardshipStageIndicator(level = HardshipLevel.Level3, text = text)
+                    Text(
+                        text = text.hardshipLevel3FinalTitle(),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = text.hardshipLevel3Warning(policyType),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = hardshipLevelColor(HardshipLevel.Level3),
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = text.hardshipLevel3FinalBody(),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = { showLevel3FirstWarning = false },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(64.dp),
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            Text(text.cancel, style = MaterialTheme.typography.titleMedium)
+                        }
+                        Button(
+                            onClick = {
+                                showLevel3FirstWarning = false
+                                showLevel3FinalWarning = true
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(64.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = hardshipLevelColor(HardshipLevel.Level3),
+                            ),
+                        ) {
+                            Text(
+                                text = text.hardshipLevel3ShortContinueLabel(),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (showLevel3FinalWarning) {
+        var level3ConfirmInput by remember(policyType) { mutableStateOf("") }
+        val requiredConfirmation = text.hardshipLevel3ConfirmationPhrase()
+        val confirmationMatched = level3ConfirmInput.trim() == requiredConfirmation
+        Dialog(onDismissRequest = { showLevel3FinalWarning = false }) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 500.dp),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(
+                    modifier = Modifier.padding(22.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    HardshipStageIndicator(level = HardshipLevel.Level3, text = text)
+                    Text(
+                        text = text.hardshipLevel3IrreversibleTitle(),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = hardshipLevelColor(HardshipLevel.Level3),
+                    )
+                    Text(
+                        text = text.hardshipLevel3IrreversibleBody(policyType),
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = hardshipLevelColor(HardshipLevel.Level3).copy(alpha = 0.10f),
+                        border = BorderStroke(
+                            1.dp,
+                            hardshipLevelColor(HardshipLevel.Level3).copy(alpha = 0.28f),
+                        ),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = text.hardshipLevel3ConfirmationInstruction(),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = requiredConfirmation,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = hardshipLevelColor(HardshipLevel.Level3),
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = level3ConfirmInput,
+                        onValueChange = { value -> level3ConfirmInput = value },
+                        label = { Text(text.hardshipLevel3ConfirmationLabel()) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(18.dp),
+                        isError = level3ConfirmInput.isNotBlank() && !confirmationMatched,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = { showLevel3FinalWarning = false },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(64.dp),
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            Text(text.cancel, style = MaterialTheme.typography.titleMedium)
+                        }
+                        Button(
+                            onClick = {
+                                showLevel3FinalWarning = false
+                                pendingLevelForPin = HardshipLevel.Level3
+                            },
+                            enabled = confirmationMatched,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(64.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = hardshipLevelColor(HardshipLevel.Level3),
+                            ),
+                        ) {
+                            Text(
+                                text = text.hardshipLevel3ShortFinalApplyLabel(),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pendingLevelForPin?.let { level ->
+        HardshipPinConfirmDialog(
+            level = level,
+            text = text,
+            onDismiss = { pendingLevelForPin = null },
+            onConfirm = { adminPin ->
+                pendingLevelForPin = null
+                onApply(level, adminPin)
+            },
+        )
+    }
+}
+
+@Composable
+private fun AdminPinConfirmDialog(
+    title: String,
+    description: String,
+    confirmLabel: String,
+    text: AppStrings,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var adminPin by remember(title) { mutableStateOf("") }
+    val pinReady = adminPin.length >= 4
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 440.dp),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        ) {
+            Column(
+                modifier = Modifier.padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = description,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                SecurePinTextField(
+                    value = adminPin,
+                    onValueChange = { value -> adminPin = value.filter { char -> char.isDigit() } },
+                    label = text.adminPin,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.NumberPassword,
+                        imeAction = ImeAction.Done,
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onDone = {
+                            if (pinReady) {
+                                onConfirm(adminPin)
+                            }
+                        },
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(text.cancel, style = MaterialTheme.typography.titleMedium)
+                    }
+                    Button(
+                        onClick = { onConfirm(adminPin) },
+                        enabled = pinReady,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(
+                            text = confirmLabel,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HardshipPinConfirmDialog(
+    level: HardshipLevel,
+    text: AppStrings,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var adminPin by remember(level) { mutableStateOf("") }
+    val pinReady = adminPin.length >= 4
+    val confirmLabel = if (level == HardshipLevel.Off) {
+        text.hardshipDisableLabel()
+    } else {
+        text.hardshipApplyLabel(level)
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 440.dp),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        ) {
+            Column(
+                modifier = Modifier.padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text(
+                    text = text.adminPin,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = text.hardshipPinInstruction(),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                SecurePinTextField(
+                    value = adminPin,
+                    onValueChange = { value -> adminPin = value.filter { char -> char.isDigit() } },
+                    label = text.adminPin,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.NumberPassword,
+                        imeAction = ImeAction.Done,
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onDone = {
+                            if (pinReady) {
+                                onConfirm(adminPin)
+                            }
+                        },
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(text.cancel, style = MaterialTheme.typography.titleMedium)
+                    }
+                    Button(
+                        onClick = { onConfirm(adminPin) },
+                        enabled = pinReady,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (level == HardshipLevel.Off) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                hardshipLevelColor(level)
+                            },
+                        ),
+                    ) {
+                        Text(
+                            text = confirmLabel,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -6364,10 +9158,9 @@ private fun PolicySectionIconBadge(
 @Composable
 fun GroupBudgetSummary(
     totalMinutes: Int,
-    dailyMinimumMinutes: Int,
     text: AppStrings,
 ) {
-    val status = if (totalMinutes > DAILY_POLICY_MAX_MINUTES) LimitStatus.Exceeded else LimitStatus.Normal
+    val status = LimitStatus.Normal
     val color = status.semanticColor()
     Surface(
         shape = RoundedCornerShape(18.dp),
@@ -6389,14 +9182,18 @@ fun GroupBudgetSummary(
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    text.groupBudgetTotal(totalMinutes, dailyMinimumMinutes).replace(" / ", "\n"),
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "설정 합계 ${formatLimitMinutesLabel(totalMinutes)}"
+                    } else {
+                        "Configured ${formatLimitMinutesLabel(totalMinutes)}"
+                    },
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
             }
             StatusBadge(
-                label = if (status == LimitStatus.Exceeded) text.policyBudgetExceeded else text.policyUpToDate,
+                label = if (text.appLanguage == AppLanguage.Korean) "독립 적용" else "Independent",
                 status = status,
             )
         }
@@ -6407,85 +9204,111 @@ fun GroupBudgetSummary(
 fun ScheduleBlockingCard(
     settings: UsagePolicySettings,
     installedApps: List<InstalledAppInfo>,
-    allowedAppPackages: Set<String>,
+    allRestrictionsExemptPackages: Set<String>,
     temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     onUpdateSettings: (UsagePolicySettings) -> Unit,
+    activeHardshipPolicyKeys: Set<HardshipPolicyKey>,
+    onHardshipConfigure: (HardshipPolicyKey) -> Unit,
 ) {
     val scheduleActiveNow = settings.isScheduleBlockingNow()
     val statusTemplate = settings.activeScheduleTemplate()
+        ?: settings.selectedScheduleTemplate()
+    val hasConfiguredScheduleHardship = settings.normalizedScheduleTemplates().any { schedule ->
+        schedule.hardshipLevel != HardshipLevel.Off
+    }
+    val scheduleHardshipLevel = settings.hardshipLevelFor(HardshipPolicyType.Schedule)
     CollapsiblePolicyCard(
         title = text.scheduleBlocking,
-        description = text.scheduleBlockingDescription,
         icon = PolicySectionIcon.Schedule,
+        helpText = if (text.appLanguage == AppLanguage.Korean) {
+            "지정한 시간에는 선택한 앱만 실행됩니다. 요일별·그룹·앱별 시간 제한은 계속 적용되며, 여러 스케줄은 겹치게 저장할 수 없습니다."
+        } else {
+            "Only selected apps can open during the schedule. Daily, group, and app limits still apply, and schedules cannot overlap."
+        },
         expanded = expanded,
         onExpandedChange = onExpandedChange,
         text = text,
+        hardshipLevel = scheduleHardshipLevel,
         headerTrailing = {
             Switch(
                 checked = settings.scheduleBlockingEnabled,
+                enabled = !settings.scheduleBlockingEnabled || !hasConfiguredScheduleHardship,
                 onCheckedChange = { enabled ->
                     onUpdateSettings(settings.copy(scheduleBlockingEnabled = enabled))
                 },
+                colors = hardshipAwareSwitchColors(scheduleHardshipLevel),
             )
         },
     ) {
-        if (settings.scheduleBlockingEnabled) {
-            Surface(
-                shape = RoundedCornerShape(18.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.62f),
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.62f),
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        text.scheduleStatus,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (statusTemplate != null) {
                         Text(
-                            text.scheduleStatus,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold,
+                            "${formatScheduleWindow(statusTemplate.startMinutes, statusTemplate.endMinutes, text)} · ${scheduleDaysSummary(statusTemplate.days, text)}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    } else {
+                        Text(
+                            text.noSchedules,
+                            style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        if (statusTemplate != null) {
-                            Text(
-                                "${formatScheduleWindow(statusTemplate.startMinutes, statusTemplate.endMinutes, text)} · ${scheduleDaysSummary(statusTemplate.days, text)}",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        } else {
-                            Text(
-                                text.noSchedules,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
                     }
-                    StatusBadge(
-                        if (scheduleActiveNow) text.scheduleActiveNow else text.scheduleInactiveNow,
-                        if (scheduleActiveNow) LimitStatus.Exceeded else LimitStatus.Normal,
-                    )
                 }
+                StatusBadge(
+                    if (scheduleActiveNow) text.scheduleActiveNow else text.scheduleInactiveNow,
+                    if (scheduleActiveNow) LimitStatus.Exceeded else LimitStatus.Normal,
+                )
             }
+        }
+        Text(
+            text.scheduleAllowedTemplateHint,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (hasConfiguredScheduleHardship) {
             Text(
-                text.scheduleAllowedTemplateHint,
+                text = if (text.appLanguage == AppLanguage.Korean) {
+                    "스케줄을 끄려면 각 스케줄의 고행 모드를 먼저 해제하세요. 3단계는 다음 날부터 변경할 수 있습니다."
+                } else {
+                    "Disable hardship on each schedule before turning schedules off. Level 3 can be changed the next day."
+                },
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.primary,
+                color = AppOver,
                 fontWeight = FontWeight.SemiBold,
             )
-            ScheduleTemplateSection(
-                settings = settings,
-                installedApps = installedApps,
-                allowedAppPackages = allowedAppPackages,
-                temporaryAllowedApps = temporaryAllowedApps,
-                text = text,
-                onUpdateSettings = onUpdateSettings,
-            )
         }
+        ScheduleTemplateSection(
+            settings = settings,
+            installedApps = installedApps,
+            allRestrictionsExemptPackages = allRestrictionsExemptPackages,
+            temporaryAllowedApps = temporaryAllowedApps,
+            text = text,
+            onUpdateSettings = onUpdateSettings,
+            activeHardshipPolicyKeys = activeHardshipPolicyKeys,
+            onHardshipConfigure = onHardshipConfigure,
+        )
     }
 }
 
@@ -6494,48 +9317,100 @@ fun AllowOnlyModeCard(
     settings: UsagePolicySettings,
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    allRestrictionsExemptPackages: Set<String>,
     temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     onUpdateSettings: (UsagePolicySettings) -> Unit,
     onAllowedAppsChanged: (Set<String>) -> Unit,
+    hardshipActive: Boolean,
+    onHardshipConfigure: () -> Unit,
 ) {
     CollapsiblePolicyCard(
         title = text.allowOnlyMode,
-        description = text.allowOnlyModeDescription,
         icon = PolicySectionIcon.AllowOnly,
+        helpText = if (text.appLanguage == AppLanguage.Korean) {
+            "선택한 앱과 제한 없는 앱만 실행됩니다. 실행이 허용된 앱에도 요일별·그룹·앱별 시간 제한은 계속 적용됩니다."
+        } else {
+            "Only selected and unrestricted apps can open. Daily, group, and app limits still apply to allowed apps."
+        },
         expanded = expanded,
         onExpandedChange = onExpandedChange,
         text = text,
+        hardshipLevel = settings.allowOnlyHardshipLevel,
         headerTrailing = {
             Switch(
                 checked = settings.allowOnlyModeEnabled,
+                enabled = !settings.allowOnlyModeEnabled ||
+                    settings.allowOnlyHardshipLevel == HardshipLevel.Off,
                 onCheckedChange = { enabled ->
                     onUpdateSettings(settings.copy(allowOnlyModeEnabled = enabled))
                 },
+                colors = hardshipAwareSwitchColors(settings.allowOnlyHardshipLevel),
             )
         },
     ) {
         if (settings.allowOnlyModeEnabled) {
-            StatusBadge(text.allowed, LimitStatus.Normal)
-            Text(
-                text.allowOnlyModeSummary,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            val pausedBySchedule = settings.isScheduleBlockingNow()
+            StatusBadge(
+                if (pausedBySchedule) {
+                    if (text.appLanguage == AppLanguage.Korean) "스케줄 동안 대기" else "Paused by schedule"
+                } else {
+                    if (text.appLanguage == AppLanguage.Korean) "현재 적용 중" else "Active now"
+                },
+                if (pausedBySchedule) LimitStatus.Warning else LimitStatus.Normal,
             )
+            if (pausedBySchedule) {
+                Text(
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "스케줄 종료 후 다시 적용됩니다."
+                    } else {
+                        "Resumes after the schedule ends."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             AllowedPolicyRelationshipSummary(
                 settings = settings,
+                installedApps = installedApps,
                 allowedAppPackages = allowedAppPackages,
+                allRestrictionsExemptPackages = allRestrictionsExemptPackages,
                 temporaryAllowedApps = temporaryAllowedApps,
                 text = text,
             )
             AlwaysAllowedAppsContent(
                 installedApps = installedApps,
                 allowedAppPackages = allowedAppPackages,
+                allRestrictionsExemptPackages = allRestrictionsExemptPackages,
                 temporaryAllowedApps = temporaryAllowedApps,
                 text = text,
                 onAllowedAppsChanged = onAllowedAppsChanged,
+                preventAdditions = hardshipActive,
+                appLimitMinutesByPackage = settings.appLimitMap(),
+                appLimitActiveDaysByPackage = settings.appLimitActiveDayMap(),
+            )
+        }
+        HardshipModeFooter(
+            policyType = HardshipPolicyType.AllowOnly,
+            level = settings.allowOnlyHardshipLevel,
+            enabled = settings.allowOnlyModeEnabled,
+            text = text,
+            onClick = onHardshipConfigure,
+        )
+        if (settings.allowOnlyHardshipLevel != HardshipLevel.Off) {
+            Text(
+                text = if (hardshipActive) {
+                    text.hardshipLockedLabel()
+                } else if (text.appLanguage == AppLanguage.Korean) {
+                    "모드를 끄려면 고행 모드를 먼저 해제하세요."
+                } else {
+                    "Disable hardship before turning this mode off."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = AppOver,
+                fontWeight = FontWeight.SemiBold,
             )
         }
     }
@@ -6544,15 +9419,25 @@ fun AllowOnlyModeCard(
 @Composable
 private fun AllowedPolicyRelationshipSummary(
     settings: UsagePolicySettings,
+    installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    allRestrictionsExemptPackages: Set<String>,
     temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
 ) {
-    val userAllowedCount = (allowedAppPackages - SafetyGate.neverBlockPackages).size
+    val cleanExemptPackages = allRestrictionsExemptPackages - SafetyGate.neverBlockPackages
+    val unrestrictedPackages = SafetyGate.expandedUserAllowedPackages(cleanExemptPackages)
+    val visibleInstalledPackages = installedApps.map { app -> app.packageName }.toSet()
+    val visibleUnrestrictedCount = unrestrictedPackages.count { packageName ->
+        packageName in visibleInstalledPackages && packageName !in SafetyGate.neverBlockPackages
+    }
+    val userAllowedCount =
+        ((allowedAppPackages - SafetyGate.neverBlockPackages) - unrestrictedPackages).size
     val activeSchedule = settings.activeScheduleTemplate()
     val scheduleAllowedCount = activeSchedule
         ?.allowedPackageNames
         ?.minus(SafetyGate.neverBlockPackages)
+        ?.minus(unrestrictedPackages)
         ?.minus(allowedAppPackages)
         ?.size
         ?: 0
@@ -6569,36 +9454,72 @@ private fun AllowedPolicyRelationshipSummary(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                text.policyRelationship,
+                if (text.appLanguage == AppLanguage.Korean) "현재 허용 범위" else "Currently allowed",
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurface,
             )
-            SafetyStatusRow(
-                title = text.requiredAllowedApps,
-                supportingText = text.requiredAllowedPolicy,
-                statusLabel = text.allowedAppCount(SafetyGate.requiredNeverBlockPackages.size),
-                status = LimitStatus.Normal,
-            )
-            SafetyStatusRow(
-                title = text.alwaysAllowedApps,
-                supportingText = text.globalAllowedPolicy,
-                statusLabel = text.allowedAppCount(userAllowedCount),
-                status = if (userAllowedCount > 0) LimitStatus.Normal else LimitStatus.Warning,
-            )
-            if (temporaryAllowedApps.isNotEmpty()) {
-                SafetyStatusRow(
-                    title = text.temporaryAllowances,
-                    supportingText = text.temporaryAllowancePolicy,
-                    statusLabel = text.allowedAppCount(temporaryAllowedApps.size),
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                CompactStatusBadge(
+                    label = if (text.appLanguage == AppLanguage.Korean) {
+                        "시스템 자동"
+                    } else {
+                        "Automatic"
+                    },
                     status = LimitStatus.Normal,
                 )
+                CompactStatusBadge(
+                    label = if (text.appLanguage == AppLanguage.Korean) {
+                        "직접 선택 $userAllowedCount"
+                    } else {
+                        "Selected $userAllowedCount"
+                    },
+                    status = if (userAllowedCount > 0) LimitStatus.Normal else LimitStatus.Warning,
+                )
+                if (visibleUnrestrictedCount > 0) {
+                    CompactStatusBadge(
+                        label = if (text.appLanguage == AppLanguage.Korean) {
+                            "제한 없음 $visibleUnrestrictedCount"
+                        } else {
+                            "Unrestricted $visibleUnrestrictedCount"
+                        },
+                        status = LimitStatus.Normal,
+                    )
+                }
+                if (temporaryAllowedApps.isNotEmpty()) {
+                    CompactStatusBadge(
+                        label = if (text.appLanguage == AppLanguage.Korean) {
+                            "임시 허용 ${temporaryAllowedApps.size}"
+                        } else {
+                            "Temporary ${temporaryAllowedApps.size}"
+                        },
+                        status = LimitStatus.Normal,
+                    )
+                }
+                if (scheduleAllowedCount > 0) {
+                    CompactStatusBadge(
+                        label = if (text.appLanguage == AppLanguage.Korean) {
+                            "스케줄 $scheduleAllowedCount"
+                        } else {
+                            "Schedule $scheduleAllowedCount"
+                        },
+                        status = LimitStatus.Normal,
+                    )
+                }
             }
-            SafetyStatusRow(
-                title = text.scheduleAllowedApps,
-                supportingText = text.scheduleAllowedPolicy,
-                statusLabel = text.allowedAppCount(scheduleAllowedCount),
-                status = if (scheduleAllowedCount > 0) LimitStatus.Normal else LimitStatus.Warning,
+            Text(
+                if (text.appLanguage == AppLanguage.Korean) {
+                    "시스템 자동은 설정·키보드·사진 선택기처럼 차단하면 안 되는 화면입니다. ‘연동 제한 없음’은 대표 앱에 필요한 보조 앱이며, 임시 허용은 블록 화면에서 추가 시간 또는 오늘 허용을 적용한 앱입니다."
+                } else {
+                    "System covers required Android surfaces. Linked unrestricted apps support a selected Phone, Messages, Gallery, or Camera app. Temporary means extra time or an unlock granted from the block screen."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
@@ -6693,7 +9614,7 @@ private fun ClockTimePickerSheet(
 }
 
 @Composable
-private fun TimeWheelPickerDialog(
+internal fun TimeWheelPickerDialog(
     title: String,
     valueMinutes: Int,
     lowerBound: Int,
@@ -6704,6 +9625,11 @@ private fun TimeWheelPickerDialog(
     onApply: (Int) -> Unit,
     headerIcon: (@Composable () -> Unit)? = null,
     supportingText: String? = null,
+    secondaryActionLabel: String? = null,
+    onSecondaryAction: (() -> Unit)? = null,
+    zeroValueWarning: String? = null,
+    additionalContent: (@Composable () -> Unit)? = null,
+    compactLayout: Boolean = false,
 ) {
     val cleanLowerBound = lowerBound.coerceAtMost(upperBound)
     val cleanUpperBound = upperBound.coerceAtLeast(cleanLowerBound)
@@ -6734,22 +9660,41 @@ private fun TimeWheelPickerDialog(
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
         ) {
             Column(
-                modifier = Modifier.padding(horizontal = 22.dp, vertical = 20.dp),
+                modifier = Modifier.padding(
+                    horizontal = 22.dp,
+                    vertical = if (compactLayout) 14.dp else 20.dp,
+                ),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                verticalArrangement = Arrangement.spacedBy(if (compactLayout) 12.dp else 16.dp),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    headerIcon?.let { content ->
-                        content()
-                        Spacer(modifier = Modifier.height(10.dp))
+                    if (compactLayout && headerIcon != null) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            headerIcon()
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text(
+                                title,
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    } else {
+                        headerIcon?.let { content ->
+                            content()
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+                        Text(
+                            title,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
                     }
-                    Text(
-                        title,
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
                     supportingText?.takeIf { value -> value.isNotBlank() }?.let { value ->
                         Text(
                             text = value,
@@ -6757,6 +9702,8 @@ private fun TimeWheelPickerDialog(
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
+                            maxLines = if (compactLayout) 2 else Int.MAX_VALUE,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                     Surface(
@@ -6772,12 +9719,33 @@ private fun TimeWheelPickerDialog(
                             color = MaterialTheme.colorScheme.onPrimaryContainer,
                         )
                     }
+                    if (!zeroValueWarning.isNullOrBlank()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 6.dp)
+                                .height(42.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (draftMinutes == 0) {
+                                Text(
+                                    text = zeroValueWarning,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = AppOver,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
                 }
 
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(300.dp)
+                        .height(if (compactLayout) 210.dp else 300.dp)
                         .clip(RoundedCornerShape(16.dp))
                         .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
                     contentAlignment = Alignment.Center,
@@ -6803,6 +9771,7 @@ private fun TimeWheelPickerDialog(
                             values = minHours..maxHours,
                             onValueChange = { hours -> updateTime(hours = hours) },
                             modifier = Modifier.weight(1f),
+                            compactLayout = compactLayout,
                         )
                         ClockTimeWheel(
                             label = "m",
@@ -6810,13 +9779,14 @@ private fun TimeWheelPickerDialog(
                             values = minSelectableMinutes..maxSelectableMinutes,
                             onValueChange = { minutes -> updateTime(minutes = minutes) },
                             modifier = Modifier.weight(1f),
+                            compactLayout = compactLayout,
                         )
                     }
                     Box(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
                             .fillMaxWidth()
-                            .height(78.dp)
+                            .height(if (compactLayout) 56.dp else 78.dp)
                             .background(
                                 Brush.verticalGradient(
                                     colors = listOf(MaterialTheme.colorScheme.surface, Color.Transparent),
@@ -6827,7 +9797,7 @@ private fun TimeWheelPickerDialog(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .fillMaxWidth()
-                            .height(78.dp)
+                            .height(if (compactLayout) 56.dp else 78.dp)
                             .background(
                                 Brush.verticalGradient(
                                     colors = listOf(Color.Transparent, MaterialTheme.colorScheme.surface),
@@ -6836,20 +9806,42 @@ private fun TimeWheelPickerDialog(
                     )
                 }
 
-                Button(
-                    onClick = { onApply(draftMinutes) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(58.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                additionalContent?.invoke()
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Text(
-                        saveLabel,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
-                    )
+                    if (!secondaryActionLabel.isNullOrBlank() && onSecondaryAction != null) {
+                        OutlinedButton(
+                            onClick = onSecondaryAction,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(58.dp),
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            Text(
+                                secondaryActionLabel,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    }
+                    Button(
+                        onClick = { onApply(draftMinutes) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(58.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                    ) {
+                        Text(
+                            saveLabel,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                        )
+                    }
                 }
             }
         }
@@ -6864,9 +9856,11 @@ private fun ClockTimeWheel(
     values: IntRange,
     onValueChange: (Int) -> Unit,
     modifier: Modifier = Modifier,
+    compactLayout: Boolean = false,
 ) {
     var showDirectInput by remember { mutableStateOf(false) }
     var suppressWheelSelection by remember { mutableStateOf(false) }
+    var ignoreWheelSelectionUntilElapsed by remember { mutableStateOf(0L) }
     val wheelValues = remember(values.first, values.last) {
         values.toList().ifEmpty { listOf(value) }
     }
@@ -6882,6 +9876,7 @@ private fun ClockTimeWheel(
             suppressWheelSelection = true
             try {
                 listState.scrollToItem(index)
+                delay(80L)
             } finally {
                 suppressWheelSelection = false
             }
@@ -6900,6 +9895,9 @@ private fun ClockTimeWheel(
         }
             .distinctUntilChanged()
             .collect { index ->
+                if (SystemClock.elapsedRealtime() < ignoreWheelSelectionUntilElapsed) {
+                    return@collect
+                }
                 val nextValue = wheelValues.getOrNull(index ?: return@collect) ?: return@collect
                 if (nextValue != currentValue) {
                     suppressWheelSelection = true
@@ -6912,9 +9910,9 @@ private fun ClockTimeWheel(
         state = listState,
         flingBehavior = flingBehavior,
         modifier = modifier
-            .height(300.dp)
+            .height(if (compactLayout) 210.dp else 300.dp)
             .clipToBounds(),
-        contentPadding = PaddingValues(vertical = 117.dp),
+        contentPadding = PaddingValues(vertical = if (compactLayout) 72.dp else 117.dp),
         verticalArrangement = Arrangement.spacedBy(0.dp),
     ) {
         items(wheelValues, key = { item -> item }) { item ->
@@ -6925,6 +9923,7 @@ private fun ClockTimeWheel(
                         showDirectInput = true
                     } else {
                         suppressWheelSelection = true
+                        ignoreWheelSelectionUntilElapsed = SystemClock.elapsedRealtime() + 250L
                         currentOnValueChange(item)
                     }
                 },
@@ -6960,6 +9959,7 @@ private fun ClockTimeWheel(
             onApply = { input ->
                 if (input != currentValue) {
                     suppressWheelSelection = true
+                    ignoreWheelSelectionUntilElapsed = SystemClock.elapsedRealtime() + 350L
                     currentOnValueChange(input)
                 }
                 showDirectInput = false
@@ -6978,8 +9978,16 @@ private fun WheelNumberInputDialog(
 ) {
     val focusManager = LocalFocusManager.current
     var input by remember(initialValue) { mutableStateOf("%02d".format(initialValue)) }
-    val parsedInput = input.filter { character -> character.isDigit() }.toIntOrNull()
-    val canApply = parsedInput != null && parsedInput in values
+
+    fun confirmInput() {
+        val confirmedValue = input
+            .filter { character -> character.isDigit() }
+            .toIntOrNull()
+            ?.coerceIn(values.first, values.last)
+            ?: return
+        focusManager.clearFocus(force = true)
+        onApply(confirmedValue)
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -7012,10 +10020,7 @@ private fun WheelNumberInputDialog(
                     ),
                     keyboardActions = KeyboardActions(
                         onDone = {
-                            focusManager.clearFocus()
-                            if (canApply) {
-                                onApply(parsedInput!!)
-                            }
+                            confirmInput()
                         },
                     ),
                     modifier = Modifier.fillMaxWidth(),
@@ -7025,12 +10030,7 @@ private fun WheelNumberInputDialog(
                     ),
                 )
                 Button(
-                    onClick = {
-                        focusManager.clearFocus()
-                        if (parsedInput != null) {
-                            onApply(parsedInput.coerceIn(values.first, values.last))
-                        }
-                    },
+                    onClick = { confirmInput() },
                     enabled = input.isNotBlank(),
                     modifier = Modifier
                         .fillMaxWidth()
@@ -7064,10 +10064,12 @@ private fun ScheduleAxisLabels() {
 private fun ScheduleTemplateSection(
     settings: UsagePolicySettings,
     installedApps: List<InstalledAppInfo>,
-    allowedAppPackages: Set<String>,
+    allRestrictionsExemptPackages: Set<String>,
     temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     text: AppStrings,
     onUpdateSettings: (UsagePolicySettings) -> Unit,
+    activeHardshipPolicyKeys: Set<HardshipPolicyKey>,
+    onHardshipConfigure: (HardshipPolicyKey) -> Unit,
 ) {
     val templates = settings.normalizedScheduleTemplates()
     var selectedTemplateId by remember(templates.map { template -> template.id }, settings.activeScheduleTemplateId) {
@@ -7079,10 +10081,17 @@ private fun ScheduleTemplateSection(
     }
     var appSearchQuery by remember(selectedTemplateId) { mutableStateOf("") }
     val selectedTemplate = templates.firstOrNull { template -> template.id == selectedTemplateId }
-    val globalUserAllowedPackages = allowedAppPackages - SafetyGate.neverBlockPackages
+    val selectedTemplateLocked = selectedTemplate?.let { template ->
+        template.hardshipLevel == HardshipLevel.Level3 &&
+            scheduleHardshipKey(template.id) in activeHardshipPolicyKeys
+    } == true
     val temporaryAllowedPackages = temporaryAllowedApps
         .map { allowance -> allowance.packageName }
         .toSet() - SafetyGate.neverBlockPackages
+    val unrestrictedPackages = SafetyGate.expandedUserAllowedPackages(
+        allRestrictionsExemptPackages - SafetyGate.neverBlockPackages,
+    )
+    val visibleInstalledPackages = installedApps.map { app -> app.packageName }.toSet()
 
     fun applyTemplates(
         nextTemplates: List<ScheduleTemplatePolicy>,
@@ -7091,8 +10100,8 @@ private fun ScheduleTemplateSection(
         val cleanedTemplates = nextTemplates.map { template ->
             template.copy(
                 allowedPackageNames = template.allowedPackageNames -
-                    globalUserAllowedPackages -
-                    SafetyGate.neverBlockPackages,
+                    SafetyGate.neverBlockPackages -
+                    unrestrictedPackages,
             )
         }
         val cleanedActiveTemplate = activeTemplate?.let { active ->
@@ -7100,7 +10109,7 @@ private fun ScheduleTemplateSection(
         }
         onUpdateSettings(
             settings.copy(
-                scheduleBlockingEnabled = true,
+                scheduleBlockingEnabled = settings.scheduleBlockingEnabled,
                 scheduleStartMinutes = cleanedActiveTemplate?.startMinutes ?: settings.scheduleStartMinutes,
                 scheduleEndMinutes = cleanedActiveTemplate?.endMinutes ?: settings.scheduleEndMinutes,
                 scheduleDays = cleanedActiveTemplate?.days?.toScheduleDaysEncoded() ?: settings.scheduleDays,
@@ -7111,8 +10120,21 @@ private fun ScheduleTemplateSection(
     }
 
     fun updateSelectedTemplate(transform: (ScheduleTemplatePolicy) -> ScheduleTemplatePolicy) {
+        if (selectedTemplateLocked) return
         val currentTemplate = selectedTemplate ?: return
-        val nextTemplate = transform(currentTemplate)
+        val transformedTemplate = transform(currentTemplate)
+        val scheduleWindowChanged = transformedTemplate.startMinutes != currentTemplate.startMinutes ||
+            transformedTemplate.endMinutes != currentTemplate.endMinutes ||
+            transformedTemplate.days != currentTemplate.days
+        val nextTemplate = if (
+            scheduleWindowChanged && transformedTemplate.hardshipLevel != HardshipLevel.Off
+        ) {
+            transformedTemplate.copy(
+                hardshipEndAtMillis = transformedTemplate.nextOccurrenceEndMillis(),
+            )
+        } else {
+            transformedTemplate
+        }
         val nextTemplates = templates.map { template ->
             if (template.id == currentTemplate.id) nextTemplate else template
         }
@@ -7171,6 +10193,7 @@ private fun ScheduleTemplateSection(
                             selectedTemplateId = nextTemplate?.id.orEmpty()
                             applyTemplates(nextTemplates, nextTemplate)
                         },
+                        enabled = !selectedTemplateLocked,
                         shape = RoundedCornerShape(16.dp),
                         color = AppOver.copy(alpha = 0.12f),
                     ) {
@@ -7184,6 +10207,32 @@ private fun ScheduleTemplateSection(
                     }
                 }
             }
+            val overlappingPairs = remember(templates) { templates.overlappingSchedulePairs() }
+            if (overlappingPairs.isNotEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = AppOver.copy(alpha = 0.10f),
+                    border = BorderStroke(1.dp, AppOver.copy(alpha = 0.30f)),
+                ) {
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            val names = overlappingPairs
+                                .take(2)
+                                .joinToString(", ") { (first, second) -> "$first ↔ $second" }
+                            "스케줄 시간이 겹칩니다: $names. 동시에 두 허용 목록이 적용되지 않도록 시간을 조정해야 저장할 수 있습니다."
+                        } else {
+                            val names = overlappingPairs
+                                .take(2)
+                                .joinToString(", ") { (first, second) -> "$first ↔ $second" }
+                            "Schedule times overlap: $names. Adjust the times before saving."
+                        },
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AppOver,
+                    )
+                }
+            }
             if (templates.isEmpty()) {
                 Text(text.noSchedules, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
@@ -7194,13 +10243,14 @@ private fun ScheduleTemplateSection(
                     templates.forEach { template ->
                         val scheduleOnlyPackages = template.allowedPackageNames -
                             SafetyGate.neverBlockPackages -
-                            globalUserAllowedPackages
+                            unrestrictedPackages
                         ScheduleTemplateChip(
                             template = template,
                             allowedAppCount = (
-                                scheduleOnlyPackages + globalUserAllowedPackages + temporaryAllowedPackages
-                                ).size,
+                                scheduleOnlyPackages + temporaryAllowedPackages + unrestrictedPackages
+                                ).count { packageName -> packageName in visibleInstalledPackages },
                             selected = selectedTemplateId == template.id,
+                            hardshipLevel = template.hardshipLevel,
                             text = text,
                             onClick = {
                                 selectedTemplateId = template.id
@@ -7247,16 +10297,38 @@ private fun ScheduleTemplateSection(
                     template = selectedTemplate,
                     templates = templates,
                     installedApps = installedApps,
-                    globalAllowedPackages = allowedAppPackages,
+                    allRestrictionsExemptPackages = allRestrictionsExemptPackages,
                     temporaryAllowedApps = temporaryAllowedApps,
                     appSearchQuery = appSearchQuery,
                     text = text,
                     onSearchQueryChange = { query -> appSearchQuery = query },
                     onTemplatesChanged = { nextTemplates ->
-                        val nextSelectedTemplate = nextTemplates.firstOrNull { template -> template.id == selectedTemplate.id }
-                        applyTemplates(nextTemplates, nextSelectedTemplate)
+                        if (!selectedTemplateLocked) {
+                            val nextSelectedTemplate = nextTemplates
+                                .firstOrNull { template -> template.id == selectedTemplate.id }
+                            applyTemplates(nextTemplates, nextSelectedTemplate)
+                        }
                     },
                 )
+                val selectedHardshipKey = scheduleHardshipKey(selectedTemplate.id)
+                HardshipModeFooter(
+                    policyType = HardshipPolicyType.Schedule,
+                    level = selectedTemplate.hardshipLevel,
+                    enabled = true,
+                    text = text,
+                    onClick = { onHardshipConfigure(selectedHardshipKey) },
+                )
+                if (
+                    selectedHardshipKey in activeHardshipPolicyKeys &&
+                    selectedTemplate.hardshipLevel == HardshipLevel.Level3
+                ) {
+                    Text(
+                        text = text.hardshipLockedLabel(),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AppOver,
+                    )
+                }
             }
         }
     }
@@ -7267,6 +10339,7 @@ private fun ScheduleTemplateChip(
     template: ScheduleTemplatePolicy,
     allowedAppCount: Int,
     selected: Boolean,
+    hardshipLevel: HardshipLevel,
     text: AppStrings,
     onClick: () -> Unit,
 ) {
@@ -7280,6 +10353,9 @@ private fun ScheduleTemplateChip(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(3.dp),
         ) {
+            if (hardshipLevel != HardshipLevel.Off) {
+                HardshipMeditationIcon(level = hardshipLevel, modifier = Modifier.size(28.dp))
+            }
             Text(
                 template.name,
                 style = MaterialTheme.typography.labelLarge,
@@ -7316,8 +10392,11 @@ private fun ScheduleNameTextField(
     onValueChange: (String) -> Unit,
 ) {
     var fieldValue by remember(scheduleId) { mutableStateOf(TextFieldValue(value)) }
-    LaunchedEffect(scheduleId, value) {
-        if (value != fieldValue.text && fieldValue.composition == null) {
+    var isFocused by remember(scheduleId) { mutableStateOf(false) }
+    val currentOnValueChange by rememberUpdatedState(onValueChange)
+    val focusManager = LocalFocusManager.current
+    LaunchedEffect(scheduleId, value, isFocused) {
+        if (!isFocused && value != fieldValue.text) {
             fieldValue = TextFieldValue(value)
         }
     }
@@ -7325,12 +10404,30 @@ private fun ScheduleNameTextField(
         value = fieldValue,
         onValueChange = { nextValue ->
             fieldValue = nextValue
-            onValueChange(nextValue.text)
+            // Keep the draft saveable while the field has focus. External value
+            // synchronization is paused while focused, so Korean IME composition is
+            // no longer overwritten or sent back to the previous cursor position.
+            currentOnValueChange(nextValue.text)
         },
         label = { Text(label) },
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(
+            onDone = { focusManager.clearFocus() },
+        ),
         singleLine = true,
-        modifier = modifier,
+        modifier = modifier.onFocusChanged { focusState ->
+            val lostFocus = isFocused && !focusState.isFocused
+            isFocused = focusState.isFocused
+            if (lostFocus) {
+                val committedName = fieldValue.text.trim().ifBlank { value }
+                if (committedName != value) {
+                    currentOnValueChange(committedName)
+                }
+                if (committedName != fieldValue.text) {
+                    fieldValue = TextFieldValue(committedName)
+                }
+            }
+        },
     )
 }
 
@@ -7429,40 +10526,44 @@ private fun ScheduleTemplateAllowedAppsEditor(
     template: ScheduleTemplatePolicy,
     templates: List<ScheduleTemplatePolicy>,
     installedApps: List<InstalledAppInfo>,
-    globalAllowedPackages: Set<String>,
+    allRestrictionsExemptPackages: Set<String>,
     temporaryAllowedApps: List<TemporaryAllowedAppSummary>,
     appSearchQuery: String,
     text: AppStrings,
     onSearchQueryChange: (String) -> Unit,
     onTemplatesChanged: (List<ScheduleTemplatePolicy>) -> Unit,
 ) {
-    val globalUserAllowedPackages = globalAllowedPackages - SafetyGate.neverBlockPackages
+    val directlyUnrestrictedPackages =
+        allRestrictionsExemptPackages - SafetyGate.neverBlockPackages
+    val unrestrictedPackages =
+        SafetyGate.expandedUserAllowedPackages(directlyUnrestrictedPackages)
     val scheduleOnlyAllowedPackages = template.allowedPackageNames -
-        globalUserAllowedPackages -
-        SafetyGate.neverBlockPackages
+        SafetyGate.neverBlockPackages -
+        unrestrictedPackages
     val temporaryAllowanceByPackage = temporaryAllowedApps.associateBy { allowance -> allowance.packageName }
     val temporaryAllowedPackages = temporaryAllowanceByPackage.keys - SafetyGate.neverBlockPackages
+    val visibleInstalledPackages = installedApps.map { app -> app.packageName }.toSet()
     val totalVisibleAllowedCount = (
-        scheduleOnlyAllowedPackages + globalUserAllowedPackages + temporaryAllowedPackages
-        ).size
+        scheduleOnlyAllowedPackages + temporaryAllowedPackages + unrestrictedPackages
+        ).count { packageName -> packageName in visibleInstalledPackages }
     val visibleApps = remember(
         installedApps,
-        scheduleOnlyAllowedPackages,
-        globalUserAllowedPackages,
-        temporaryAllowedPackages,
         appSearchQuery,
+        scheduleOnlyAllowedPackages,
+        temporaryAllowedPackages,
+        unrestrictedPackages,
     ) {
+        val effectiveAllowedPackages =
+            scheduleOnlyAllowedPackages + temporaryAllowedPackages + unrestrictedPackages
         installedApps
             .filterNot { app -> app.packageName in SafetyGate.neverBlockPackages }
             .filter { app ->
                 app.matchesAppSearch(appSearchQuery)
             }
             .sortedWith(
-                compareByDescending<InstalledAppInfo> { app -> app.packageName in globalUserAllowedPackages }
-                    .thenByDescending { app -> app.packageName in scheduleOnlyAllowedPackages }
-                    .thenByDescending { app -> app.packageName in temporaryAllowedPackages }
-                    .thenByDescending { app -> app.packageName in SafetyGate.communicationAppPackages }
-                    .thenBy { app -> app.appName.lowercase() },
+                compareByDescending<InstalledAppInfo> { app ->
+                    app.packageName in effectiveAllowedPackages
+                }.thenBy { app -> app.appName.lowercase() },
             )
     }
 
@@ -7493,25 +10594,31 @@ private fun ScheduleTemplateAllowedAppsEditor(
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(max = 320.dp),
-                resetKey = template.id to (
-                    appSearchQuery +
-                        scheduleOnlyAllowedPackages.sorted().joinToString(",") +
-                        globalUserAllowedPackages.sorted().joinToString(",") +
-                        temporaryAllowedPackages.sorted().joinToString(",")
-                    ),
+                resetKey = template.id to appSearchQuery,
             ) {
                 items(visibleApps, key = { app -> app.packageName }) { app ->
-                    val globallyAllowed = app.packageName in globalUserAllowedPackages
                     val scheduleAllowed = app.packageName in scheduleOnlyAllowedPackages
+                    val directlyUnrestricted = app.packageName in directlyUnrestrictedPackages
+                    val linkedFamily = SafetyGate.linkedAppFamily(
+                        targetPackageName = app.packageName,
+                        directlyAllowedPackages = directlyUnrestrictedPackages,
+                    )
+                    val unrestricted = app.packageName in unrestrictedPackages
                     val temporaryAllowance = temporaryAllowanceByPackage[app.packageName]
-                    val selected = globallyAllowed || scheduleAllowed || temporaryAllowance != null
+                    val selected = unrestricted || scheduleAllowed || temporaryAllowance != null
                     UserAllowedAppRow(
                         app = app,
                         selected = selected,
                         text = text,
-                        enabled = !globallyAllowed && temporaryAllowance == null,
+                        enabled = !unrestricted && temporaryAllowance == null,
                         statusLabel = when {
-                            globallyAllowed || scheduleAllowed -> text.allowed
+                            directlyUnrestricted -> if (text.appLanguage == AppLanguage.Korean) {
+                                "제한 없음"
+                            } else {
+                                "Unrestricted"
+                            }
+                            linkedFamily != null -> linkedUnrestrictedLabel(linkedFamily, text)
+                            scheduleAllowed -> text.allowed
                             temporaryAllowance != null -> temporaryAllowanceStatusLabel(temporaryAllowance, text)
                             else -> text.allow
                         },
@@ -7524,7 +10631,11 @@ private fun ScheduleTemplateAllowedAppsEditor(
                             onTemplatesChanged(
                                 templates.map { item ->
                                     if (item.id == template.id) {
-                                        item.copy(allowedPackageNames = nextPackages - SafetyGate.neverBlockPackages)
+                                        item.copy(
+                                            allowedPackageNames = nextPackages -
+                                                SafetyGate.neverBlockPackages -
+                                                unrestrictedPackages,
+                                        )
                                     } else {
                                         item
                                     }
@@ -7614,9 +10725,12 @@ fun PolicyPillButton(label: String, modifier: Modifier = Modifier, onClick: () -
 @Composable
 fun AppGroupChip(
     name: String,
-    budgetMinutes: Int,
+    budgetMinutes: Int?,
     appCount: Int,
     selected: Boolean,
+    text: AppStrings,
+    activeDays: Set<Int>,
+    hardshipLevel: HardshipLevel = HardshipLevel.Off,
     onClick: () -> Unit,
 ) {
     val dotColor = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
@@ -7630,6 +10744,9 @@ fun AppGroupChip(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            if (hardshipLevel != HardshipLevel.Off) {
+                HardshipMeditationIcon(level = hardshipLevel, modifier = Modifier.size(28.dp))
+            }
             Surface(modifier = Modifier.size(10.dp), shape = CircleShape, color = dotColor) {}
             Text(
                 name,
@@ -7639,7 +10756,11 @@ fun AppGroupChip(
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${formatLimitMinutesLabel(budgetMinutes)} \u00B7 $appCount",
+                "${when (budgetMinutes) {
+                    null -> text.noLimit
+                    0 -> text.zeroMinuteBlockLabel()
+                    else -> formatLimitMinutesLabel(budgetMinutes)
+                }} \u00B7 $appCount \u00B7 ${scheduleDaysSummary(activeDays, text)}",
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -7766,9 +10887,14 @@ fun AppLimitRow(
     unlockedForToday: Boolean,
     temporaryRemainingMinutes: Int,
     text: AppStrings,
+    activeDays: Set<Int> = (1..7).toSet(),
+    accessScopeLabel: String? = null,
+    accessAllowed: Boolean? = null,
     onClick: () -> Unit,
+    hardshipLevel: HardshipLevel = HardshipLevel.Off,
+    onHardshipClick: (() -> Unit)? = null,
 ) {
-    val hasLimit = limitMinutes != null && limitMinutes > 0
+    val hasLimit = limitMinutes != null
 
     Column {
         Surface(
@@ -7786,18 +10912,33 @@ fun AppLimitRow(
                 Spacer(modifier = Modifier.width(16.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(app.appName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Text(
-                        when {
-                            unlockedForToday -> text.unlockedToday
-                            temporaryRemainingMinutes > 0 ->
-                                "${formatLimitMinutesLabel(temporaryRemainingMinutes)} ${text.temporaryAllowances}"
-                            hasLimit -> formatLimitWithAllowance(limitMinutes ?: 0, extraMinutes, false, text)
-                            extraMinutes > 0 -> "+${formatLimitMinutesLabel(extraMinutes)}"
-                            else -> text.noLimit
-                        },
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    accessScopeLabel?.let { label ->
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = when (accessAllowed) {
+                                true -> AppSafe
+                                false -> AppOver
+                                null -> MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
+                    if (hasLimit) {
+                        val normalizedDays = activeDays.normalizedPolicyDays()
+                        val activeToday = currentPolicyDayOfWeek() in normalizedDays
+                        Text(
+                            text = if (activeToday) {
+                                scheduleDaysSummary(normalizedDays, text)
+                            } else if (text.appLanguage == AppLanguage.Korean) {
+                                "${scheduleDaysSummary(normalizedDays, text)} · 오늘 미적용"
+                            } else {
+                                "${scheduleDaysSummary(normalizedDays, text)} · Not active today"
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
                 Surface(
                     shape = RoundedCornerShape(16.dp),
@@ -7812,6 +10953,7 @@ fun AppLimitRow(
                             unlockedForToday -> text.unlockedToday
                             temporaryRemainingMinutes > 0 ->
                                 "${formatLimitMinutesLabel(temporaryRemainingMinutes)} ${text.temporaryAllowances}"
+                            hasLimit && limitMinutes == 0 -> text.zeroMinuteBlockLabel()
                             hasLimit -> formatLimitWithAllowance(limitMinutes ?: 0, extraMinutes, false, text)
                             extraMinutes > 0 -> "+${formatLimitMinutesLabel(extraMinutes)}"
                             else -> text.addLimit
@@ -7834,6 +10976,40 @@ fun AppLimitRow(
                 )
             }
         }
+        if (onHardshipClick != null) {
+            Surface(
+                onClick = onHardshipClick,
+                modifier = Modifier.fillMaxWidth(),
+                color = if (hardshipLevel == HardshipLevel.Off) {
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                } else {
+                    hardshipLevelColor(hardshipLevel).copy(alpha = 0.10f)
+                },
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    HardshipMeditationIcon(level = hardshipLevel, modifier = Modifier.size(28.dp))
+                    Text(
+                        text = if (hardshipLevel == HardshipLevel.Off) {
+                            text.hardshipConfigureLabel()
+                        } else {
+                            text.hardshipLevelLabel(hardshipLevel)
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (hardshipLevel == HardshipLevel.Off) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            hardshipLevelColor(hardshipLevel)
+                        },
+                    )
+                }
+            }
+        }
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -7846,58 +11022,113 @@ fun AppLimitRow(
 private data class AppLimitAllocationInfo(
     val groupName: String,
     val groupBudgetMinutes: Int,
-    val usedByOtherAppsMinutes: Int,
-    val maxAllowedMinutes: Int,
 )
 
 private fun appLimitAllocationInfo(
     packageName: String,
     appGroups: List<AppGroupPolicy>,
-    appLimits: Map<String, Int>,
 ): AppLimitAllocationInfo? {
     val group = appGroups.firstOrNull { appGroup -> packageName in appGroup.packageNames } ?: return null
-    val usedByOtherApps = group.packageNames
-        .filterNot { groupPackageName -> groupPackageName == packageName }
-        .sumOf { groupPackageName -> appLimits[groupPackageName] ?: 0 }
-        .coerceAtLeast(0)
-    val maxAllowed = (group.budgetMinutes - usedByOtherApps)
-        .coerceIn(0, POLICY_MAX_MINUTES)
+    val groupLimitMinutes = group.limitMinutesOrNull() ?: return null
     return AppLimitAllocationInfo(
         groupName = group.name,
-        groupBudgetMinutes = group.budgetMinutes,
-        usedByOtherAppsMinutes = usedByOtherApps,
-        maxAllowedMinutes = maxAllowed,
+        groupBudgetMinutes = groupLimitMinutes,
     )
+}
+
+@Composable
+private fun PolicyAccessWarningDialog(
+    appName: String,
+    scopeName: String,
+    text: AppStrings,
+    onDismiss: () -> Unit,
+    onContinue: () -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(22.dp),
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, AppOver.copy(alpha = 0.28f)),
+        ) {
+            Column(
+                modifier = Modifier.padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text(
+                    if (text.appLanguage == AppLanguage.Korean) "현재 실행할 수 없는 앱" else "App currently blocked",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = AppOver,
+                )
+                Text(
+                    if (text.appLanguage == AppLanguage.Korean) {
+                        "$appName 앱은 ‘$scopeName’에서 허용되지 않아 시간만 설정해도 실행되지 않습니다. 허용 목록에 추가한 뒤 시간을 설정할 수 있습니다."
+                    } else {
+                        "$appName is not allowed by ‘$scopeName’. Add it to the allowed list before setting its time."
+                    },
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(1f)) {
+                        Text(if (text.appLanguage == AppLanguage.Korean) "취소" else "Cancel")
+                    }
+                    Button(onClick = onContinue, modifier = Modifier.weight(1f)) {
+                        Text(if (text.appLanguage == AppLanguage.Korean) "허용 후 설정" else "Allow & set")
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
 private fun AppLimitPickerDialog(
     app: InstalledAppInfo,
     initialLimitMinutes: Int?,
+    initialActiveDays: Set<Int>,
     allocationInfo: AppLimitAllocationInfo?,
     text: AppStrings,
     onDismiss: () -> Unit,
-    onApply: (Int?) -> Unit,
+    onApply: (Int?, Set<Int>) -> Unit,
 ) {
-    val maxAllowedMinutes = allocationInfo?.maxAllowedMinutes ?: POLICY_MAX_MINUTES
+    var selectedDays by remember(app.packageName, initialActiveDays) {
+        mutableStateOf(initialActiveDays.normalizedPolicyDays())
+    }
     val supportingText = allocationInfo?.let { info ->
-        text.appLimitGroupAllowance(
-            info.groupName.ifBlank { text.groupName },
-            info.maxAllowedMinutes,
-            info.groupBudgetMinutes,
-        )
+        if (text.appLanguage == AppLanguage.Korean) {
+            "${info.groupName.ifBlank { text.groupName }} 그룹 제한 ${formatLimitMinutesLabel(info.groupBudgetMinutes)}과 앱별 제한 중 먼저 도달하는 제한이 적용됩니다."
+        } else {
+            "The first limit reached applies: this app limit or the ${
+                info.groupName.ifBlank { text.groupName }
+            } group limit (${formatLimitMinutesLabel(info.groupBudgetMinutes)})."
+        }
     }
     TimeWheelPickerDialog(
         title = app.appName,
-        valueMinutes = (initialLimitMinutes ?: 0).coerceIn(0, maxAllowedMinutes),
+        valueMinutes = (initialLimitMinutes ?: 0).coerceIn(0, POLICY_MAX_MINUTES),
         lowerBound = 0,
-        upperBound = maxAllowedMinutes,
+        upperBound = POLICY_MAX_MINUTES,
         displayValue = { minutes ->
-            if (minutes == 0) text.noLimit else text.minutesPerDay(minutes)
+            if (minutes == 0) text.zeroMinuteBlockLabel() else text.minutesPerDay(minutes)
         },
         saveLabel = text.applyLimit,
         onDismiss = onDismiss,
-        onApply = { minutes -> onApply(minutes.takeIf { value -> value > 0 }) },
+        onApply = { minutes -> onApply(minutes, selectedDays) },
+        secondaryActionLabel = text.noLimit,
+        onSecondaryAction = { onApply(null, selectedDays) },
+        zeroValueWarning = text.zeroMinuteBlockWarning(),
+        additionalContent = {
+            ScheduleDaysEditor(
+                selectedDays = selectedDays,
+                text = text,
+                onDaysChanged = { days -> selectedDays = days.normalizedPolicyDays() },
+            )
+        },
         headerIcon = {
             Surface(
                 shape = CircleShape,
@@ -7908,6 +11139,7 @@ private fun AppLimitPickerDialog(
             }
         },
         supportingText = supportingText,
+        compactLayout = true,
     )
 }
 
@@ -7922,17 +11154,39 @@ fun formatLimitMinutesLabel(minutes: Int): String {
     }
 }
 
+private fun AppStrings.zeroMinuteBlockLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "사용 불가 · 0분" else "Blocked · 0m"
+
+private fun AppStrings.zeroMinuteBlockWarning(): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "사용 시간이 0분이므로 이 정책이 적용되는 동안 즉시 차단됩니다."
+    } else {
+        "A zero-minute limit blocks access immediately while this policy is active."
+    }
+
+private fun AppStrings.todayNotAppliedLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "오늘 미적용" else "Not active today"
+
 @Composable
 fun GroupAppSelectionRow(
     app: InstalledAppInfo,
     selected: Boolean,
     text: AppStrings,
+    assignedGroupName: String? = null,
+    accessScopeLabel: String? = null,
+    accessAllowed: Boolean? = null,
+    enabled: Boolean = true,
     onToggle: () -> Unit,
 ) {
     Column {
         Surface(
             onClick = onToggle,
-            color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f) else MaterialTheme.colorScheme.surface,
+            enabled = enabled,
+            color = when {
+                selected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                assignedGroupName != null -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+                else -> MaterialTheme.colorScheme.surface
+            },
         ) {
             Row(
                 modifier = Modifier
@@ -7942,24 +11196,46 @@ fun GroupAppSelectionRow(
             ) {
                 AppIcon(packageName = app.packageName, contentDescription = app.appName, size = 36.dp)
                 Spacer(modifier = Modifier.width(14.dp))
-                Text(
-                    app.appName,
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        app.appName,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (enabled || selected) {
+                            MaterialTheme.colorScheme.onSurface
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    accessScopeLabel?.let { label ->
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (accessAllowed == false) AppOver else AppSafe,
+                            maxLines = 1,
+                        )
+                    }
+                }
                 Surface(
+                    modifier = Modifier.widthIn(max = 180.dp),
                     shape = RoundedCornerShape(16.dp),
                     color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
                 ) {
                     Text(
-                        if (selected) text.inGroup else text.addToGroup,
+                        assignedGroupName
+                            ?.takeIf { groupName -> groupName.isNotBlank() }
+                            ?.let { groupName -> "${text.inGroup} · $groupName" }
+                            ?: accessScopeLabel?.takeIf { !enabled }
+                            ?: text.addToGroup,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                         color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
@@ -7977,8 +11253,11 @@ fun GroupAppSelectionRow(
 private fun UsagePolicySection(
     settings: UsagePolicySettings,
     temporaryUnlockState: TemporaryUnlockState,
+    activeHardshipPolicyKeys: Set<HardshipPolicyKey>,
+    hardshipRuntimeState: HardshipRuntimeState,
     installedApps: List<InstalledAppInfo>,
     allowedAppPackages: Set<String>,
+    allRestrictionsExemptPackages: Set<String>,
     text: AppStrings,
     isExpanded: Boolean,
     contentMode: PolicyContentMode,
@@ -7993,21 +11272,18 @@ private fun UsagePolicySection(
     allowOnlyModeExpanded: Boolean = true,
     onAllowOnlyModeExpandedChange: (Boolean) -> Unit = {},
     onPolicyDraftChanged: (UsagePolicySettings) -> Unit,
+    onStartHardshipConfigurationReflection: (HardshipPolicyKey) -> Unit,
+    onHardshipPolicyDraftChanged: (UsagePolicySettings, String) -> Unit,
     onAllowedAppsChanged: (Set<String>) -> Unit,
+    onAllRestrictionsExemptAppsChanged: (Set<String>) -> Unit,
 ) {
-    val dailyLimits = listOf(
-        settings.mondayLimitMinutes,
-        settings.tuesdayLimitMinutes,
-        settings.wednesdayLimitMinutes,
-        settings.thursdayLimitMinutes,
-        settings.fridayLimitMinutes,
-        settings.saturdayLimitMinutes,
-        settings.sundayLimitMinutes,
-    ).map { minutes -> minutes.coerceIn(0, DAILY_POLICY_MAX_MINUTES).toString() }
+    val dailyLimits = settings.dailyLimitMinutesByDayOrNull()
+        .map { minutes -> minutes?.toString().orEmpty() }
+    val dailyPolicyLocked = settings.dailyHardshipLevel == HardshipLevel.Level3 &&
+        dailyHardshipKey() in activeHardshipPolicyKeys
     var selectedDayIndex by remember { mutableStateOf(Calendar.getInstance().get(Calendar.DAY_OF_WEEK).toDayIndex()) }
     val appGroups = settings.normalizedAppGroups().normalizedForEditing()
-    val groupBudgetTotal = appGroups.sumOf { group -> group.budgetMinutes.coerceAtLeast(0) }
-    val minimumDailyLimit = groupBudgetTotal.coerceAtMost(DAILY_POLICY_MAX_MINUTES)
+    val groupBudgetTotal = appGroups.mapNotNull { group -> group.limitMinutesOrNull() }.sum()
     var activeGroupId by remember { mutableStateOf(appGroups.firstOrNull()?.id.orEmpty()) }
     LaunchedEffect(appGroups.map { group -> group.id }) {
         if (appGroups.isNotEmpty() && appGroups.none { group -> group.id == activeGroupId }) {
@@ -8015,6 +11291,7 @@ private fun UsagePolicySection(
         }
     }
     val appLimits = settings.appLimitMap()
+    val appLimitActiveDays = settings.appLimitActiveDayMap()
     val todayTemporaryUnlockState = temporaryUnlockState.forToday()
     var temporaryAllowanceNowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(todayTemporaryUnlockState) {
@@ -8037,32 +11314,91 @@ private fun UsagePolicySection(
     var appSearchQuery by remember { mutableStateOf("") }
     var appLimitFilter by remember { mutableStateOf(AppLimitFilter.All) }
     var selectedLimitApp by remember { mutableStateOf<InstalledAppInfo?>(null) }
+    var pendingInaccessibleLimitApp by remember { mutableStateOf<InstalledAppInfo?>(null) }
     var groupAppSearchQuery by remember { mutableStateOf("") }
+    var hardshipDialogPolicyKey by remember { mutableStateOf<HardshipPolicyKey?>(null) }
+    val directlyUnrestrictedPackages =
+        allRestrictionsExemptPackages - SafetyGate.neverBlockPackages
+    val expandedExemptPackages = remember(allRestrictionsExemptPackages) {
+        SafetyGate.expandedUserAllowedPackages(allRestrictionsExemptPackages) +
+            SafetyGate.neverBlockPackages
+    }
+    val activeAccessSchedule = settings.activeScheduleTemplate()
+
+    fun accessScopeFor(packageName: String): Pair<String, Boolean>? {
+        if (packageName in expandedExemptPackages) {
+            val linkedFamily = SafetyGate.linkedAppFamily(
+                targetPackageName = packageName,
+                directlyAllowedPackages = directlyUnrestrictedPackages,
+            )
+            return when {
+                linkedFamily != null -> linkedUnrestrictedLabel(linkedFamily, text) to true
+                text.appLanguage == AppLanguage.Korean -> "제한 없음" to true
+                else -> "Unrestricted" to true
+            }
+        }
+        val schedule = activeAccessSchedule
+        if (schedule != null) {
+            val allowed = SafetyGate.isUserAllowedPackage(packageName, schedule.allowedPackageNames) ||
+                packageName in expandedExemptPackages
+            return if (text.appLanguage == AppLanguage.Korean) {
+                "스케줄 · ${if (allowed) "허용" else "차단"}" to allowed
+            } else {
+                "Schedule · ${if (allowed) "Allowed" else "Blocked"}" to allowed
+            }
+        }
+        if (settings.allowOnlyModeEnabled) {
+            val allowed = SafetyGate.isUserAllowedPackage(packageName, allowedAppPackages) ||
+                packageName in expandedExemptPackages
+            return if (text.appLanguage == AppLanguage.Korean) {
+                "허용앱만 · ${if (allowed) "허용" else "차단"}" to allowed
+            } else {
+                "Allow-only · ${if (allowed) "Allowed" else "Blocked"}" to allowed
+            }
+        }
+        return null
+    }
 
     fun updateDraft(
         nextDailyLimits: List<String> = dailyLimits,
         nextAppGroups: List<AppGroupPolicy> = appGroups,
         nextAppLimits: Map<String, Int> = appLimits,
+        nextAppLimitActiveDays: Map<String, Set<Int>> = appLimitActiveDays,
     ) {
         onPolicyDraftChanged(
             buildUsagePolicySettings(
                 base = settings,
-                dailyLimits = nextDailyLimits,
+                dailyLimits = if (dailyPolicyLocked) dailyLimits else nextDailyLimits,
                 appGroups = nextAppGroups,
                 appLimits = nextAppLimits,
+                appLimitActiveDays = nextAppLimitActiveDays,
             ),
         )
     }
     val limitPolicy: @Composable ColumnScope.() -> Unit = {
         CollapsiblePolicyCard(
             title = text.dailyPolicy,
-            description = text.dailyPolicyDescription,
             icon = PolicySectionIcon.DailyLimit,
+            helpText = if (text.appLanguage == AppLanguage.Korean) {
+                "요일마다 기기 전체 사용시간을 정합니다. 앱별·그룹 제한과 함께 사용하면 가장 먼저 끝나는 시간 제한으로 차단됩니다."
+            } else {
+                "Sets total device time for each day. When combined with app or group limits, the first limit reached blocks usage."
+            },
             expanded = dailyPolicyExpanded,
             onExpandedChange = onDailyPolicyExpandedChange,
             text = text,
+            hardshipLevel = settings.dailyHardshipLevel,
+            reserveHeaderTrailingSpace = true,
             headerTrailing = {
-                Text(text.timePerDay, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Switch(
+                    checked = settings.dailyPolicyEnabled,
+                    enabled = !settings.dailyPolicyEnabled ||
+                        settings.dailyHardshipLevel == HardshipLevel.Off,
+                    onCheckedChange = { enabled ->
+                        onPolicyDraftChanged(settings.copy(dailyPolicyEnabled = enabled))
+                    },
+                    colors = hardshipAwareSwitchColors(settings.dailyHardshipLevel),
+                )
             },
         ) {
             DayLimitChips(
@@ -8072,17 +11408,19 @@ private fun UsagePolicySection(
                 selectedDayIndex = selectedDayIndex,
                 onDaySelected = { index -> selectedDayIndex = index },
             )
-            val selectedMinutes = dailyLimits[selectedDayIndex].toIntOrNull() ?: 0
+            val selectedMinutes = dailyLimits[selectedDayIndex].toIntOrNull()
             MinuteControlPanel(
                 valueMinutes = selectedMinutes,
                 onValueMinutesChange = { minutes ->
-                    val safeMinutes = if (minutes == 0) {
-                        0
-                    } else {
-                        minutes.coerceAtLeast(minimumDailyLimit)
-                    }
                     val nextDailyLimits = dailyLimits.toMutableList().also { limits ->
-                        limits[selectedDayIndex] = safeMinutes.toString()
+                        limits[selectedDayIndex] =
+                            minutes.coerceIn(0, DAILY_POLICY_MAX_MINUTES).toString()
+                    }
+                    updateDraft(nextDailyLimits = nextDailyLimits)
+                },
+                onRemoveLimit = {
+                    val nextDailyLimits = dailyLimits.toMutableList().also { limits ->
+                        limits[selectedDayIndex] = ""
                     }
                     updateDraft(nextDailyLimits = nextDailyLimits)
                 },
@@ -8117,27 +11455,83 @@ private fun UsagePolicySection(
                     },
                 )
             }
+            HardshipModeFooter(
+                policyType = HardshipPolicyType.DailyLimit,
+                level = settings.dailyHardshipLevel,
+                enabled = settings.dailyPolicyEnabled &&
+                    dailyLimits.any { value -> value.toIntOrNull() != null },
+                text = text,
+                onClick = { hardshipDialogPolicyKey = dailyHardshipKey() },
+            )
+            if (dailyPolicyLocked) {
+                Text(
+                    text = text.hardshipLockedLabel(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppOver,
+                )
+            } else if (settings.dailyHardshipLevel != HardshipLevel.Off) {
+                Text(
+                    text = if (text.appLanguage == AppLanguage.Korean) {
+                        "요일별 제한을 끄려면 고행 모드를 먼저 해제하세요."
+                    } else {
+                        "Disable hardship before turning daily limits off."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppOver,
+                )
+            }
         }
     }
 
     val groupPolicy: @Composable ColumnScope.() -> Unit = {
         CollapsiblePolicyCard(
             title = text.appGroups,
-            description = text.appGroupsDescription,
             icon = PolicySectionIcon.AppGroups,
+            helpText = if (text.appLanguage == AppLanguage.Korean) {
+                "여러 앱이 하나의 시간을 함께 사용합니다. 앱은 한 그룹에만 포함되며, 앱별 제한이 있으면 먼저 끝나는 제한이 적용됩니다."
+            } else {
+                "Apps share one group budget. An app can belong to one group, and the first group or app limit reached applies."
+            },
             expanded = appGroupsExpanded,
             onExpandedChange = onAppGroupsExpandedChange,
             text = text,
+            hardshipLevel = settings.hardshipLevelFor(HardshipPolicyType.AppGroups),
+            reserveHeaderTrailingSpace = true,
+            headerTrailing = {
+                Text(
+                    text = if (text.appLanguage == AppLanguage.Korean) {
+                        "그룹 ${appGroups.size}개"
+                    } else {
+                        "${appGroups.size} groups"
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            },
         ) {
             val activeGroup = appGroups.firstOrNull { group -> group.id == activeGroupId }
                 ?: appGroups.firstOrNull()
+            val assignedGroupByPackage = buildMap {
+                appGroups.forEach { group ->
+                    group.packageNames.forEach { packageName ->
+                        if (packageName !in this) {
+                            put(packageName, group)
+                        }
+                    }
+                }
+            }
+            val activeGroupLocked = activeGroup?.let { group ->
+                group.hardshipLevel == HardshipLevel.Level3 &&
+                    appGroupHardshipKey(group.id) in activeHardshipPolicyKeys
+            } == true
             val groupVisibleApps = installedApps
+                .filterNot { app -> app.packageName in SafetyGate.neverBlockPackages }
                 .filter { app -> app.matchesAppSearch(groupAppSearchQuery) }
-                .sortedWith(
-                    compareByDescending<InstalledAppInfo> { app ->
-                        app.packageName in activeGroup?.packageNames.orEmpty()
-                    }.thenBy { app -> app.appName.lowercase() },
-                )
+                .sortedBy { app -> app.appName.lowercase() }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End,
@@ -8181,6 +11575,7 @@ private fun UsagePolicySection(
                                 .orEmpty()
                             updateDraft(nextAppGroups = nextGroups)
                         },
+                        enabled = !activeGroupLocked,
                         shape = RoundedCornerShape(16.dp),
                         color = AppOver.copy(alpha = 0.12f),
                     ) {
@@ -8196,7 +11591,6 @@ private fun UsagePolicySection(
             }
             GroupBudgetSummary(
                 totalMinutes = groupBudgetTotal,
-                dailyMinimumMinutes = minimumDailyLimit,
                 text = text,
             )
             Row(
@@ -8208,9 +11602,12 @@ private fun UsagePolicySection(
                 appGroups.forEach { group ->
                     AppGroupChip(
                         name = group.name.ifBlank { text.groupName },
-                        budgetMinutes = group.budgetMinutes,
+                        budgetMinutes = group.limitMinutesOrNull(),
                         appCount = group.packageNames.size,
                         selected = activeGroupId == group.id,
+                        text = text,
+                        activeDays = group.activeDays,
+                        hardshipLevel = group.hardshipLevel,
                     ) {
                         activeGroupId = group.id
                     }
@@ -8222,31 +11619,62 @@ private fun UsagePolicySection(
                     value = activeGroup.name,
                     label = text.groupName,
                     onValueChange = { value ->
-                        val nextGroups = appGroups.replaceGroupById(
-                            activeGroup.id,
-                            activeGroup.copy(name = value),
-                        )
-                        updateDraft(nextAppGroups = nextGroups)
+                        if (!activeGroupLocked) {
+                            val nextGroups = appGroups.replaceGroupById(
+                                activeGroup.id,
+                                activeGroup.copy(name = value),
+                            )
+                            updateDraft(nextAppGroups = nextGroups)
+                        }
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
                 key(activeGroup.id) {
-                    val assignedAppLimitTotal = activeGroup.packageNames
-                        .sumOf { packageName -> appLimits[packageName] ?: 0 }
-                        .coerceAtMost(POLICY_MAX_MINUTES)
                     MinuteControlPanel(
-                        valueMinutes = activeGroup.budgetMinutes.coerceAtLeast(assignedAppLimitTotal),
+                        valueMinutes = activeGroup.limitMinutesOrNull(),
                         onValueMinutesChange = { minutes ->
-                            val nextGroups = appGroups.replaceGroupById(
-                                activeGroup.id,
-                                activeGroup.copy(budgetMinutes = minutes.coerceAtLeast(assignedAppLimitTotal)),
-                            )
-                            updateDraft(nextAppGroups = nextGroups)
+                            if (!activeGroupLocked) {
+                                val nextGroups = appGroups.replaceGroupById(
+                                    activeGroup.id,
+                                    activeGroup.copy(budgetMinutes = encodeOptionalLimitMinutes(minutes)),
+                                )
+                                updateDraft(nextAppGroups = nextGroups)
+                            }
+                        },
+                        onRemoveLimit = {
+                            if (!activeGroupLocked) {
+                                val nextGroups = appGroups.replaceGroupById(
+                                    activeGroup.id,
+                                    activeGroup.copy(budgetMinutes = 0),
+                                )
+                                updateDraft(nextAppGroups = nextGroups)
+                            }
                         },
                         text = text,
                         title = text.groupBudgetMinutes,
-                        minMinutes = assignedAppLimitTotal,
+                        minMinutes = 0,
                         maxMinutes = POLICY_MAX_MINUTES,
+                        pickerSaveLabel = if (text.appLanguage == AppLanguage.Korean) "저장" else "Save",
+                    )
+                }
+                if (activeGroupLocked) {
+                    Text(
+                        text = "${text.scheduleDays}: ${scheduleDaysSummary(activeGroup.activeDays, text)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    ScheduleDaysEditor(
+                        selectedDays = activeGroup.activeDays,
+                        text = text,
+                        onDaysChanged = { days ->
+                            val nextGroups = appGroups.replaceGroupById(
+                                activeGroup.id,
+                                activeGroup.copy(activeDays = days.normalizedPolicyDays()),
+                            )
+                            updateDraft(nextAppGroups = nextGroups)
+                        },
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -8260,6 +11688,17 @@ private fun UsagePolicySection(
                         groupAppSearchQuery = it
                     },
                 )
+                if (activeAccessSchedule != null || settings.allowOnlyModeEnabled) {
+                    Text(
+                        if (text.appLanguage == AppLanguage.Korean) {
+                            "현재 실행 범위에서 차단된 앱은 그룹에 새로 넣을 수 없습니다. 허용앱만 또는 스케줄에서 먼저 허용해 주세요. 기존 그룹 앱은 제거할 수 있습니다."
+                        } else {
+                            "Apps blocked by the active access mode cannot be added to a group. Allow them in allow-only or schedule first. Existing members can still be removed."
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 if (groupVisibleApps.isEmpty()) {
                     Text(text.noSelectableApps)
                 } else {
@@ -8270,22 +11709,52 @@ private fun UsagePolicySection(
                         resetKey = activeGroup.id to groupAppSearchQuery,
                     ) {
                         items(groupVisibleApps, key = { app -> app.packageName }) { app ->
+                            val assignedGroup = assignedGroupByPackage[app.packageName]
+                            val selectedInActiveGroup = assignedGroup?.id == activeGroup.id
+                            val accessScope = accessScopeFor(app.packageName)
+                            val unrestricted = app.packageName in expandedExemptPackages
+                            val selectable = !activeGroupLocked &&
+                                (assignedGroup == null || selectedInActiveGroup) &&
+                                (selectedInActiveGroup || (!unrestricted && accessScope?.second != false))
                             GroupAppSelectionRow(
                                 app = app,
-                                selected = app.packageName in activeGroup.packageNames,
+                                selected = selectedInActiveGroup,
+                                assignedGroupName = assignedGroup?.name?.ifBlank { text.groupName },
+                                accessScopeLabel = accessScope?.first,
+                                accessAllowed = accessScope?.second,
+                                enabled = selectable,
                                 text = text,
                                 onToggle = {
-                                    updateDraft(
-                                        nextAppGroups = appGroups.togglePackageForGroupId(
-                                            activeGroup.id,
-                                            app.packageName,
-                                        ),
-                                    )
+                                    if (selectable) {
+                                        updateDraft(
+                                            nextAppGroups = appGroups.togglePackageForGroupId(
+                                                activeGroup.id,
+                                                app.packageName,
+                                            ),
+                                        )
+                                    }
                                 },
                             )
                         }
                     }
                 }
+            }
+            HardshipModeFooter(
+                policyType = HardshipPolicyType.AppGroups,
+                level = activeGroup?.hardshipLevel ?: HardshipLevel.Off,
+                enabled = activeGroup != null &&
+                    activeGroup.limitMinutesOrNull() != null &&
+                    activeGroup.packageNames.isNotEmpty(),
+                text = text,
+                onClick = { activeGroup?.let { group -> hardshipDialogPolicyKey = appGroupHardshipKey(group.id) } },
+            )
+            if (activeGroupLocked) {
+                Text(
+                    text = text.hardshipLockedLabel(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppOver,
+                )
             }
         }
     }
@@ -8293,16 +11762,23 @@ private fun UsagePolicySection(
     val appLimitsSection: @Composable ColumnScope.() -> Unit = {
         CollapsiblePolicyCard(
             title = text.appLimits,
-            description = text.appLimitsDescription,
             icon = PolicySectionIcon.AppLimits,
+            helpText = if (text.appLanguage == AppLanguage.Korean) {
+                "앱마다 사용할 시간을 정합니다. 허용앱만 또는 스케줄에서 실행이 허용된 앱에만 실제로 사용할 수 있습니다."
+            } else {
+                "Sets time per app. The app must also be allowed by the active allow-only mode or schedule to open."
+            },
             expanded = appLimitsExpanded,
             onExpandedChange = onAppLimitsExpandedChange,
             text = text,
+            hardshipLevel = settings.hardshipLevelFor(HardshipPolicyType.AppLimits),
+            reserveHeaderTrailingSpace = true,
             headerTrailing = {
                 Text(text.activeAppLimits(appLimits.size), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             },
         ) {
             val visibleApps = installedApps
+                .filterNot { app -> app.packageName in SafetyGate.neverBlockPackages }
                 .filter { app -> app.matchesAppSearch(appSearchQuery) }
                 .filter { app ->
                     when (appLimitFilter) {
@@ -8311,10 +11787,7 @@ private fun UsagePolicySection(
                         AppLimitFilter.Unrestricted -> app.packageName !in appLimits
                     }
                 }
-                .sortedWith(
-                    compareByDescending<InstalledAppInfo> { app -> app.packageName in appLimits }
-                        .thenBy { app -> app.appName.lowercase() },
-                )
+                .sortedBy { app -> app.appName.lowercase() }
             SearchBox(
                 value = appSearchQuery,
                 placeholder = text.searchApps,
@@ -8329,7 +11802,10 @@ private fun UsagePolicySection(
                 AppFilterChip(text.limitedApps, appLimitFilter == AppLimitFilter.Limited) {
                     appLimitFilter = AppLimitFilter.Limited
                 }
-                AppFilterChip(text.unrestrictedApps, appLimitFilter == AppLimitFilter.Unrestricted) {
+                AppFilterChip(
+                    if (text.appLanguage == AppLanguage.Korean) "미설정" else "Not set",
+                    appLimitFilter == AppLimitFilter.Unrestricted,
+                ) {
                     appLimitFilter = AppLimitFilter.Unrestricted
                 }
             }
@@ -8344,6 +11820,12 @@ private fun UsagePolicySection(
                     items(visibleApps, key = { app -> app.packageName }) { app ->
                         val appLimit = appLimits[app.packageName]
                         val allowance = todayTemporaryUnlockState.packageAllowances[app.packageName]
+                        val appHardshipKey = appLimitHardshipKey(app.packageName)
+                        val appHardshipLevel = settings.hardshipLevelFor(appHardshipKey)
+                        val appLimitLocked = appHardshipLevel == HardshipLevel.Level3 &&
+                            appHardshipKey in activeHardshipPolicyKeys
+                        val accessScope = accessScopeFor(app.packageName)
+                        val unrestricted = app.packageName in expandedExemptPackages
                         AppLimitRow(
                             app = app,
                             limitMinutes = appLimit,
@@ -8351,7 +11833,23 @@ private fun UsagePolicySection(
                             unlockedForToday = allowance?.unlockedForToday == true,
                             temporaryRemainingMinutes = allowance?.temporaryRemainingMinutes() ?: 0,
                             text = text,
-                            onClick = { selectedLimitApp = app },
+                            activeDays = appLimitActiveDays[app.packageName] ?: (1..7).toSet(),
+                            accessScopeLabel = accessScope?.first,
+                            accessAllowed = accessScope?.second,
+                            onClick = {
+                                when {
+                                    unrestricted -> Unit
+                                    appLimitLocked -> hardshipDialogPolicyKey = appHardshipKey
+                                    accessScope?.second == false -> pendingInaccessibleLimitApp = app
+                                    else -> selectedLimitApp = app
+                                }
+                            },
+                            hardshipLevel = appHardshipLevel,
+                            onHardshipClick = if (appLimit != null) {
+                                { hardshipDialogPolicyKey = appHardshipKey }
+                            } else {
+                                null
+                            },
                         )
                     }
                 }
@@ -8359,23 +11857,62 @@ private fun UsagePolicySection(
         }
     }
 
+    pendingInaccessibleLimitApp?.let { app ->
+        PolicyAccessWarningDialog(
+            appName = app.appName,
+            scopeName = if (activeAccessSchedule != null) {
+                activeAccessSchedule.name.ifBlank { text.scheduleBlocking }
+            } else {
+                text.allowOnlyMode
+            },
+            text = text,
+            onDismiss = { pendingInaccessibleLimitApp = null },
+            onContinue = {
+                if (activeAccessSchedule != null) {
+                    val updatedSchedules = settings.normalizedScheduleTemplates().map { schedule ->
+                        if (schedule.id == activeAccessSchedule.id) {
+                            schedule.copy(allowedPackageNames = schedule.allowedPackageNames + app.packageName)
+                        } else {
+                            schedule
+                        }
+                    }
+                    onPolicyDraftChanged(
+                        settings.copy(scheduleTemplates = updatedSchedules.toScheduleTemplatesEncoded()),
+                    )
+                } else if (settings.allowOnlyModeEnabled) {
+                    onAllowedAppsChanged(allowedAppPackages + app.packageName)
+                }
+                pendingInaccessibleLimitApp = null
+                selectedLimitApp = app
+            },
+        )
+    }
+
     selectedLimitApp?.let { app ->
-        val allocationInfo = appLimitAllocationInfo(app.packageName, appGroups, appLimits)
+        val allocationInfo = appLimitAllocationInfo(app.packageName, appGroups)
         AppLimitPickerDialog(
             app = app,
             initialLimitMinutes = appLimits[app.packageName],
+            initialActiveDays = appLimitActiveDays[app.packageName] ?: (1..7).toSet(),
             allocationInfo = allocationInfo,
             text = text,
             onDismiss = { selectedLimitApp = null },
-            onApply = { minutes ->
-                val cappedMinutes = minutes?.coerceAtMost(allocationInfo?.maxAllowedMinutes ?: POLICY_MAX_MINUTES)
+            onApply = { minutes, activeDays ->
                 val nextAppLimits = if (minutes == null) {
                     appLimits - app.packageName
                 } else {
-                    appLimits + (app.packageName to (cappedMinutes ?: minutes))
+                    appLimits + (app.packageName to minutes.coerceAtMost(POLICY_MAX_MINUTES))
+                }
+                val nextActiveDays = if (minutes == null) {
+                    appLimitActiveDays - app.packageName
+                } else {
+                    appLimitActiveDays + (app.packageName to activeDays.normalizedPolicyDays())
                 }
                 selectedLimitApp = null
-                updateDraft(nextAppLimits = nextAppLimits)
+                updateDraft(
+                    nextAppLimits = nextAppLimits,
+                    nextAppLimitActiveDays = nextActiveDays,
+                )
             },
         )
     }
@@ -8383,9 +11920,6 @@ private fun UsagePolicySection(
     when (contentMode) {
         PolicyContentMode.TimeControls -> {
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                PolicyTabIntro(
-                    description = text.timeTabDescription,
-                )
                 AdaptiveTwoPane(
                     isExpanded = isExpanded,
                     leftContent = {
@@ -8401,32 +11935,81 @@ private fun UsagePolicySection(
 
         PolicyContentMode.BlockingControls -> {
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                PolicyTabIntro(
-                    description = text.blockingTabDescription,
-                )
                 ScheduleBlockingCard(
                     settings = settings,
                     installedApps = installedApps,
-                    allowedAppPackages = allowedAppPackages,
+                    allRestrictionsExemptPackages = allRestrictionsExemptPackages,
                     temporaryAllowedApps = temporaryAllowedApps,
                     text = text,
                     expanded = scheduleBlockingExpanded,
                     onExpandedChange = onScheduleBlockingExpandedChange,
                     onUpdateSettings = onPolicyDraftChanged,
+                    activeHardshipPolicyKeys = activeHardshipPolicyKeys,
+                    onHardshipConfigure = { key -> hardshipDialogPolicyKey = key },
                 )
                 AllowOnlyModeCard(
                     settings = settings,
                     installedApps = installedApps,
                     allowedAppPackages = allowedAppPackages,
+                    allRestrictionsExemptPackages = allRestrictionsExemptPackages,
                     temporaryAllowedApps = temporaryAllowedApps,
                     text = text,
                     expanded = allowOnlyModeExpanded,
                     onExpandedChange = onAllowOnlyModeExpandedChange,
                     onUpdateSettings = onPolicyDraftChanged,
                     onAllowedAppsChanged = onAllowedAppsChanged,
+                    hardshipActive = allowOnlyHardshipKey() in activeHardshipPolicyKeys &&
+                        settings.allowOnlyHardshipLevel == HardshipLevel.Level3,
+                    onHardshipConfigure = { hardshipDialogPolicyKey = allowOnlyHardshipKey() },
+                )
+                PolicyExceptionAppsCard(
+                    settings = settings,
+                    installedApps = installedApps,
+                    exemptPackages = allRestrictionsExemptPackages,
+                    activeHardshipPolicyKeys = activeHardshipPolicyKeys,
+                    text = text,
+                    onExemptPackagesChanged = onAllRestrictionsExemptAppsChanged,
                 )
             }
         }
+    }
+
+    hardshipDialogPolicyKey?.let { policyKey ->
+        val targetName = when (policyKey.policyType) {
+            HardshipPolicyType.AppGroups -> appGroups.firstOrNull { group -> group.id == policyKey.targetId }?.name.orEmpty()
+            HardshipPolicyType.AppLimits -> installedApps
+                .firstOrNull { app -> app.packageName == policyKey.targetId }
+                ?.appName
+                ?: policyKey.targetId
+            HardshipPolicyType.Schedule -> settings.normalizedScheduleTemplates()
+                .firstOrNull { schedule -> schedule.id == policyKey.targetId }
+                ?.name
+                .orEmpty()
+            else -> ""
+        }
+        HardshipModeDialog(
+            policyKey = policyKey,
+            policyType = policyKey.policyType,
+            targetName = targetName,
+            currentLevel = settings.hardshipLevelFor(policyKey),
+            level3Locked = policyKey in activeHardshipPolicyKeys &&
+                settings.hardshipLevelFor(policyKey) == HardshipLevel.Level3,
+            allRestrictionsExemptAppCount = allRestrictionsExemptPackages.size,
+            configurationReflectionReadyAtMillis =
+                hardshipRuntimeState.configurationReflectionReadyAtMillis(policyKey),
+            text = text,
+            onDismiss = { hardshipDialogPolicyKey = null },
+            onStartConfigurationReflection = {
+                onStartHardshipConfigurationReflection(policyKey)
+            },
+            onApply = { level, adminPin ->
+                hardshipDialogPolicyKey = null
+                onHardshipPolicyDraftChanged(
+                    settings.withHardshipLevel(policyKey, level),
+                    adminPin,
+                )
+            },
+        )
     }
 }
 
@@ -8556,11 +12139,13 @@ fun List<AppGroupPolicy>.togglePackageForGroupId(groupId: String, packageName: S
     }
     val targetGroup = firstOrNull { group -> group.id == groupId } ?: return this
     val adding = packageName !in targetGroup.packageNames
+    if (adding && any { group -> group.id != groupId && packageName in group.packageNames }) {
+        return this
+    }
     return map { group ->
         when {
             group.id == groupId && adding -> group.copy(packageNames = group.packageNames + packageName)
             group.id == groupId -> group.copy(packageNames = group.packageNames - packageName)
-            adding -> group.copy(packageNames = group.packageNames - packageName)
             else -> group
         }
     }
@@ -8571,49 +12156,62 @@ fun buildUsagePolicySettings(
     dailyLimits: List<String>,
     appGroups: List<AppGroupPolicy>,
     appLimits: Map<String, Int>,
+    appLimitActiveDays: Map<String, Set<Int>>,
 ): UsagePolicySettings {
     val cleanAppLimits = appLimits
-        .filter { (packageName, minutes) -> packageName.isNotBlank() && minutes > 0 }
+        .filter { (packageName, minutes) -> packageName.isNotBlank() && minutes >= 0 }
         .mapValues { (_, minutes) -> minutes.coerceIn(0, POLICY_MAX_MINUTES) }
     val cleanGroups = appGroups.normalizedForEditing()
         .map { group ->
-            val assignedAppLimitTotal = group.packageNames.sumOf { packageName -> cleanAppLimits[packageName] ?: 0 }
-            group.copy(budgetMinutes = group.budgetMinutes.coerceAtLeast(assignedAppLimitTotal))
+            group.copy(
+                budgetMinutes = group.budgetMinutes.coerceIn(
+                    com.manisykh.screenrest.data.EXPLICIT_ZERO_LIMIT_STORAGE_MINUTES,
+                    POLICY_MAX_MINUTES,
+                ),
+            )
         }
-    val groupBudgetTotal = cleanGroups.sumOf { group -> group.budgetMinutes.coerceAtLeast(0) }
+    val cleanAppLimitActiveDays = cleanAppLimits.keys.associateWith { packageName ->
+        appLimitActiveDays[packageName]?.normalizedPolicyDays() ?: (1..7).toSet()
+    }
     val safeDailyLimits = (0..6).map { index ->
-        val minutes = dailyLimits.getOrNull(index).toLimitMinutes()
-        if (groupBudgetTotal > 0 && minutes > 0) {
-            minutes.coerceAtLeast(groupBudgetTotal).coerceAtMost(DAILY_POLICY_MAX_MINUTES)
-        } else {
-            minutes
-        }
+        dailyLimits.getOrNull(index)
+            ?.trim()
+            ?.toIntOrNull()
+            ?.coerceIn(0, DAILY_POLICY_MAX_MINUTES)
     }
     val primaryGroup = cleanGroups.firstOrNull()
     return base.copy(
-        weekdayLimitMinutes = safeDailyLimits[0],
-        weekendLimitMinutes = safeDailyLimits[5],
-        mondayLimitMinutes = safeDailyLimits[0],
-        tuesdayLimitMinutes = safeDailyLimits[1],
-        wednesdayLimitMinutes = safeDailyLimits[2],
-        thursdayLimitMinutes = safeDailyLimits[3],
-        fridayLimitMinutes = safeDailyLimits[4],
-        saturdayLimitMinutes = safeDailyLimits[5],
-        sundayLimitMinutes = safeDailyLimits[6],
+        weekdayLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[0]),
+        weekendLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[5]),
+        mondayLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[0]),
+        tuesdayLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[1]),
+        wednesdayLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[2]),
+        thursdayLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[3]),
+        fridayLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[4]),
+        saturdayLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[5]),
+        sundayLimitMinutes = encodeOptionalLimitMinutes(safeDailyLimits[6]),
         appGroupName = primaryGroup?.name.orEmpty(),
         appGroupPackages = primaryGroup?.packageNames.orEmpty().sorted().joinToString(","),
         appGroupBudgetMinutes = primaryGroup?.budgetMinutes ?: 0,
         appGroups = cleanGroups.toAppGroupsEncoded(),
         appLimitRules = cleanAppLimits.toAppLimitRules(),
+        appLimitActiveDays = cleanAppLimitActiveDays.toAppLimitActiveDaysEncoded(),
     )
 }
 
 fun List<AppGroupPolicy>.normalizedForEditing(): List<AppGroupPolicy> {
+    val assignedPackages = mutableSetOf<String>()
     val cleanGroups = mapIndexed { index, group ->
         group.copy(
             name = group.name,
-            packageNames = group.packageNames.filter { packageName -> packageName.isNotBlank() }.toSet(),
-            budgetMinutes = group.budgetMinutes.coerceIn(0, POLICY_MAX_MINUTES),
+            packageNames = group.packageNames
+                .filter { packageName -> packageName.isNotBlank() && assignedPackages.add(packageName) }
+                .toSet(),
+            budgetMinutes = group.budgetMinutes.coerceIn(
+                com.manisykh.screenrest.data.EXPLICIT_ZERO_LIMIT_STORAGE_MINUTES,
+                POLICY_MAX_MINUTES,
+            ),
+            activeDays = group.activeDays.normalizedPolicyDays(),
             id = group.id.ifBlank { "legacy-$index" },
         )
     }
@@ -8668,6 +12266,14 @@ fun formatStatsWeekdayLabel(dayStartMillis: Long): String {
 
 fun formatStatsDateLabel(dayStartMillis: Long): String {
     return SimpleDateFormat("M/d", Locale.getDefault()).format(Date(dayStartMillis))
+}
+
+private fun AppStrings.recordedDaysLabel(recordedDays: Int, totalDays: Int): String {
+    return if (appLanguage == AppLanguage.Korean) {
+        "${totalDays}일 중 ${recordedDays}일 기록"
+    } else {
+        "$recordedDays of $totalDays days recorded"
+    }
 }
 
 fun isToday(dayStartMillis: Long): Boolean {
@@ -8744,6 +12350,10 @@ fun formatClockTime(timestampMillis: Long): String {
     return SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(timestampMillis))
 }
 
+private fun formatDateTime(timestampMillis: Long): String {
+    return SimpleDateFormat("M/d HH:mm", Locale.getDefault()).format(Date(timestampMillis))
+}
+
 private fun formatMonitorAge(ageMillis: Long): String {
     val totalSeconds = (ageMillis.coerceAtLeast(0L) / 1_000L).toInt()
     return when {
@@ -8755,7 +12365,6 @@ private fun formatMonitorAge(ageMillis: Long): String {
 
 private const val MONITOR_STALE_WARNING_MILLIS = 90_000L
 private const val USAGE_CONSISTENCY_TOLERANCE_MILLIS = 2L * 60L * 1000L
-private const val FOREGROUND_FORCE_REFRESH_AFTER_MILLIS = 10_000L
 
 fun Int.toDayIndex(): Int {
     return when (this) {
@@ -8770,7 +12379,210 @@ fun Int.toDayIndex(): Int {
     }
 }
 
+private fun AppStrings.hardshipModeTitle(): String =
+    if (appLanguage == AppLanguage.Korean) "고행 모드" else "Hardship mode"
+
+private fun AppStrings.shortSaveLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "저장" else "Save"
+
+private fun AppStrings.shortPolicyUpToDateLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "완료" else "OK"
+
+private fun AppStrings.generatePairingCodePinInstruction(): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "자녀 기기 연결 코드를 생성하려면 관리 PIN을 입력하세요."
+    } else {
+        "Enter the admin PIN to generate a child device pairing code."
+    }
+
+private fun AppStrings.registerChildDevicePinInstruction(): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "자녀 기기를 등록하려면 관리 PIN을 입력하세요."
+    } else {
+        "Enter the admin PIN to register the child device."
+    }
+
+private fun AppStrings.hardshipLevel3ShortContinueLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "다음" else "Next"
+
+private fun AppStrings.hardshipLevel3ShortFinalApplyLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "적용" else "Apply"
+
+private fun AppStrings.hardshipConfigureLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "고행 모드 설정" else "Configure hardship mode"
+
+private fun AppStrings.hardshipChangeLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "설정 변경" else "Change settings"
+
+private fun AppStrings.hardshipDisableLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "고행 모드 사용 안 함" else "Turn off hardship mode"
+
+private fun AppStrings.hardshipNeedsPolicyLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "먼저 이 차단 정책을 설정하고 활성화해 주세요." else
+        "Configure and enable this blocking policy first."
+
+private fun AppStrings.hardshipLockedLabel(): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "고행 3단계 적용 중에는 이 정책을 약화하거나 해제할 수 없습니다."
+    } else {
+        "This policy cannot be weakened or disabled while hardship level 3 is active."
+    }
+
+private fun AppStrings.hardshipDialogTitle(): String =
+    if (appLanguage == AppLanguage.Korean) "고행 모드 단계 설정" else "Set hardship level"
+
+private fun AppStrings.hardshipLevelLabel(level: HardshipLevel): String {
+    return if (appLanguage == AppLanguage.Korean) {
+        "${level.storageValue}단계"
+    } else {
+        "Level ${level.storageValue}"
+    }
+}
+
+private fun AppStrings.hardshipLevelName(level: HardshipLevel): String {
+    return when (level) {
+        HardshipLevel.Off -> if (appLanguage == AppLanguage.Korean) "사용 안 함" else "Off"
+        HardshipLevel.Level1 -> if (appLanguage == AppLanguage.Korean) "숙고" else "Reflect"
+        HardshipLevel.Level2 -> if (appLanguage == AppLanguage.Korean) "통제" else "Controlled"
+        HardshipLevel.Level3 -> if (appLanguage == AppLanguage.Korean) "절대 집중" else "Absolute focus"
+    }
+}
+
+private fun AppStrings.hardshipPolicyLabel(policyType: HardshipPolicyType): String {
+    return when (policyType) {
+        HardshipPolicyType.DailyLimit -> dailyPolicy
+        HardshipPolicyType.AppGroups -> appGroups
+        HardshipPolicyType.AppLimits -> appLimits
+        HardshipPolicyType.Schedule -> scheduleBlocking
+        HardshipPolicyType.AllowOnly -> allowOnlyMode
+    }
+}
+
+private fun AppStrings.hardshipDialogTarget(policyType: HardshipPolicyType): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "적용 대상 · ${hardshipPolicyLabel(policyType)}"
+    } else {
+        "Applies to · ${hardshipPolicyLabel(policyType)}"
+    }
+
+private fun AppStrings.hardshipPolicyDescription(policyType: HardshipPolicyType): String {
+    return if (appLanguage == AppLanguage.Korean) {
+        "${hardshipPolicyLabel(policyType)}으로 차단됐을 때 사용할 해제 방식을 제한합니다."
+    } else {
+        "Restrict the unlock methods available when ${hardshipPolicyLabel(policyType)} blocks an app."
+    }
+}
+
+private fun AppStrings.hardshipConfiguredDescription(level: HardshipLevel): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "${hardshipLevelLabel(level)} · ${hardshipLevelName(level)} 설정됨"
+    } else {
+        "${hardshipLevelLabel(level)} · ${hardshipLevelName(level)} configured"
+    }
+
+private fun AppStrings.hardshipLevelDescription(
+    level: HardshipLevel,
+    policyType: HardshipPolicyType,
+): String {
+    if (appLanguage != AppLanguage.Korean) {
+        return when (level) {
+            HardshipLevel.Off -> "Use the standard unlock controls."
+            HardshipLevel.Level1 -> "Wait 2 minutes, then use a fixed 5-minute temporary allowance."
+            HardshipLevel.Level2 -> "Temporary allowances are disabled. Ask a parent, or wait 30 minutes and enter the Admin PIN."
+            HardshipLevel.Level3 -> "The Admin PIN cannot normally unlock level 3. Parent approval is disabled, and one app-scoped Emergency Pass is shared every 7 days."
+        }
+    }
+    return when (level) {
+        HardshipLevel.Off -> "기본 해제 기능을 사용합니다."
+        HardshipLevel.Level1 -> "2분을 기다린 후 고정된 5분 임시 허용을 사용할 수 있습니다."
+        HardshipLevel.Level2 -> "임시 허용은 사용할 수 없습니다. 부모 승인을 받거나 30분 숙고 후 관리 PIN으로 종료합니다."
+        HardshipLevel.Level3 -> when (policyType) {
+            HardshipPolicyType.Schedule -> "스케줄이 끝날 때까지 관리 PIN 일반 해제와 부모 승인을 사용할 수 없습니다. Emergency Pass는 현재 앱에만 적용되며 모든 3단계에서 7일에 1회 사용할 수 있습니다."
+            else -> "정책이 끝날 때까지 관리 PIN 일반 해제와 부모 승인을 사용할 수 없습니다. Emergency Pass는 현재 앱에만 적용되며 모든 3단계에서 7일에 1회 사용할 수 있습니다."
+        }
+    }
+}
+
+private fun AppStrings.hardshipLevel3Warning(policyType: HardshipPolicyType): String {
+    return if (appLanguage == AppLanguage.Korean) {
+        when (policyType) {
+            HardshipPolicyType.Schedule -> "주의: 차단 스케줄 종료 전에는 관리 PIN, 시간 추가, 오늘만 허용을 사용할 수 없습니다."
+            HardshipPolicyType.AllowOnly -> "주의: 오늘 자정까지 관리 PIN, 시간 추가, 오늘만 허용을 사용할 수 없으며 이후 허용 앱만 모드가 종료됩니다."
+            else -> "주의: 다음 날 사용량이 초기화되기 전에는 관리 PIN, 시간 추가, 오늘만 허용을 사용할 수 없습니다."
+        }
+    } else {
+        "Warning: admin PIN, extra time, unlock-today, and parent approval are unavailable while this policy is active."
+    }
+}
+
+private fun AppStrings.hardshipLevel3FinalTitle(): String =
+    if (appLanguage == AppLanguage.Korean) "3단계를 정말 적용하시겠습니까?" else
+        "Apply level 3?"
+
+private fun AppStrings.hardshipLevel3FinalBody(): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "차단이 시작되면 관리 PIN만으로 일반 해제할 수 없고 부모 승인도 사용할 수 없습니다. Emergency Pass는 현재 앱에만 적용되며 모든 고행 3단계에 공통으로 7일에 한 번만 사용할 수 있습니다."
+    } else {
+        "Once blocking starts, the Admin PIN cannot normally unlock it and parent approval is unavailable. Emergency Pass applies only to the current app and is shared by all level-3 policies once every 7 days."
+    }
+
+private fun AppStrings.hardshipLevel3FinalApplyLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "이해하고 적용" else "Understand and apply"
+
+private fun AppStrings.hardshipLevel3ContinueLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "다음 경고 확인" else "Review final warning"
+
+private fun AppStrings.hardshipLevel3ConfirmationPhrase(): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "3단계 진입을 이해했고 허용합니다"
+    } else {
+        "I understand and allow Level 3"
+    }
+
+private fun AppStrings.hardshipLevel3ConfirmationInstruction(): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "최종 적용하려면 아래 문구를 그대로 입력하세요."
+    } else {
+        "Type the phrase below exactly to continue."
+    }
+
+private fun AppStrings.hardshipLevel3ConfirmationLabel(): String =
+    if (appLanguage == AppLanguage.Korean) "확인 문구 입력" else "Confirmation phrase"
+
+private fun AppStrings.hardshipLevel3IrreversibleTitle(): String =
+    if (appLanguage == AppLanguage.Korean) "마지막 확인 · 시작 후 취소 불가" else
+        "Final confirmation · cannot be cancelled after start"
+
+private fun AppStrings.hardshipLevel3IrreversibleBody(policyType: HardshipPolicyType): String {
+    return if (appLanguage == AppLanguage.Korean) {
+        when (policyType) {
+            HardshipPolicyType.Schedule ->
+                "차단이 시작되면 해당 스케줄이 끝날 때까지 3단계를 낮추거나 해제할 수 없습니다."
+            else ->
+                "차단이 시작되면 다음 날 사용량이 초기화될 때까지 3단계를 낮추거나 해제할 수 없습니다."
+        }
+    } else {
+        when (policyType) {
+            HardshipPolicyType.Schedule ->
+                "After blocking starts, level 3 cannot be lowered or disabled until the schedule ends."
+            else ->
+                "After blocking starts, level 3 cannot be lowered or disabled until the next daily reset."
+        }
+    }
+}
+
+private fun AppStrings.hardshipPinInstruction(): String =
+    if (appLanguage == AppLanguage.Korean) {
+        "고행 모드를 적용하거나 해제하려면 관리 PIN이 필요합니다."
+    } else {
+        "The admin PIN is required to apply or turn off hardship mode."
+    }
+
+private fun AppStrings.hardshipApplyLabel(level: HardshipLevel): String =
+    if (appLanguage == AppLanguage.Korean) "${hardshipLevelLabel(level)} 적용" else "Apply ${hardshipLevelLabel(level)}"
+
 class AppStrings {
+    var appLanguage: AppLanguage = AppLanguage.English
     var appTitle: String = "ScreenRest"
     var appSubtitle: String = "Manager \u00B7 Today"
     var korean: String = ""
@@ -8855,6 +12667,10 @@ class AppStrings {
     var newGroup: String = ""
     var noSelectableApps: String = ""
     var savePolicy: String = ""
+    var saveNow: String = ""
+    var savingChanges: String = ""
+    var pendingChangesHint: String = ""
+    var saveInstructions: String = ""
     var resetChanges: String = ""
     var unsavedChanges: String = ""
     var policyUpToDate: String = ""
@@ -9066,6 +12882,7 @@ class AppStrings {
 }
 fun appStrings(appLanguage: AppLanguage): AppStrings {
     return AppStrings().apply {
+        this.appLanguage = appLanguage
         appTitle = "ScreenRest"
         appSubtitle = "Manager \u00B7 Today"
         korean = "Korean"
@@ -9092,10 +12909,10 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         policyEnforcementDisabled = "Policy Enforcement Disabled"
         autoRecoveryReady = "Auto Recovery Ready"
         autoRecoveryEnabledSafeMode = "Auto Recovery Enabled Safe Mode"
-        emergencyUnlock = "Emergency Unlock"
-        developerPin = "Developer Pin"
-        unlock = "Unlock"
-        offlinePinAvailable = "Offline Pin Available"
+        emergencyUnlock = "Safe Recovery"
+        developerPin = "Admin PIN"
+        unlock = "Recover"
+        offlinePinAvailable = "Admin PIN is available offline"
         safeModeEnabled = "Safe Mode Enabled"
         invalidPin = "Invalid Pin"
         todayUsage = "Today Usage"
@@ -9141,6 +12958,10 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         newGroup = "New Group"
         noSelectableApps = "No Selectable Apps"
         savePolicy = "Save Policy"
+        saveNow = "Save Now"
+        savingChanges = "Saving Changes"
+        pendingChangesHint = "Changes are not saved yet. Tap Save now to apply them."
+        saveInstructions = "Enter the Admin PIN to save."
         resetChanges = "Reset Changes"
         unsavedChanges = "Unsaved Changes"
         policyUpToDate = "Policy Up To Date"
@@ -9161,8 +12982,8 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         deleteSchedule = "Delete Schedule"
         noSchedules = "No Schedules"
         scheduleAllowedApps = "Schedule Allowed Apps"
-        scheduleAllowedDescription = "Schedule Allowed Description"
-        scheduleAllowedTemplateHint = "Schedule Allowed Template Hint"
+        scheduleAllowedDescription = "Selected apps can open during this schedule; daily, group, and app limits still apply."
+        scheduleAllowedTemplateHint = "Each schedule has its own allowed-app list."
         activeSchedule = "Active Schedule"
         nextSchedule = "Next Schedule"
         nextDay = "next day"
@@ -9170,7 +12991,7 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         scheduleDiagnostics = "Schedule Diagnostics"
         allowOnlyMode = "Allow Only Mode"
         allowOnlyModeDescription = "Allow only selected apps while this mode is active."
-        allowOnlyModeSummary = "Allow Only Mode Summary"
+        allowOnlyModeSummary = "Only selected apps can open; daily, group, and app limits still apply."
         policyEnforcementStillDisabled = "Policy Enforcement Still Disabled"
         policySaved = "Policy Saved"
         invalidAdminPin = "Invalid Admin Pin"
@@ -9200,8 +13021,8 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         warningNotificationsDescription = "Warning Notifications Description"
         limitNotifications = "Limit Notifications"
         limitNotificationsDescription = "Limit Notifications Description"
-        alwaysAllowedApps = "Always Allowed Apps"
-        alwaysAllowedDescription = "Always Allowed Description"
+        alwaysAllowedApps = "Allow-only Apps"
+        alwaysAllowedDescription = "These apps can open in allow-only mode, while time limits still apply."
         requiredAllowedApps = "Required Allowed Apps"
         userAllowedApps = "User Allowed Apps"
         allow = "Allow"
@@ -9211,8 +13032,8 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         pinSettings = "Pin Settings"
         currentAdminPin = "Current Admin Pin"
         newAdminPin = "New Admin Pin"
-        currentEmergencyPin = "Current Emergency Pin"
-        newEmergencyPin = "New Emergency Pin"
+        currentEmergencyPin = "Current Admin PIN"
+        newEmergencyPin = "New Admin PIN"
         pinChangeIdle = "Pin Change Idle"
         pinChanged = "Pin Changed"
         pinTooShort = "Pin Too Short"
@@ -9229,7 +13050,7 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         policyEnforcementReady = "Policy Enforcement Ready"
         usageAccessReady = "Usage Access Ready"
         whitelistReady = "Whitelist Ready"
-        emergencyUnlockReady = "Emergency Unlock Ready"
+        emergencyUnlockReady = "Safe Recovery"
         openOverlaySettings = "Open Overlay Settings"
         openNotificationAccessSettings = "Open Notification Access Settings"
         openExactAlarmSettings = "Open Exact Alarm Settings"
@@ -9276,7 +13097,7 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         unlinkParent = "Unlink Parent"
         syncNow = "Sync Now"
         adminPinRole = "Admin Pin Role"
-        emergencyPinRole = "Emergency Pin Role"
+        emergencyPinRole = "Emergency Pass is a limited level-3 exception, not a separate PIN"
         remoteTestMode = "Remote Test Mode"
         remoteDailyLimit = "Remote Daily Limit"
         remoteAppTarget = "Remote App Target"
@@ -9325,8 +13146,8 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         appUsageSource = "App Usage Source"
         policyRelationship = "Policy Relationship"
         requiredAllowedPolicy = "Required Allowed Policy"
-        globalAllowedPolicy = "Global Allowed Policy"
-        scheduleAllowedPolicy = "Schedule Allowed Policy"
+        globalAllowedPolicy = "Allow-only apps can open in that mode but do not bypass time limits."
+        scheduleAllowedPolicy = "Schedule-allowed apps can open only while that schedule is active; time limits still apply."
         statistics = "Statistics"
         dailyTrend = "Daily Trend"
         topApps = "Top Apps"
@@ -9362,6 +13183,10 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         appLimitsDescription = "Set limits for individual apps."
         noLimit = "No limit"
         savePolicy = "Save"
+        saveNow = "Save now"
+        savingChanges = "Saving"
+        pendingChangesHint = "Changes are not saved yet. Tap Save now to apply them."
+        saveInstructions = "Enter the Admin PIN to save."
         resetChanges = "Reset"
         policyUpToDate = "Up to date"
         warningSummary = { warningCount, exceededCount -> warningCount.toString() + " warning, " + exceededCount + " exceeded" }
@@ -9374,11 +13199,11 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         }
         dayLabels = listOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
         selectedApps = { count -> count.toString() + " selected" }
-        groupBudgetTotal = { total, dailyMinimum -> "Group budgets " + formatLimitMinutesLabel(total) + " / daily minimum " + formatLimitMinutesLabel(dailyMinimum) }
+        groupBudgetTotal = { total, _ -> "Configured group limits " + formatLimitMinutesLabel(total) + " · independently enforced" }
         activeAppLimits = { count -> count.toString() + " active" }
         minutesPerDay = { minutes -> formatLimitMinutesLabel(minutes) + "/day" }
-        appLimitGroupAllowance = { groupNameValue, maxMinutes, groupBudget -> "Up to " + formatLimitMinutesLabel(maxMinutes) + " available in " + groupNameValue + " group (" + formatLimitMinutesLabel(groupBudget) + ")" }
-        appGroupLimitConflict = { count -> count.toString() + " app limits exceed group budgets" }
+        appLimitGroupAllowance = { groupNameValue, _, groupBudget -> "The first limit reached applies: app limit or " + groupNameValue + " group (" + formatLimitMinutesLabel(groupBudget) + ")" }
+        appGroupLimitConflict = { count -> count.toString() + " apps need a policy review" }
         allowedAppCount = { count -> count.toString() + " allowed" }
         startsIn = { duration -> "in " + duration }
         temporaryAllowanceDetail = { remaining, extra -> "Remaining extra " + formatLimitMinutesLabel(remaining) + " / added " + formatLimitMinutesLabel(extra) }
@@ -9415,7 +13240,7 @@ private fun AppStrings.applyKoreanStrings() {
     time = "시간"
     timeTabDescription = "요일별 예산, 앱 그룹, 앱별 제한을 설정합니다"
     blocking = "차단"
-    blockingTabDescription = "스케줄, 허용 앱만 모드, 차단 예외를 관리합니다"
+    blockingTabDescription = "스케줄, 허용앱만 모드, 제한 없이 사용할 앱을 관리합니다"
     stats = "통계"
     safety = "안전"
     settings = "설정"
@@ -9434,10 +13259,10 @@ private fun AppStrings.applyKoreanStrings() {
     policyEnforcementDisabled = "정책 적용 OFF"
     autoRecoveryReady = "자동 복구 준비됨"
     autoRecoveryEnabledSafeMode = "자동 복구로 안전 모드 전환됨"
-    emergencyUnlock = "긴급 해제"
-    developerPin = "개발자 PIN"
-    unlock = "해제"
-    offlinePinAvailable = "오프라인 PIN 사용 가능"
+    emergencyUnlock = "안전 복구"
+    developerPin = "관리 PIN"
+    unlock = "복구"
+    offlinePinAvailable = "관리 PIN으로 오프라인 복구 가능"
     safeModeEnabled = "안전 모드 활성화"
     invalidPin = "PIN이 올바르지 않습니다"
     todayUsage = "오늘 사용"
@@ -9483,8 +13308,12 @@ private fun AppStrings.applyKoreanStrings() {
     applyLimit = "적용"
     newGroup = "+ 새 그룹"
     noSelectableApps = "선택 가능한 앱이 없습니다"
-    savePolicy = "저장"
-    resetChanges = "되돌리기"
+    savePolicy = "변경사항 저장"
+    saveNow = "지금 저장"
+    savingChanges = "저장 중"
+    pendingChangesHint = "지금 저장을 눌러야 변경 사항이 적용됩니다"
+    saveInstructions = "관리 PIN을 입력해 저장하세요"
+    resetChanges = "변경 취소"
     unsavedChanges = "변경 있음"
     policyUpToDate = "최신 상태"
     policyBudgetExceeded = "예산 초과"
@@ -9504,7 +13333,7 @@ private fun AppStrings.applyKoreanStrings() {
     deleteSchedule = "- 스케줄 삭제"
     noSchedules = "아직 스케줄이 없습니다"
     scheduleAllowedApps = "스케줄 허용 앱"
-    scheduleAllowedDescription = "선택한 앱은 이 스케줄이 활성화된 동안 차단에서 제외됩니다"
+    scheduleAllowedDescription = "선택한 앱은 이 스케줄 동안 실행할 수 있으며 요일별·그룹·앱별 시간 제한은 계속 적용됩니다"
     scheduleAllowedTemplateHint = "스케줄마다 허용 앱을 따로 설정할 수 있습니다"
     activeSchedule = "활성"
     nextSchedule = "다음"
@@ -9513,7 +13342,7 @@ private fun AppStrings.applyKoreanStrings() {
     scheduleDiagnostics = "스케줄 진단"
     allowOnlyMode = "허용 앱만"
     allowOnlyModeDescription = "필수 앱과 허용한 앱만 실행할 수 있습니다"
-    allowOnlyModeSummary = "허용 앱만 모드에서는 항상 허용 앱과 필수 앱만 실행됩니다"
+    allowOnlyModeSummary = "선택한 앱만 실행할 수 있으며 요일별·그룹·앱별 시간 제한은 계속 적용됩니다"
     policyEnforcementStillDisabled = "정책 적용은 아직 꺼져 있습니다"
     policySaved = "저장됨"
     invalidAdminPin = "관리 PIN이 올바르지 않습니다"
@@ -9543,8 +13372,8 @@ private fun AppStrings.applyKoreanStrings() {
     warningNotificationsDescription = "사용량이 제한의 80%에 도달하면 알림을 보냅니다"
     limitNotifications = "초과 알림"
     limitNotificationsDescription = "제한 초과 또는 차단 직전에 알림을 보냅니다"
-    alwaysAllowedApps = "항상 허용 앱"
-    alwaysAllowedDescription = "선택한 앱은 사용량에는 남지만 차단되지 않습니다"
+    alwaysAllowedApps = "허용앱만 허용 앱"
+    alwaysAllowedDescription = "허용앱만 모드에서 실행할 수 있으며 시간 제한은 계속 적용됩니다"
     requiredAllowedApps = "필수 허용 앱"
     userAllowedApps = "사용자 허용 앱"
     allow = "허용"
@@ -9554,8 +13383,8 @@ private fun AppStrings.applyKoreanStrings() {
     pinSettings = "PIN 설정"
     currentAdminPin = "현재 관리 PIN"
     newAdminPin = "새 관리 PIN"
-    currentEmergencyPin = "현재 긴급 PIN"
-    newEmergencyPin = "새 긴급 PIN"
+    currentEmergencyPin = "현재 관리 PIN"
+    newEmergencyPin = "새 관리 PIN"
     pinChangeIdle = "PIN은 4자리 이상으로 설정하세요"
     pinChanged = "PIN이 변경됨"
     pinTooShort = "PIN은 4자리 이상이어야 합니다"
@@ -9572,7 +13401,7 @@ private fun AppStrings.applyKoreanStrings() {
     policyEnforcementReady = "정책 적용 ON"
     usageAccessReady = "사용정보 권한"
     whitelistReady = "필수 예외 목록"
-    emergencyUnlockReady = "긴급 해제"
+    emergencyUnlockReady = "안전 복구"
     openOverlaySettings = "오버레이 설정"
     openNotificationAccessSettings = "알림 접근 설정"
     openExactAlarmSettings = "알람 설정"
@@ -9618,7 +13447,7 @@ private fun AppStrings.applyKoreanStrings() {
     unlinkParent = "연결 해제"
     syncNow = "동기화"
     adminPinRole = "관리 PIN: 정책 저장, 안전 모드 전환, 차단 화면의 시간 추가에 사용합니다"
-    emergencyPinRole = "긴급 PIN: 인터넷 없이 Safe Mode로 복구하는 비상 해제 PIN입니다"
+    emergencyPinRole = "Emergency Pass는 별도 PIN이 아니라 고행 3단계의 제한된 예외 권한입니다"
     remoteTestMode = "원격 명령 테스트"
     remoteDailyLimit = "하루 전체"
     remoteAppTarget = "앱 선택"
@@ -9667,8 +13496,8 @@ private fun AppStrings.applyKoreanStrings() {
     appUsageSource = "오늘 사용"
     policyRelationship = "허용 정책 관계"
     requiredAllowedPolicy = "필수 허용 앱은 안전을 위해 항상 차단하지 않습니다"
-    globalAllowedPolicy = "항상 허용 앱은 허용 앱만 모드와 모든 스케줄에서 허용됩니다"
-    scheduleAllowedPolicy = "스케줄 허용 앱은 해당 스케줄이 활성일 때만 추가로 허용됩니다"
+    globalAllowedPolicy = "허용앱만 허용 앱은 해당 모드에서 실행할 수 있지만 시간 제한을 우회하지 않습니다"
+    scheduleAllowedPolicy = "스케줄 허용 앱은 해당 스케줄 동안만 실행할 수 있으며 시간 제한은 계속 적용됩니다"
     statistics = "통계"
     dailyTrend = "지난 30일"
     topApps = "앱 사용 Top"
@@ -9691,15 +13520,15 @@ private fun AppStrings.applyKoreanStrings() {
         }
     }
     selectedApps = { count -> "선택 ${count}개" }
-    groupBudgetTotal = { total, dailyMinimum ->
-        "그룹 예산 합계 ${formatLimitMinutesLabel(total)} / 일일 최소 ${formatLimitMinutesLabel(dailyMinimum)}"
+    groupBudgetTotal = { total, _ ->
+        "설정된 그룹 제한 ${formatLimitMinutesLabel(total)} · 각 제한 독립 적용"
     }
     activeAppLimits = { count -> "활성 ${count}개" }
     minutesPerDay = { minutes -> formatLimitMinutesLabel(minutes) + "/일" }
-    appLimitGroupAllowance = { groupNameValue, maxMinutes, groupBudget ->
-        "${groupNameValue} 그룹에서 최대 ${formatLimitMinutesLabel(maxMinutes)}까지 설정할 수 있습니다 (그룹 ${formatLimitMinutesLabel(groupBudget)})"
+    appLimitGroupAllowance = { groupNameValue, _, groupBudget ->
+        "앱별 제한과 ${groupNameValue} 그룹 제한 ${formatLimitMinutesLabel(groupBudget)} 중 먼저 도달한 제한이 적용됩니다"
     }
-    appGroupLimitConflict = { count -> "그룹 예산보다 큰 앱별 제한 ${count}개" }
+    appGroupLimitConflict = { count -> "정책 확인이 필요한 앱 ${count}개" }
     allowedAppCount = { count -> "허용 앱 ${count}개" }
     startsIn = { duration -> "${duration} 후" }
     temporaryAllowanceDetail = { remaining, extra ->
@@ -9757,6 +13586,7 @@ private fun ScreenTimeManagerPreviewContent() {
     ScreenTimeManagerTheme {
         ScreenTimeManagerScreen(
             uiState = SafeModeUiState(safeModeEnabled = true),
+            parentAccountAuthState = ParentAccountAuthState(),
             onSafeModeChanged = {},
             onSafeModeEnableWithPin = {},
             onSafeModePinStatusSeen = {},
@@ -9765,9 +13595,10 @@ private fun ScreenTimeManagerPreviewContent() {
             onAppLanguageChanged = {},
             onWarningNotificationsChanged = {},
             onLimitNotificationsChanged = {},
-            onEmergencyUnlock = {},
-            onEmergencyPinChanged = {},
+            onSafeRecovery = {},
+            onSafeRecoveryPinChanged = {},
             onAllowedAppsChanged = {},
+            onAllRestrictionsExemptAppsChanged = {},
             onOpenUsageAccessSettings = {},
             onOpenNotificationAccessSettings = {},
             onOpenExactAlarmSettings = {},
@@ -9775,18 +13606,20 @@ private fun ScreenTimeManagerPreviewContent() {
             onRefreshUsageStats = {},
             onRefreshStatistics = {},
             onPolicyDraftChanged = {},
+            onStartHardshipConfigurationReflection = {},
             onResetPolicyDraft = {},
             onSaveUsagePolicy = {},
             onPolicySaveStatusSeen = {},
             onRequestNotificationPermission = {},
             onUpdateAdminPin = { _, _ -> },
-            onUpdateEmergencyPin = { _, _ -> },
             onPinInputChanged = {},
             onPairParentAccount = { _, _, _ -> },
             onParentProfileNameChanged = {},
             onParentDeviceRoleChanged = { _, _ -> },
             onGenerateChildPairingCode = {},
             onRegisterChildPairingCode = { _, _, _ -> },
+            onParentGoogleSignIn = {},
+            onDeleteAccountAndCloudData = {},
             onUnlinkParentAccount = {},
             onUnlinkLinkedChildDevice = { _, _ -> },
             onUnlinkLinkedParentDevice = { _, _ -> },

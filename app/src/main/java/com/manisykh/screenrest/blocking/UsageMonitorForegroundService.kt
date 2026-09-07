@@ -7,17 +7,16 @@ import android.app.NotificationManager
 import android.app.AlarmManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
-import android.media.session.MediaSessionManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -29,6 +28,7 @@ import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -37,33 +37,55 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.NumberPicker
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.manisykh.screenrest.MainActivity
 import com.manisykh.screenrest.R
 import com.manisykh.screenrest.data.EventLogType
+import com.manisykh.screenrest.data.AppLanguage
+import com.manisykh.screenrest.data.HardshipLevel
+import com.manisykh.screenrest.data.HardshipLifecycleResult
+import com.manisykh.screenrest.data.MAX_TEMPORARY_EXTRA_MINUTES
+import com.manisykh.screenrest.data.HardshipPolicyKey
+import com.manisykh.screenrest.data.HardshipPolicyType
+import com.manisykh.screenrest.data.HardshipLevelOneGrantResult
+import com.manisykh.screenrest.data.HardshipLevelTwoUnlockResult
+import com.manisykh.screenrest.data.EmergencyPassUseResult
+import com.manisykh.screenrest.data.hardshipLevelFor
+import com.manisykh.screenrest.data.canRequestParentApproval
+import com.manisykh.screenrest.data.ParentDeviceRole
 import com.manisykh.screenrest.data.ParentRemoteSyncDataSourceFactory
 import com.manisykh.screenrest.data.SettingsRepository
+import com.manisykh.screenrest.data.ScheduleHardshipStarted
 import com.manisykh.screenrest.data.UsagePolicySettings
 import com.manisykh.screenrest.data.activeScheduleAllowedPackages
+import com.manisykh.screenrest.data.appliesOn
+import com.manisykh.screenrest.data.currentPolicyDayOfWeek
+import com.manisykh.screenrest.data.emergencyPassExpiryFor
 import com.manisykh.screenrest.data.isScheduleBlockingNow
+import com.manisykh.screenrest.data.limitMinutesOrNull
+import com.manisykh.screenrest.data.levelOneReflectionEntry
 import com.manisykh.screenrest.data.normalizedAppGroups
+import com.manisykh.screenrest.data.normalizedScheduleTemplates
 import com.manisykh.screenrest.data.RemoteRequestBlockReason
+import com.manisykh.screenrest.data.RemoteUnlockRequestSubmitResult
 import com.manisykh.screenrest.data.RemoteUnlockRequestStatus
 import com.manisykh.screenrest.data.settingsDataStore
 import com.manisykh.screenrest.formatLimitMinutesLabel
-import com.manisykh.screenrest.notification.ScreenTimeNotificationListenerService
+import com.manisykh.screenrest.notification.UsageNotificationHelper
 import com.manisykh.screenrest.safety.BlockDecision
 import com.manisykh.screenrest.safety.BlockDecisionEngine
 import com.manisykh.screenrest.safety.BlockDecisionResult
+import com.manisykh.screenrest.safety.AndroidSystemInteractionResolver
 import com.manisykh.screenrest.safety.OverlayPermissionChecker
 import com.manisykh.screenrest.safety.SafetyGate
-import com.manisykh.screenrest.ui.safety.appLimitMap
-import com.manisykh.screenrest.ui.safety.todayLimitMinutes
+import com.manisykh.screenrest.ui.safety.activeAppLimitMap
+import com.manisykh.screenrest.ui.safety.todayLimitMinutesOrNull
 import com.manisykh.screenrest.usage.AppVisibility
 import com.manisykh.screenrest.usage.ForegroundAppTracker
 import com.manisykh.screenrest.usage.UsageStatsRepository
@@ -80,6 +102,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.util.Calendar
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class UsageMonitorForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -90,6 +115,8 @@ class UsageMonitorForegroundService : Service() {
         )
     }
     private val usageRepository by lazy { UsageStatsRepository(applicationContext) }
+    private val systemInteractionResolver by lazy { AndroidSystemInteractionResolver(applicationContext) }
+    private val usageNotificationHelper by lazy { UsageNotificationHelper(applicationContext) }
     private var monitorJob: Job? = null
     @Volatile
     private var blockingOverlayView: View? = null
@@ -101,7 +128,6 @@ class UsageMonitorForegroundService : Service() {
     private var lastLoggedBlockPackageName: String? = null
     private var lastLoggedBlockAt: Long = 0L
     private var lastRemoteParentSyncAt: Long = 0L
-    private var remoteParentFastSyncUntilElapsed: Long = 0L
     private var activeForegroundPackageName: String? = null
     private var activeForegroundStartedAtElapsed: Long = 0L
     private var activeForegroundBaselineUsageMillis: Long? = null
@@ -115,6 +141,7 @@ class UsageMonitorForegroundService : Service() {
     private var blockEnforcementGuardPackageName: String? = null
     private var blockForegroundEvictionJob: Job? = null
     private var blockForegroundEvictionPackageName: String? = null
+    private var remoteParentRequestSubmitJob: Job? = null
     private var remoteParentRequestMonitorJob: Job? = null
     @Volatile
     private var latestRequestedForegroundPackageName: String? = null
@@ -127,9 +154,11 @@ class UsageMonitorForegroundService : Service() {
     private var cachedUsageByPackage: Map<String, Long> = emptyMap()
     private var cachedUsageByPackageAtElapsed: Long = 0L
     private var cachedUsageDayStartMillis: Long = 0L
+    private var lastHardshipLifecycleCheckAtElapsed: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
+        systemInteractionResolver.refreshDetectedRelationships()
         debugMonitor("created; overlay=${overlayPermissionState().summary}; starting foreground notification and monitor loop")
         ensureMonitorChannel()
         debugMonitor("startForeground request notificationId=$MONITOR_NOTIFICATION_ID")
@@ -144,7 +173,7 @@ class UsageMonitorForegroundService : Service() {
         serviceScope.launch {
             updateMonitorStatus(decision = "service starting", force = true)
         }
-        scheduleExactRecoveryAlarm(
+        scheduleRecoveryAlarm(
             context = applicationContext,
             reason = "foreground monitor watchdog",
         )
@@ -197,6 +226,7 @@ class UsageMonitorForegroundService : Service() {
         }
         if (intent?.action == ACTION_MANAGER_VISIBLE) {
             debugMonitor("manager visible action received")
+            ForegroundAppTracker.clear()
             startBlockExitTransitionGrace(intent.getStringExtra(EXTRA_PACKAGE_NAME))
             managerOpenGraceUntilElapsed = SystemClock.elapsedRealtime() + MANAGER_OPEN_GRACE_MILLIS
             cancelBlockEnforcementGuard()
@@ -209,6 +239,7 @@ class UsageMonitorForegroundService : Service() {
         }
         if (intent?.action == ACTION_BLOCKED_SCREEN_VISIBLE) {
             debugMonitor("blocked screen visible action received")
+            ForegroundAppTracker.clear()
             clearActiveForegroundSession()
             removeBlockingOverlay()
             updateMonitorNotification("ScreenRest", "Blocked screen open")
@@ -231,6 +262,7 @@ class UsageMonitorForegroundService : Service() {
         cancelBlockEnforcementGuard()
         removeBlockingOverlay()
         monitorJob?.cancel()
+        remoteParentRequestSubmitJob?.cancel()
         remoteParentRequestMonitorJob?.cancel()
         serviceScope.cancel()
         super.onDestroy()
@@ -249,7 +281,7 @@ class UsageMonitorForegroundService : Service() {
                     forceRestart = true,
                     reason = "task removed",
                 )
-                scheduleExactRecoveryAlarm(
+                scheduleRecoveryAlarm(
                     context = applicationContext,
                     reason = "task removed exact recovery",
                     delayMillis = 5_000L,
@@ -295,16 +327,30 @@ class UsageMonitorForegroundService : Service() {
 
     private suspend fun syncRemoteParentStateIfNeeded() {
         val now = SystemClock.elapsedRealtime()
-        val interval = if (now < remoteParentFastSyncUntilElapsed) {
-            REMOTE_PARENT_FAST_SYNC_INTERVAL_MILLIS
-        } else {
-            REMOTE_PARENT_SYNC_INTERVAL_MILLIS
-        }
-        if (now - lastRemoteParentSyncAt < interval) {
+        if (now - lastRemoteParentSyncAt < REMOTE_PARENT_BACKGROUND_SYNC_INTERVAL_MILLIS) {
             return
         }
         lastRemoteParentSyncAt = now
-        repository.syncParentDevice()
+        val parentState = repository.parentManagementState.first()
+        if (
+            !parentState.paired ||
+            parentState.deviceRole != ParentDeviceRole.Child ||
+            parentState.childDeviceId.isBlank()
+        ) {
+            return
+        }
+        parentState.remoteUnlockRequests
+            .filter { request ->
+                request.status == RemoteUnlockRequestStatus.Pending &&
+                    request.expiresAtMillis >= System.currentTimeMillis()
+            }
+            .map { request -> request.id }
+            .filter { requestId -> requestId.isNotBlank() }
+            .distinct()
+            .forEach { requestId ->
+                repository.syncRemoteUnlockRequest(requestId)
+            }
+        repository.syncNewRemoteCommands()
     }
 
     private suspend fun evaluateCurrentForegroundApp() {
@@ -388,6 +434,28 @@ class UsageMonitorForegroundService : Service() {
             debugMonitor("home grace canceled by foreground package=$packageName")
             homeExitGraceUntilElapsed = 0L
         }
+        if (
+            systemInteractionResolver.isProtectedSystemTransition(
+                targetPackageName = packageName,
+                sourcePackageName = activeForegroundPackageName,
+            )
+        ) {
+            debugMonitorState(
+                "loop system handoff source=${activeForegroundPackageName.orEmpty()} target=$packageName",
+            )
+            cancelBlockEnforcementGuard()
+            clearActiveForegroundSession()
+            withContext(Dispatchers.Main) { removeBlockingOverlay() }
+            updateMonitorNotification("ScreenRest", "System function is available")
+            updateMonitorStatus(
+                appName = usageRepository.getAppLabel(packageName),
+                packageName = packageName,
+                decision = "system interaction allowed",
+                limitedTarget = false,
+                blockReason = "",
+            )
+            return
+        }
         if (packageName.isBlank() || packageName == applicationContext.packageName || AppVisibility.isHiddenPackage(packageName)) {
             debugMonitorState("loop drop package=$packageName raw=$rawForegroundPackageName detected=$detectedForegroundPackageName")
             clearActiveForegroundSession()
@@ -398,7 +466,7 @@ class UsageMonitorForegroundService : Service() {
 
         val settings = repository.usagePolicySettings.first()
         val hasDirectLimit = settings.hasDirectLimitFor(packageName)
-        val hasTotalLimit = settings.todayLimitMinutes() > 0
+        val hasTotalLimit = settings.todayLimitMinutesOrNull() != null
         val hasActiveScheduleBlock = settings.isScheduleBlockingNow()
         val hasAllowOnlyBlock = settings.allowOnlyModeEnabled
         if (!hasDirectLimit && !hasTotalLimit && !hasActiveScheduleBlock && !hasAllowOnlyBlock) {
@@ -450,6 +518,18 @@ class UsageMonitorForegroundService : Service() {
     }
 
     private suspend fun evaluateForegroundPackageNow(packageName: String) {
+        if (
+            systemInteractionResolver.isProtectedSystemTransition(
+                targetPackageName = packageName,
+                sourcePackageName = activeForegroundPackageName,
+            )
+        ) {
+            debugMonitorState("immediate system surface package=$packageName")
+            cancelBlockEnforcementGuard()
+            clearActiveForegroundSession()
+            withContext(Dispatchers.Main) { removeBlockingOverlay() }
+            return
+        }
         if (packageName.isBlank() || packageName == applicationContext.packageName || AppVisibility.isHiddenPackage(packageName)) {
             debugMonitorState("immediate drop package=$packageName")
             return
@@ -513,7 +593,7 @@ class UsageMonitorForegroundService : Service() {
 
         val settings = repository.usagePolicySettings.first()
         val hasDirectLimit = settings.hasDirectLimitFor(packageName)
-        val hasTotalLimit = settings.todayLimitMinutes() > 0
+        val hasTotalLimit = settings.todayLimitMinutesOrNull() != null
         val hasActiveScheduleBlock = settings.isScheduleBlockingNow()
         val hasAllowOnlyBlock = settings.allowOnlyModeEnabled
         if (latestRequestedForegroundPackageName != packageName) {
@@ -572,10 +652,40 @@ class UsageMonitorForegroundService : Service() {
         packageName: String,
         settings: UsagePolicySettings? = null,
     ): MonitorDecision {
-        val resolvedSettings = settings ?: repository.usagePolicySettings.first()
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val shouldReconcileHardship = lastHardshipLifecycleCheckAtElapsed == 0L ||
+            nowElapsed - lastHardshipLifecycleCheckAtElapsed >= HARDSHIP_LIFECYCLE_CHECK_INTERVAL_MILLIS
+        val hardshipLifecycle = if (shouldReconcileHardship) {
+            lastHardshipLifecycleCheckAtElapsed = nowElapsed
+            repository.reconcileHardshipLifecycle()
+        } else {
+            HardshipLifecycleResult()
+        }
+        if (hardshipLifecycle.startedSchedules.isNotEmpty()) {
+            val language = repository.appLanguage.first()
+            hardshipLifecycle.startedSchedules.forEach { schedule ->
+                showScheduleHardshipStarted(schedule, language)
+            }
+        }
+        val lifecycleChanged = hardshipLifecycle.endedScheduleIds.isNotEmpty() ||
+            hardshipLifecycle.dailyHardshipCleared
+        val resolvedSettings = if (settings == null || lifecycleChanged) {
+            repository.usagePolicySettings.first()
+        } else {
+            settings
+        }
         val temporaryUnlockState = repository.temporaryUnlockState.first().forToday()
-        val allowedPackages = repository.allowedAppPackages.first()
-        val scheduleAllowedPackages = resolvedSettings.activeScheduleAllowedPackages()
+        val hardshipRuntimeState = repository.hardshipRuntimeState.first().forToday()
+        val canRequestParent = repository.parentManagementState.first().canRequestParentApproval()
+        val allowOnlyPackages = expandAllowedPackagesWithSharedUid(
+            repository.allowOnlyAllowedAppPackages.first(),
+        )
+        val allRestrictionsExemptPackages = expandAllowedPackagesWithSharedUid(
+            repository.allRestrictionsExemptPackages.first(),
+        )
+        val scheduleAllowedPackages = expandAllowedPackagesWithSharedUid(
+            resolvedSettings.activeScheduleAllowedPackages(),
+        )
         val schedulePackageAllowed = SafetyGate.isUserAllowedPackage(
             targetPackageName = packageName,
             userAllowedPackages = scheduleAllowedPackages,
@@ -588,12 +698,23 @@ class UsageMonitorForegroundService : Service() {
             usageMillis = adjustedActiveForegroundUsageMillis(packageName, rawAppUsedMillis),
         )
         val stableUsageByPackage = usageByPackage + (packageName to appUsedMillis)
-        val totalUsedMillis = stableUsageByPackage.values.sum()
-        val appLimitMinutes = resolvedSettings.appLimitMap()[packageName] ?: 0
+        val enforcementExcludedPackages =
+            SafetyGate.neverBlockPackages +
+                SafetyGate.expandedUserAllowedPackages(allRestrictionsExemptPackages)
+        val totalUsedMillis = stableUsageByPackage
+            .filterKeys { usedPackageName -> usedPackageName !in enforcementExcludedPackages }
+            .values
+            .sum()
+        val appLimitMinutes = resolvedSettings.activeAppLimitMap()[packageName]
         val targetGroup = resolvedSettings.normalizedAppGroups()
-            .firstOrNull { group -> packageName in group.packageNames && group.budgetMinutes > 0 }
+            .firstOrNull { group ->
+                packageName in group.packageNames &&
+                    group.appliesOn(currentPolicyDayOfWeek()) &&
+                    group.limitMinutesOrNull() != null
+            }
         val targetGroupUsedMillis = targetGroup
             ?.packageNames
+            ?.filter { groupPackageName -> groupPackageName !in enforcementExcludedPackages }
             ?.sumOf { groupPackageName ->
                 val rawGroupPackageUsageMillis = stableUsageByPackage[groupPackageName] ?: 0L
                 if (groupPackageName == packageName) {
@@ -611,11 +732,24 @@ class UsageMonitorForegroundService : Service() {
             appUsedMillis = appUsedMillis,
             totalUsedMillis = totalUsedMillis,
             targetGroupUsedMillis = targetGroupUsedMillis,
-            targetGroupLimitMinutes = targetGroup?.budgetMinutes,
+            targetGroupLimitMinutes = targetGroup?.limitMinutesOrNull(),
             temporaryUnlockState = temporaryUnlockState,
-            userAllowedPackages = allowedPackages,
+            allowOnlyAllowedPackages = allowOnlyPackages,
+            userAllowedPackages = allRestrictionsExemptPackages,
             scheduleAllowedPackages = scheduleAllowedPackages,
+            hardshipBypassedPolicies = hardshipRuntimeState.bypassedPolicies,
+            hardshipBypassedPolicyKeys = hardshipRuntimeState.bypassedKeysForPackage(packageName),
         )
+        evaluation.activeHardshipPolicyKeys
+            .filter { key -> resolvedSettings.hardshipLevelFor(key) != HardshipLevel.Off }
+            .filter { key -> key !in hardshipRuntimeState.activePolicyKeys }
+            .forEach { key -> repository.markHardshipPolicyTriggered(key) }
+        hardshipRuntimeState.activePolicyKeys
+            .filter { key ->
+                val level = resolvedSettings.hardshipLevelFor(key)
+                level == HardshipLevel.Off
+            }
+            .forEach { key -> repository.clearHardshipPolicyTriggered(key) }
         debugMonitorState(
             "EVAL package=$packageName decision=${evaluation.result.decision.toLogReason()} appUsed=$appUsedMillis rawApp=$rawAppUsedMillis total=$totalUsedMillis group=${targetGroup?.name.orEmpty()} groupUsed=${targetGroupUsedMillis ?: 0L} limit=${evaluation.limitMillis} extra=${evaluation.activeExtraMinutes} unlocked=${evaluation.unlockedForToday} scheduleAllowed=$schedulePackageAllowed",
         )
@@ -628,15 +762,26 @@ class UsageMonitorForegroundService : Service() {
             extraMinutes = evaluation.activeExtraMinutes,
             unlockedForToday = evaluation.unlockedForToday,
             appUsedMillis = appUsedMillis,
-            appLimitMillis = appLimitMinutes
-                .takeIf { minutes -> minutes > 0 }
-                ?.let { minutes -> minutes.toLong() * 60_000L },
+            appLimitMillis = appLimitMinutes?.let { minutes -> minutes.toLong() * 60_000L },
             targetGroupName = targetGroup?.name,
             targetGroupUsedMillis = targetGroupUsedMillis,
             targetGroupLimitMillis = targetGroup
-                ?.budgetMinutes
-                ?.takeIf { minutes -> minutes > 0 }
+                ?.limitMinutesOrNull()
                 ?.let { minutes -> minutes.toLong() * 60_000L },
+            hardshipLevel = evaluation.hardshipLevel,
+            hardshipPolicyType = evaluation.hardshipPolicyType,
+            hardshipPolicyKey = evaluation.hardshipPolicyKey,
+            activeHardshipPolicyKeys = evaluation.activeHardshipPolicyKeys,
+            canRequestParent = canRequestParent,
+            hardshipAllowanceEnded = temporaryUnlockState.packageAllowances[packageName]
+                ?.hardshipAllowanceUntilMillis
+                ?.let { untilMillis -> untilMillis > 0L && untilMillis <= System.currentTimeMillis() }
+                == true,
+            levelOneReflectionReadyAtMillis = evaluation.hardshipPolicyKey?.let { policyKey ->
+                hardshipRuntimeState.levelOneReflectionEntry(policyKey, packageName)?.readyAtMillis
+            } ?: 0L,
+            emergencyPassNextAvailableAtMillis = hardshipRuntimeState.emergencyPassNextAvailableAtMillis(),
+            activeBlockCount = evaluation.activeBlockDecisions.size,
         )
     }
 
@@ -836,7 +981,8 @@ class UsageMonitorForegroundService : Service() {
 
     private fun String.shouldHardClearForegroundSession(): Boolean {
         val normalizedPackageName = lowercase()
-        return normalizedPackageName == "com.android.settings" ||
+        return AppVisibility.clearsForegroundSession(this) ||
+            normalizedPackageName == "com.android.settings" ||
             normalizedPackageName == "com.google.android.settings" ||
             normalizedPackageName == "com.google.android.apps.nexuslauncher" ||
             normalizedPackageName == "com.sec.android.app.launcher" ||
@@ -1052,6 +1198,7 @@ class UsageMonitorForegroundService : Service() {
 
                 val rawForegroundPackageName = usageRepository.getRawCurrentForegroundPackageName().orEmpty()
                 val managerVisible = rawForegroundPackageName == applicationContext.packageName
+                val systemInteractionVisible = SafetyGate.isSystemInteractionPackage(rawForegroundPackageName)
                 val foregroundPackageName = resolveForegroundPackageName(
                     detectedPackageName = rawForegroundPackageName.takeUnless { it == applicationContext.packageName }.orEmpty(),
                     rawPackageName = rawForegroundPackageName,
@@ -1059,6 +1206,7 @@ class UsageMonitorForegroundService : Service() {
                 val targetLockedForBlocking = blockingOverlayPackageName == packageName ||
                     blockForegroundEvictionPackageName == packageName
                 val shouldReassertBlock = !managerVisible &&
+                    !systemInteractionVisible &&
                     (
                         targetLockedForBlocking ||
                             foregroundPackageName == packageName ||
@@ -1066,8 +1214,14 @@ class UsageMonitorForegroundService : Service() {
                     )
                 val now = SystemClock.elapsedRealtime()
                 debugMonitorState(
-                    "BLOCK_PIPE guard package=$packageName raw=$rawForegroundPackageName resolved=$foregroundPackageName managerVisible=$managerVisible shouldReassert=$shouldReassertBlock overlayAttached=${blockingOverlayView?.isAttachedToWindow == true} decision=${currentDecision.result.decision.toLogReason()}",
+                    "BLOCK_PIPE guard package=$packageName raw=$rawForegroundPackageName resolved=$foregroundPackageName managerVisible=$managerVisible systemSurface=$systemInteractionVisible shouldReassert=$shouldReassertBlock overlayAttached=${blockingOverlayView?.isAttachedToWindow == true} decision=${currentDecision.result.decision.toLogReason()}",
                 )
+                if (systemInteractionVisible) {
+                    withContext(Dispatchers.Main) { removeBlockingOverlay() }
+                    clearActiveForegroundSession()
+                    delay(BLOCK_ENFORCEMENT_GUARD_INTERVAL_MILLIS)
+                    continue
+                }
                 if (shouldReassertBlock && now - lastReassertAt >= BLOCK_REASSERT_INTERVAL_MILLIS) {
                     lastReassertAt = now
                     val retryCount = nextBlockDiagnosticRetryCount(packageName)
@@ -1183,6 +1337,11 @@ class UsageMonitorForegroundService : Service() {
                 }
 
                 val rawForegroundPackageName = usageRepository.getRawCurrentForegroundPackageName().orEmpty()
+                if (SafetyGate.isSystemInteractionPackage(rawForegroundPackageName)) {
+                    withContext(Dispatchers.Main) { removeBlockingOverlay() }
+                    clearActiveForegroundSession()
+                    break
+                }
                 val targetStillForeground = isBlockedTargetStillForeground(
                     decision = currentDecision,
                     rawForegroundPackageName = rawForegroundPackageName,
@@ -1399,16 +1558,28 @@ class UsageMonitorForegroundService : Service() {
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                     WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
                     WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                 PixelFormat.TRANSLUCENT,
             ).apply {
-                gravity = Gravity.CENTER
+                gravity = Gravity.TOP or Gravity.START
                 softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
                     WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    // Draw the blocking background behind status/navigation bars. The root view
+                    // applies those insets as padding so controls remain in the safe area.
+                    setFitInsetsTypes(0)
+                    setFitInsetsSides(0)
+                    setFitInsetsIgnoringVisibility(true)
+                }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     layoutInDisplayCutoutMode =
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                        } else {
+                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                        }
                 }
             }
             getSystemService(WindowManager::class.java).addView(overlayView, params)
@@ -1453,21 +1624,50 @@ class UsageMonitorForegroundService : Service() {
             isFocusable = true
             isFocusableInTouchMode = true
             clipToPadding = true
+            systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
             background = GradientDrawable().apply {
                 setColor(style.backgroundColor)
+            }
+            setOnApplyWindowInsetsListener { view, windowInsets ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val safeInsets = windowInsets.getInsets(
+                        WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
+                    )
+                    view.setPadding(
+                        safeInsets.left,
+                        safeInsets.top,
+                        safeInsets.right,
+                        safeInsets.bottom,
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    view.setPadding(
+                        windowInsets.systemWindowInsetLeft,
+                        windowInsets.systemWindowInsetTop,
+                        windowInsets.systemWindowInsetRight,
+                        windowInsets.systemWindowInsetBottom,
+                    )
+                }
+                windowInsets
             }
         }
         root.setOnKeyListener { _, keyCode, _ -> keyCode == KeyEvent.KEYCODE_BACK }
 
         val scrollView = ScrollView(this).apply {
-            isFillViewport = false
+            isFillViewport = true
             clipToPadding = false
             overScrollMode = View.OVER_SCROLL_NEVER
+        }
+        val scrollContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
         }
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(18), dp(18), dp(18), dp(16))
+            setPadding(dp(20), dp(20), dp(20), dp(20))
             background = GradientDrawable().apply {
                 cornerRadius = dp(24).toFloat()
                 setColor(style.cardColor)
@@ -1507,12 +1707,21 @@ class UsageMonitorForegroundService : Service() {
             }
         }
         scrollView.addView(
-            card,
+            scrollContent,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER,
             ),
+        )
+        scrollContent.addView(
+            card,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(8)
+            },
         )
 
         card.addView(blockOverlayText(strings.titleFor(decision.result.decision), 21, Color.rgb(17, 24, 39), true))
@@ -1544,102 +1753,290 @@ class UsageMonitorForegroundService : Service() {
                 false,
             ),
         )
-
-        val adminInput = blockOverlayPinInput(strings.adminPin, scrollView, strings)
-        card.addView(
-            adminInput.container,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(46),
-            ).apply {
-                topMargin = dp(10)
+        if (decision.hardshipLevel != HardshipLevel.Off) {
+            card.addView(blockOverlayHardshipIndicator(decision.hardshipLevel, strings))
+        }
+        val statusText = blockOverlayText(
+            if (decision.hardshipLevel == HardshipLevel.Level1 && decision.hardshipAllowanceEnded) {
+                strings.hardshipAllowanceExpired
+            } else {
+                ""
             },
+            13,
+            Color.rgb(229, 91, 74),
+            true,
         )
-
-        var extraMinutes = 5
-        val extraMinutesText = blockOverlayText(strings.extraTimeLabel(extraMinutes), 14, style.accentColor, true)
-        card.addView(extraMinutesText)
-        card.addView(
-            SeekBar(this).apply {
-                max = 239
-                progress = extraMinutes - 1
-                setOnSeekBarChangeListener(
-                    object : SeekBar.OnSeekBarChangeListener {
-                        override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                            extraMinutes = progress + 1
-                            extraMinutesText.text = strings.extraTimeLabel(extraMinutes)
+        card.addView(statusText)
+        when (decision.hardshipLevel) {
+            HardshipLevel.Off -> {
+                var requestedExtraMinutes = 5
+                card.addView(
+                    blockOverlayButton(
+                        text = strings.addTime,
+                        iconRes = R.drawable.ic_block_add_time,
+                        iconColor = Color.rgb(37, 99, 235),
+                    ) {
+                        showOverlayTimePicker(
+                            root = root,
+                            initialMinutes = requestedExtraMinutes,
+                            strings = strings,
+                        ) { selectedMinutes ->
+                            requestedExtraMinutes = selectedMinutes
+                            showOverlayPinDialog(
+                                root = root,
+                                title = strings.adminPin,
+                                strings = strings,
+                            ) { pin, dialogStatus, dismiss ->
+                                applyParentExtraTime(
+                                    decision = decision,
+                                    pin = pin,
+                                    extraMinutes = selectedMinutes,
+                                    statusText = dialogStatus,
+                                    strings = strings,
+                                    onSuccess = dismiss,
+                                )
+                            }
                         }
-
-                        override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-
-                        override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
                     },
                 )
-            },
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ),
-        )
-
-        val statusText = blockOverlayText("", 13, Color.rgb(229, 91, 74), true)
-        card.addView(statusText)
-        card.addView(blockOverlayButton(strings.addTime) {
-            val pin = adminInput.input.text?.toString().orEmpty()
-            applyParentExtraTime(
-                decision = decision,
-                pin = pin,
-                extraMinutes = extraMinutes,
-                statusText = statusText,
-                strings = strings,
-            )
-        })
-        card.addView(blockOverlayButton(strings.unlockToday) {
-            val pin = adminInput.input.text?.toString().orEmpty()
-            applyParentUnlockToday(
-                decision = decision,
-                pin = pin,
-                statusText = statusText,
-                strings = strings,
-            )
-        })
-        card.addView(blockOverlayButton(strings.requestParent, outline = true) {
-            requestParentApproval(
-                decision = decision,
-                extraMinutes = extraMinutes,
-                statusText = statusText,
-                strings = strings,
-            )
-        })
-
-        val emergencyInput = blockOverlayPinInput(strings.emergencyPin, scrollView, strings)
-        card.addView(
-            emergencyInput.container,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(46),
-            ).apply {
-                topMargin = dp(6)
-            },
-        )
-
-        card.addView(blockOverlayButton(strings.emergencyUnlock) {
-            val pin = emergencyInput.input.text?.toString().orEmpty()
-            serviceScope.launch {
-                val unlocked = repository.emergencyUnlock(pin)
-                withContext(Dispatchers.Main) {
-                    if (unlocked) {
-                        cancelBlockEnforcementGuard()
-                        clearActiveForegroundSession()
-                        lastBlockedActivityPackageName = null
-                        removeBlockingOverlay()
-                    } else {
-                        statusText.text = strings.invalidEmergencyPin
+                card.addView(
+                    blockOverlayButton(
+                        text = strings.unlockToday,
+                        iconRes = R.drawable.ic_block_unlock_today,
+                        iconColor = Color.rgb(5, 150, 105),
+                    ) {
+                        showOverlayPinDialog(
+                            root = root,
+                            title = strings.adminPin,
+                            strings = strings,
+                        ) { pin, dialogStatus, dismiss ->
+                            applyParentUnlockToday(
+                                decision = decision,
+                                pin = pin,
+                                statusText = dialogStatus,
+                                strings = strings,
+                                onSuccess = dismiss,
+                            )
+                        }
+                    },
+                )
+                if (decision.canRequestParent) {
+                    card.addView(blockOverlayParentRequestButton(decision, requestedExtraMinutes, statusText, strings))
+                }
+                addStandardSafeRecovery(card, root, statusText, strings)
+            }
+            HardshipLevel.Level1 -> {
+                card.addView(blockOverlayText(strings.hardshipLevel1Description, 15, style.accentColor, true))
+                lateinit var levelOneButton: Button
+                levelOneButton = blockOverlayButton(
+                    text = strings.hardshipReflectionAction,
+                    iconRes = R.drawable.ic_block_add_time,
+                    iconColor = Color.rgb(180, 122, 22),
+                ) {
+                    serviceScope.launch {
+                        val policyKey = decision.hardshipPolicyKey
+                        val result = if (policyKey == null) {
+                            HardshipLevelOneGrantResult.NotAvailable
+                        } else {
+                            repository.requestLevelOneAllowance(
+                                policyKey = policyKey,
+                                packageName = decision.result.packageName,
+                                appName = decision.result.appName,
+                            )
+                        }
+                        withContext(Dispatchers.Main) {
+                            statusText.text = when (result) {
+                                HardshipLevelOneGrantResult.Granted -> strings.hardshipFiveMinutesGranted
+                                HardshipLevelOneGrantResult.WaitingStarted -> strings.hardshipReflectionStarted
+                                HardshipLevelOneGrantResult.Waiting -> strings.hardshipReflectionWaiting
+                                HardshipLevelOneGrantResult.DailyLimitReached -> strings.hardshipAllowanceLimitReached
+                                HardshipLevelOneGrantResult.NotAvailable -> strings.hardshipUnavailable
+                            }
+                            if (result == HardshipLevelOneGrantResult.Granted) {
+                                cancelBlockEnforcementGuard()
+                                removeBlockingOverlay()
+                            } else if (
+                                result == HardshipLevelOneGrantResult.WaitingStarted ||
+                                result == HardshipLevelOneGrantResult.Waiting
+                            ) {
+                                val readyAtMillis = policyKey?.let { key ->
+                                    repository.hardshipRuntimeState.first().forToday()
+                                        .levelOneReflectionEntry(key, decision.result.packageName)
+                                        ?.readyAtMillis
+                                } ?: 0L
+                                bindLevelOneCountdown(levelOneButton, readyAtMillis, strings)
+                            }
+                        }
                     }
                 }
+                bindLevelOneCountdown(
+                    button = levelOneButton,
+                    readyAtMillis = decision.levelOneReflectionReadyAtMillis,
+                    strings = strings,
+                )
+                card.addView(levelOneButton)
+                if (decision.canRequestParent) {
+                    card.addView(blockOverlayParentRequestButton(decision, 5, statusText, strings))
+                }
+                addStandardSafeRecovery(card, root, statusText, strings)
             }
-        })
-        card.addView(blockOverlayButton(strings.openManager) {
+            HardshipLevel.Level2 -> {
+                val levelTwoDescription = if (decision.canRequestParent) {
+                    "${strings.hardshipLevel2Description} ${strings.hardshipParentApprovalAvailable}"
+                } else {
+                    strings.hardshipLevel2Description
+                }
+                card.addView(blockOverlayText(levelTwoDescription, 15, style.accentColor, true))
+                card.addView(
+                    blockOverlayButton(
+                        text = strings.hardshipLevel2Action,
+                        iconRes = R.drawable.ic_block_unlock_today,
+                        iconColor = Color.rgb(234, 88, 12),
+                    ) {
+                        showOverlayPinDialog(
+                            root = root,
+                            title = strings.adminPin,
+                            strings = strings,
+                        ) { pin, dialogStatus, dismiss ->
+                            val policyKey = decision.hardshipPolicyKey
+                            serviceScope.launch {
+                                val result = if (policyKey == null) {
+                                    HardshipLevelTwoUnlockResult.NotAvailable
+                                } else {
+                                    repository.requestLevelTwoPolicyUnlock(
+                                        policyKey = policyKey,
+                                        adminPin = pin,
+                                    )
+                                }
+                                withContext(Dispatchers.Main) {
+                                    dialogStatus.text = when (result) {
+                                        HardshipLevelTwoUnlockResult.Unlocked -> if (
+                                            decision.hardshipPolicyType == HardshipPolicyType.Schedule
+                                        ) {
+                                            if (strings.hardshipLevelPrefix == "Level") {
+                                                "Level 2 was ended for this schedule occurrence."
+                                            } else {
+                                                "고행 2단계를 이번 스케줄에서 종료했습니다."
+                                            }
+                                        } else {
+                                            strings.hardshipLevel2Unlocked
+                                        }
+                                        HardshipLevelTwoUnlockResult.WaitingStarted -> strings.hardshipLevel2Started
+                                        HardshipLevelTwoUnlockResult.Waiting -> strings.hardshipLevel2Waiting
+                                        HardshipLevelTwoUnlockResult.InvalidPin -> strings.invalidAdminPin
+                                        HardshipLevelTwoUnlockResult.NotAvailable -> strings.hardshipUnavailable
+                                    }
+                                    if (result == HardshipLevelTwoUnlockResult.Unlocked) {
+                                        dismiss()
+                                        cancelBlockEnforcementGuard()
+                                        removeBlockingOverlay()
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+                if (decision.canRequestParent) {
+                    card.addView(blockOverlayParentRequestButton(decision, 5, statusText, strings))
+                }
+                addStandardSafeRecovery(card, root, statusText, strings)
+            }
+            HardshipLevel.Level3 -> {
+                card.addView(blockOverlayText(strings.hardshipLevel3Description, 15, style.accentColor, true))
+                val emergencyPassAvailable = decision.emergencyPassNextAvailableAtMillis <= 0L ||
+                    System.currentTimeMillis() >= decision.emergencyPassNextAvailableAtMillis
+                card.addView(
+                    blockOverlayText(
+                        if (emergencyPassAvailable) {
+                            if (strings.hardshipLevelPrefix == "Level") "Emergency Pass available · 1 use" else "Emergency Pass 사용 가능 · 1회"
+                        } else {
+                            if (strings.hardshipLevelPrefix == "Level") {
+                                "Emergency Pass used · available again ${formatEmergencyPassTime(decision.emergencyPassNextAvailableAtMillis)}"
+                            } else {
+                                "Emergency Pass 사용 완료 · 다음 사용 가능 ${formatEmergencyPassTime(decision.emergencyPassNextAvailableAtMillis)}"
+                            }
+                        },
+                        14,
+                        if (emergencyPassAvailable) Color.rgb(37, 130, 78) else style.accentColor,
+                        true,
+                    ),
+                )
+                if (emergencyPassAvailable) {
+                    card.addView(
+                        blockOverlayButton(
+                            text = strings.emergencyPass,
+                            iconRes = R.drawable.ic_block_emergency,
+                            iconColor = Color.rgb(190, 24, 93),
+                        ) {
+                            serviceScope.launch {
+                                val settings = repository.usagePolicySettings.first()
+                                val expiresAtMillis = decision.activeHardshipPolicyKeys.maxOfOrNull { policyKey ->
+                                    settings.emergencyPassExpiryFor(policyKey)
+                                } ?: 0L
+                                withContext(Dispatchers.Main) {
+                                    showOverlayEmergencyPassConfirmation(
+                                        root = root,
+                                        appName = decision.result.appName,
+                                        expiresAtMillis = expiresAtMillis,
+                                        strings = strings,
+                                    ) {
+                                        showOverlayPinDialog(
+                                            root = root,
+                                            title = strings.adminPin,
+                                            strings = strings,
+                                        ) { pin, dialogStatus, dismiss ->
+                                            serviceScope.launch {
+                                                val result = if (decision.hardshipPolicyKey == null) {
+                                                    EmergencyPassUseResult.NotAvailable
+                                                } else {
+                                                    repository.useHardshipEmergencyPass(
+                                                        adminPin = pin,
+                                                        packageName = decision.result.packageName,
+                                                        blockingPolicyKeys = decision.activeHardshipPolicyKeys,
+                                                    )
+                                                }
+                                                withContext(Dispatchers.Main) {
+                                                    dialogStatus.text = when (result) {
+                                                        EmergencyPassUseResult.Used -> {
+                                                            val nextAvailable = formatEmergencyPassTime(
+                                                                System.currentTimeMillis() + 7L * 24L * 60L * 60L * 1000L,
+                                                            )
+                                                            if (strings.hardshipLevelPrefix == "Level") {
+                                                                "${decision.result.appName} is allowed until ${formatEmergencyPassTime(expiresAtMillis)}. Available again $nextAvailable"
+                                                            } else {
+                                                                "${decision.result.appName} 앱을 ${formatEmergencyPassTime(expiresAtMillis)}까지 허용했습니다. 다음 사용 가능 $nextAvailable"
+                                                            }
+                                                        }
+                                                        EmergencyPassUseResult.InvalidPin -> strings.invalidAdminPin
+                                                        EmergencyPassUseResult.CooldownActive -> strings.emergencyPassCooldown
+                                                        EmergencyPassUseResult.NotAvailable -> strings.hardshipUnavailable
+                                                    }
+                                                    if (result == EmergencyPassUseResult.Used) {
+                                                        Toast.makeText(
+                                                            this@UsageMonitorForegroundService,
+                                                            dialogStatus.text,
+                                                            Toast.LENGTH_LONG,
+                                                        ).show()
+                                                        dismiss()
+                                                        cancelBlockEnforcementGuard()
+                                                        removeBlockingOverlay()
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+        }
+        card.addView(blockOverlayButton(
+            strings.openManager,
+            iconRes = R.drawable.ic_block_manager,
+            iconColor = Color.rgb(79, 70, 229),
+        ) {
             val now = SystemClock.elapsedRealtime()
             startBlockExitTransitionGrace(decision.result.packageName)
             managerOpenGraceUntilElapsed = now + MANAGER_OPEN_GRACE_MILLIS
@@ -1650,21 +2047,68 @@ class UsageMonitorForegroundService : Service() {
             removeBlockingOverlay()
             openMainActivity()
         })
-        card.addView(blockOverlayButton(strings.home) {
+        card.addView(blockOverlayButton(
+            strings.home,
+            iconRes = R.drawable.ic_block_home,
+            iconColor = Color.rgb(71, 85, 105),
+        ) {
             allowHomeExitFromBlockedScreen(decision.result.packageName)
             sendHomeIntent(force = true)
         })
         return root
     }
 
-    private fun requestParentApproval(
+    private fun blockOverlayParentRequestButton(
         decision: MonitorDecision,
         extraMinutes: Int,
         statusText: TextView,
         strings: BlockOverlayStrings,
+    ): Button {
+        return blockOverlayButton(
+            text = strings.requestParent,
+            outline = true,
+            iconRes = R.drawable.ic_block_parent,
+            iconColor = Color.rgb(124, 58, 237),
+        ) {}.apply {
+            setOnClickListener {
+                requestParentApproval(decision, extraMinutes, statusText, this, strings)
+            }
+        }
+    }
+
+    private fun showScheduleHardshipStarted(
+        schedule: ScheduleHardshipStarted,
+        language: AppLanguage,
     ) {
-        serviceScope.launch {
-            val created = repository.createRemoteUnlockRequest(
+        usageNotificationHelper.showPolicyAlert(
+            title = if (language == AppLanguage.Korean) {
+                "${schedule.scheduleName} · 고행 ${schedule.level.storageValue}단계"
+            } else {
+                "${schedule.scheduleName} · Hardship level ${schedule.level.storageValue}"
+            },
+            message = if (language == AppLanguage.Korean) {
+                "스케줄 고행 모드가 시작되었습니다. 스케줄 종료 시 자동으로 해제됩니다."
+            } else {
+                "Schedule hardship has started and will unlock automatically when this schedule ends."
+            },
+        )
+    }
+
+    private fun requestParentApproval(
+        decision: MonitorDecision,
+        extraMinutes: Int,
+        statusText: TextView,
+        requestButton: Button,
+        strings: BlockOverlayStrings,
+    ) {
+        if (!requestButton.isEnabled) return
+        requestButton.isEnabled = false
+        requestButton.alpha = 0.55f
+        statusText.setTextColor(Color.rgb(37, 99, 235))
+        statusText.text = strings.requestSent
+        remoteParentRequestSubmitJob?.cancel()
+        remoteParentRequestSubmitJob = serviceScope.launch {
+            val submission = repository.createRemoteUnlockRequest(
                 blockReason = decision.result.decision.toRemoteRequestBlockReason(),
                 targetPackageName = decision.result.packageName,
                 targetAppName = decision.result.appName,
@@ -1676,16 +2120,40 @@ class UsageMonitorForegroundService : Service() {
                 unlockedForToday = decision.unlockedForToday,
                 requestedMinutes = extraMinutes,
             )
-            withContext(Dispatchers.Main) {
-                if (created) {
-                    remoteParentFastSyncUntilElapsed = SystemClock.elapsedRealtime() + REMOTE_PARENT_FAST_SYNC_WINDOW_MILLIS
-                    statusText.setTextColor(Color.rgb(37, 99, 235))
-                    statusText.text = strings.requestWaiting
-                    remoteParentRequestMonitorJob?.cancel()
-                    remoteParentRequestMonitorJob = serviceScope.launch {
-                        monitorRemoteParentRequestStatus(decision, statusText, strings)
+            when (submission) {
+                is RemoteUnlockRequestSubmitResult.Sent -> {
+                    withContext(Dispatchers.Main) {
+                        statusText.setTextColor(Color.rgb(37, 99, 235))
+                        statusText.text = strings.requestSent
                     }
-                } else {
+                    startRemoteParentRequestMonitor(
+                        requestId = submission.requestId,
+                        statusText = statusText,
+                        requestButton = requestButton,
+                        strings = strings,
+                    )
+                }
+                is RemoteUnlockRequestSubmitResult.Retrying -> {
+                    withContext(Dispatchers.Main) {
+                        statusText.setTextColor(Color.rgb(180, 83, 9))
+                        statusText.text = strings.requestRetrying
+                    }
+                    retryRemoteParentRequest(
+                        requestId = submission.requestId,
+                        statusText = statusText,
+                        requestButton = requestButton,
+                        strings = strings,
+                    )
+                }
+                RemoteUnlockRequestSubmitResult.NotPaired -> withContext(Dispatchers.Main) {
+                    requestButton.isEnabled = true
+                    requestButton.alpha = 1f
+                    statusText.setTextColor(Color.rgb(229, 91, 74))
+                    statusText.text = strings.parentNotLinked
+                }
+                is RemoteUnlockRequestSubmitResult.Failed -> withContext(Dispatchers.Main) {
+                    requestButton.isEnabled = true
+                    requestButton.alpha = 1f
                     statusText.setTextColor(Color.rgb(229, 91, 74))
                     statusText.text = strings.requestPublishFailed
                 }
@@ -1693,14 +2161,71 @@ class UsageMonitorForegroundService : Service() {
         }
     }
 
-    private suspend fun monitorRemoteParentRequestStatus(
-        decision: MonitorDecision,
+    private suspend fun retryRemoteParentRequest(
+        requestId: String,
         statusText: TextView,
+        requestButton: Button,
+        strings: BlockOverlayStrings,
+    ) {
+        var retryDelayMillis = REMOTE_PARENT_REQUEST_RETRY_INITIAL_MILLIS
+        while (serviceScope.isActive) {
+            delay(retryDelayMillis)
+            when (val result = repository.retryRemoteUnlockRequest(requestId)) {
+                is RemoteUnlockRequestSubmitResult.Sent -> {
+                    withContext(Dispatchers.Main) {
+                        statusText.setTextColor(Color.rgb(37, 99, 235))
+                        statusText.text = strings.requestSent
+                    }
+                    startRemoteParentRequestMonitor(
+                        requestId = result.requestId,
+                        statusText = statusText,
+                        requestButton = requestButton,
+                        strings = strings,
+                    )
+                    return
+                }
+                is RemoteUnlockRequestSubmitResult.Retrying -> {
+                    withContext(Dispatchers.Main) {
+                        statusText.setTextColor(Color.rgb(180, 83, 9))
+                        statusText.text = strings.requestRetrying
+                    }
+                    retryDelayMillis = (retryDelayMillis * 2L)
+                        .coerceAtMost(REMOTE_PARENT_REQUEST_RETRY_MAX_MILLIS)
+                }
+                RemoteUnlockRequestSubmitResult.NotPaired,
+                is RemoteUnlockRequestSubmitResult.Failed -> {
+                    withContext(Dispatchers.Main) {
+                        requestButton.isEnabled = true
+                        requestButton.alpha = 1f
+                        statusText.setTextColor(Color.rgb(229, 91, 74))
+                        statusText.text = strings.requestPublishFailed
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    private fun startRemoteParentRequestMonitor(
+        requestId: String,
+        statusText: TextView,
+        requestButton: Button,
+        strings: BlockOverlayStrings,
+    ) {
+        remoteParentRequestMonitorJob?.cancel()
+        remoteParentRequestMonitorJob = serviceScope.launch {
+            monitorRemoteParentRequestStatus(requestId, statusText, requestButton, strings)
+        }
+    }
+
+    private suspend fun monitorRemoteParentRequestStatus(
+        requestId: String,
+        statusText: TextView,
+        requestButton: Button,
         strings: BlockOverlayStrings,
     ) {
         val startedAt = SystemClock.elapsedRealtime()
         val deadline = startedAt + REMOTE_PARENT_REQUEST_STATUS_WINDOW_MILLIS
-        val blockReason = decision.result.decision.toRemoteRequestBlockReason()
         while (serviceScope.isActive && SystemClock.elapsedRealtime() < deadline) {
             val elapsed = SystemClock.elapsedRealtime() - startedAt
             delay(
@@ -1710,16 +2235,11 @@ class UsageMonitorForegroundService : Service() {
                     REMOTE_PARENT_SYNC_INTERVAL_MILLIS
                 },
             )
-            repository.syncParentDevice()
+            repository.syncRemoteUnlockRequest(requestId)
             val now = System.currentTimeMillis()
             val request = repository.parentManagementState.first()
                 .remoteUnlockRequests
-                .sortedByDescending { item -> item.createdAtMillis }
-                .firstOrNull { item ->
-                    item.blockReason == blockReason &&
-                        item.targetPackageName == decision.result.packageName &&
-                        item.targetGroupName == decision.targetGroupName.orEmpty()
-                }
+                .firstOrNull { item -> item.id == requestId }
             val status = when {
                 request == null -> RemoteUnlockRequestStatus.Pending
                 request.status == RemoteUnlockRequestStatus.Pending && request.expiresAtMillis < now ->
@@ -1741,22 +2261,34 @@ class UsageMonitorForegroundService : Service() {
                         removeBlockingOverlay()
                     }
                     RemoteUnlockRequestStatus.Rejected -> {
+                        requestButton.isEnabled = true
+                        requestButton.alpha = 1f
                         statusText.setTextColor(Color.rgb(229, 91, 74))
                         statusText.text = strings.requestRejected
                     }
                     RemoteUnlockRequestStatus.Expired -> {
+                        requestButton.isEnabled = true
+                        requestButton.alpha = 1f
                         statusText.setTextColor(Color.rgb(180, 83, 9))
                         statusText.text = strings.requestExpired
                     }
                     RemoteUnlockRequestStatus.Failed -> {
+                        requestButton.isEnabled = true
+                        requestButton.alpha = 1f
                         statusText.setTextColor(Color.rgb(229, 91, 74))
                         statusText.text = strings.requestFailed
                     }
                 }
             }
             if (status != RemoteUnlockRequestStatus.Pending) {
-                break
+                return
             }
+        }
+        withContext(Dispatchers.Main) {
+            requestButton.isEnabled = true
+            requestButton.alpha = 1f
+            statusText.setTextColor(Color.rgb(180, 83, 9))
+            statusText.text = strings.requestExpired
         }
     }
 
@@ -1766,6 +2298,7 @@ class UsageMonitorForegroundService : Service() {
         extraMinutes: Int,
         statusText: TextView,
         strings: BlockOverlayStrings,
+        onSuccess: () -> Unit = {},
     ) {
         if (pin.isBlank() || extraMinutes <= 0) {
             statusText.text = strings.adminPinRequired
@@ -1789,6 +2322,7 @@ class UsageMonitorForegroundService : Service() {
                 if (granted) {
                     statusText.setTextColor(Color.rgb(22, 101, 52))
                     statusText.text = strings.addedTime(extraMinutes)
+                    onSuccess()
                     cancelBlockEnforcementGuard()
                     removeBlockingOverlay()
                 } else {
@@ -1804,6 +2338,7 @@ class UsageMonitorForegroundService : Service() {
         pin: String,
         statusText: TextView,
         strings: BlockOverlayStrings,
+        onSuccess: () -> Unit = {},
     ) {
         if (pin.isBlank()) {
             statusText.text = strings.adminPinRequired
@@ -1823,6 +2358,7 @@ class UsageMonitorForegroundService : Service() {
                 if (granted) {
                     statusText.setTextColor(Color.rgb(22, 101, 52))
                     statusText.text = strings.unlockedForToday
+                    onSuccess()
                     cancelBlockEnforcementGuard()
                     removeBlockingOverlay()
                 } else {
@@ -1876,6 +2412,9 @@ class UsageMonitorForegroundService : Service() {
                     usedMinutes = decision.result.usedMinutes,
                     limitMinutes = decision.result.limitMinutes,
                     showAppDetails = decision.result.decision != BlockDecision.WouldBlockTotalLimit,
+                    hardshipLevel = decision.hardshipLevel,
+                    hardshipPolicyKey = decision.hardshipPolicyKey,
+                    activeHardshipPolicyKeys = decision.activeHardshipPolicyKeys,
                 ),
             )
             lastBlockedActivityPackageName = decision.result.packageName
@@ -1920,14 +2459,6 @@ class UsageMonitorForegroundService : Service() {
     }
 
     private fun pauseActiveMediaPlayback() {
-        runCatching {
-            val listenerComponent = ComponentName(this, ScreenTimeNotificationListenerService::class.java)
-            val mediaSessionManager = getSystemService(MediaSessionManager::class.java)
-            mediaSessionManager.getActiveSessions(listenerComponent).forEach { controller ->
-                controller.transportControls.pause()
-                controller.transportControls.stop()
-            }
-        }
         try {
             val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 ?: return
@@ -2024,7 +2555,7 @@ class UsageMonitorForegroundService : Service() {
         )
         return NotificationCompat.Builder(this, MONITOR_CHANNEL_ID)
             .setSmallIcon(R.mipmap.notification_icon)
-            .setContentTitle(title)
+            .setContentTitle(getString(R.string.monitoring_notification_title))
             .setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setOngoing(true)
@@ -2052,9 +2583,13 @@ class UsageMonitorForegroundService : Service() {
     private fun overlayPermissionState() = OverlayPermissionChecker.state(this)
 
     private fun UsagePolicySettings.hasDirectLimitFor(packageName: String): Boolean {
-        val hasAppLimit = (appLimitMap()[packageName] ?: 0) > 0
+        val hasAppLimit = activeAppLimitMap().containsKey(packageName)
         val hasGroupLimit = normalizedAppGroups()
-            .any { group -> packageName in group.packageNames && group.budgetMinutes > 0 }
+            .any { group ->
+                packageName in group.packageNames &&
+                    group.appliesOn(currentPolicyDayOfWeek()) &&
+                    group.limitMinutesOrNull() != null
+            }
         return hasAppLimit || hasGroupLimit
     }
 
@@ -2254,26 +2789,52 @@ class UsageMonitorForegroundService : Service() {
                 showPin = "보기",
                 hidePin = "숨기기",
                 extraTime = "추가 시간",
+                selectExtraTime = "추가할 시간 선택",
                 addTime = "시간 추가",
                 unlockToday = "오늘만 해제",
                 requestParent = "부모에게 요청",
-                requestSent = "부모에게 요청을 보냈습니다",
+                requestSent = "요청을 보냈습니다.",
+                requestRetrying = "재시도 중입니다.",
                 requestWaiting = "부모에게 요청됨 · 승인 대기 중",
-                requestPublishFailed = "요청을 보내지 못했습니다 · 연결과 네트워크를 확인하세요",
+                requestPublishFailed = "요청을 처리하지 못했습니다 · 관리 앱에서 연결 상태를 확인하세요",
                 requestApproved = "승인됨 · 차단을 해제합니다",
                 requestRejected = "부모가 요청을 거절했습니다",
                 requestExpired = "요청이 만료되었습니다",
                 requestFailed = "요청 처리에 실패했습니다",
                 parentNotLinked = "부모 기기가 연결되어 있지 않습니다",
-                emergencyPin = "긴급 PIN",
-                emergencyUnlock = "긴급 해제",
-                openManager = "관리 앱 열기",
+                safeRecovery = "안전 복구",
+                openManager = "폰 쉼 열기",
                 home = "홈으로",
+                cancel = "취소",
+                next = "다음",
+                confirm = "확인",
+                hoursUnit = "시간",
+                minutesUnit = "분",
+                timeRequired = "1분 이상의 시간을 선택하세요",
+                pinRequired = "PIN을 입력하세요",
                 adminPinRequired = "관리 PIN을 입력하세요",
                 invalidAdminPin = "관리 PIN이 올바르지 않습니다",
-                invalidEmergencyPin = "긴급 PIN이 올바르지 않습니다",
                 addedPrefix = "추가됨",
                 unlockedForToday = "오늘만 해제되었습니다",
+                hardshipLevelPrefix = "단계",
+                hardshipLevel1Description = "2분 숙고 후 5분 임시 허용을 최대 2회 사용할 수 있습니다. 고행 종료는 2분 숙고 후 관리 PIN이 필요합니다.",
+                hardshipLevel2Description = "고행 종료는 30분 숙고 후 관리 PIN이 필요합니다.",
+                hardshipParentApprovalAvailable = "연결된 부모에게 승인도 요청할 수 있습니다.",
+                hardshipLevel3Description = "관리 PIN만으로 일반 해제할 수 없습니다. Emergency Pass는 현재 앱에만 적용되며 모든 3단계에서 7일에 한 번 사용할 수 있습니다.",
+                hardshipReflectionAction = "2분 숙고 / 5분 허용",
+                hardshipReflectionStarted = "2분 숙고를 시작했습니다. 시간이 지난 뒤 다시 눌러 주세요.",
+                hardshipReflectionWaiting = "아직 숙고 시간이 끝나지 않았습니다.",
+                hardshipFiveMinutesGranted = "5분 임시 허용이 적용되었습니다.",
+                hardshipAllowanceExpired = "5분 임시 허용 시간이 끝나 다시 차단되었습니다.",
+                hardshipAllowanceLimitReached = "오늘 사용할 수 있는 임시 허용을 모두 사용했습니다.",
+                hardshipUnavailable = "현재 이 기능을 사용할 수 없습니다.",
+                emergencyPass = "Emergency Pass 사용",
+                emergencyPassUsed = "Emergency Pass를 사용했습니다.",
+                emergencyPassCooldown = "아직 Emergency Pass를 사용할 수 없습니다. 표시된 다음 사용 가능 시각을 확인하세요.",
+                hardshipLevel2Action = "30분 숙고 / 관리 PIN으로 종료",
+                hardshipLevel2Started = "30분 숙고를 시작했습니다. 시간이 지난 뒤 관리 PIN을 입력하세요.",
+                hardshipLevel2Waiting = "아직 30분 숙고 시간이 끝나지 않았습니다.",
+                hardshipLevel2Unlocked = "고행 2단계 정책을 오늘만 종료했습니다.",
             )
 
             else -> BlockOverlayStrings(
@@ -2288,10 +2849,12 @@ class UsageMonitorForegroundService : Service() {
                 showPin = "Show",
                 hidePin = "Hide",
                 extraTime = "Extra time",
+                selectExtraTime = "Select extra time",
                 addTime = "Add time",
                 unlockToday = "Unlock for today",
                 requestParent = "Ask parent",
                 requestSent = "Request sent to parent",
+                requestRetrying = "Retrying",
                 requestWaiting = "Requested · waiting for approval",
                 requestPublishFailed = "Request failed · check the connection and network",
                 requestApproved = "Approved · unlocking",
@@ -2299,15 +2862,39 @@ class UsageMonitorForegroundService : Service() {
                 requestExpired = "Request expired",
                 requestFailed = "Request failed",
                 parentNotLinked = "Parent device is not linked",
-                emergencyPin = "Emergency PIN",
-                emergencyUnlock = "Emergency Unlock",
-                openManager = "Open Manager",
+                safeRecovery = "Safe Recovery",
+                openManager = "Open ScreenRest",
                 home = "Home",
+                cancel = "Cancel",
+                next = "Next",
+                confirm = "Confirm",
+                hoursUnit = "h",
+                minutesUnit = "min",
+                timeRequired = "Select at least 1 minute",
+                pinRequired = "Enter the PIN",
                 adminPinRequired = "Admin PIN is required",
                 invalidAdminPin = "Admin PIN is incorrect",
-                invalidEmergencyPin = "Emergency PIN is incorrect",
                 addedPrefix = "Added",
                 unlockedForToday = "Unlocked for today",
+                hardshipLevelPrefix = "Level",
+                hardshipLevel1Description = "After 2 minutes of reflection, you can use a 5-minute allowance up to twice. Ending hardship also requires 2 minutes and the Admin PIN.",
+                hardshipLevel2Description = "Ending hardship requires 30 minutes of reflection and the Admin PIN.",
+                hardshipParentApprovalAvailable = "You can also ask the linked parent for approval.",
+                hardshipLevel3Description = "The Admin PIN cannot normally unlock level 3. Emergency Pass applies only to this app and is shared across all level-3 policies once every 7 days.",
+                hardshipReflectionAction = "Reflect 2 min / allow 5 min",
+                hardshipReflectionStarted = "The 2-minute reflection started. Try again when it ends.",
+                hardshipReflectionWaiting = "The reflection period has not ended yet.",
+                hardshipFiveMinutesGranted = "A 5-minute allowance was granted.",
+                hardshipAllowanceExpired = "The 5-minute allowance ended, so the app is blocked again.",
+                hardshipAllowanceLimitReached = "Today's temporary allowances have all been used.",
+                hardshipUnavailable = "This action is not available now.",
+                emergencyPass = "Use Emergency Pass",
+                emergencyPassUsed = "Emergency Pass used.",
+                emergencyPassCooldown = "Emergency Pass is not available yet. Check the displayed next available time.",
+                hardshipLevel2Action = "Reflect 30 min / end with Admin PIN",
+                hardshipLevel2Started = "The 30-minute reflection started. Enter the Admin PIN when it ends.",
+                hardshipLevel2Waiting = "The 30-minute reflection has not ended yet.",
+                hardshipLevel2Unlocked = "The level 2 policy was ended for today.",
             )
         }
     }
@@ -2331,6 +2918,14 @@ class UsageMonitorForegroundService : Service() {
         return "$addedPrefix ${formatLimitMinutesLabel(extraMinutes)}"
     }
 
+    private fun BlockOverlayStrings.hardshipLevelLabel(level: HardshipLevel): String {
+        return if (hardshipLevelPrefix == "Level") {
+            "Level ${level.storageValue}"
+        } else {
+            "${level.storageValue}단계"
+        }
+    }
+
     private fun blockOverlayText(text: String, sp: Int, color: Int, bold: Boolean): TextView {
         return TextView(this).apply {
             this.text = text
@@ -2344,10 +2939,156 @@ class UsageMonitorForegroundService : Service() {
         }
     }
 
+    private fun blockOverlayHardshipIndicator(
+        level: HardshipLevel,
+        strings: BlockOverlayStrings,
+    ): View {
+        val color = when (level) {
+            HardshipLevel.Off -> Color.rgb(107, 114, 128)
+            HardshipLevel.Level1 -> Color.rgb(176, 122, 22)
+            HardshipLevel.Level2 -> Color.rgb(226, 104, 34)
+            HardshipLevel.Level3 -> Color.rgb(142, 39, 69)
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(
+                ImageView(this@UsageMonitorForegroundService).apply {
+                    setImageResource(R.drawable.ic_hardship_meditation)
+                    setColorFilter(color)
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                },
+                LinearLayout.LayoutParams(dp(34), dp(34)),
+            )
+            addView(
+                blockOverlayText(strings.hardshipLevelLabel(level), 17, color, true),
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { leftMargin = dp(8) },
+            )
+        }
+    }
+
+    private fun addStandardSafeRecovery(
+        card: LinearLayout,
+        root: FrameLayout,
+        statusText: TextView,
+        strings: BlockOverlayStrings,
+    ) {
+        card.addView(
+            blockOverlayButton(
+                text = strings.safeRecovery,
+                iconRes = R.drawable.ic_block_emergency,
+                iconColor = Color.rgb(220, 38, 38),
+            ) {
+                showOverlayPinDialog(
+                    root = root,
+                    title = strings.adminPin,
+                    strings = strings,
+                ) { pin, dialogStatus, dismiss ->
+                    serviceScope.launch {
+                        val unlocked = repository.safeRecovery(pin)
+                        withContext(Dispatchers.Main) {
+                            if (unlocked) {
+                                dismiss()
+                                cancelBlockEnforcementGuard()
+                                clearActiveForegroundSession()
+                                lastBlockedActivityPackageName = null
+                                removeBlockingOverlay()
+                            } else {
+                                dialogStatus.setTextColor(Color.rgb(229, 91, 74))
+                                dialogStatus.text = strings.invalidAdminPin
+                                statusText.text = ""
+                            }
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    private fun showOverlayEmergencyPassConfirmation(
+        root: FrameLayout,
+        appName: String,
+        expiresAtMillis: Long,
+        strings: BlockOverlayStrings,
+        onContinue: () -> Unit,
+    ) {
+        val modal = createOverlayModal(root)
+        val content = modal.content
+        val korean = strings.hardshipLevelPrefix != "Level"
+        val expiry = if (expiresAtMillis > 0L) {
+            formatEmergencyPassTime(expiresAtMillis)
+        } else if (korean) {
+            "현재 정책 종료 시점"
+        } else {
+            "the current policy end"
+        }
+        content.addView(
+            blockOverlayText(
+                if (korean) "Emergency Pass 확인" else "Confirm Emergency Pass",
+                19,
+                Color.rgb(17, 24, 39),
+                true,
+            ),
+        )
+        content.addView(
+            blockOverlayText(
+                if (korean) {
+                    "$appName 앱을 $expiry 까지 허용합니다. 현재 이 앱을 막고 있는 정책에만 예외가 적용됩니다. 사용 후 7일 동안 모든 고행 3단계에서 다시 사용할 수 없으며 취소하거나 되돌릴 수 없습니다."
+                } else {
+                    "Allow $appName until $expiry. Only policies currently blocking this app are bypassed. The Pass cannot be used again for any level-3 policy for 7 days and cannot be refunded."
+                },
+                14,
+                Color.rgb(55, 65, 81),
+                false,
+            ),
+        )
+        content.addView(
+            overlayDialogButtons(
+                cancelText = strings.cancel,
+                confirmText = if (korean) "관리 PIN 입력" else "Enter Admin PIN",
+                onCancel = modal.dismiss,
+                onConfirm = {
+                    modal.dismiss()
+                    onContinue()
+                },
+            ),
+        )
+    }
+
+    private fun formatEmergencyPassTime(timestampMillis: Long): String {
+        if (timestampMillis <= 0L) return "-"
+        return SimpleDateFormat("M/d HH:mm", Locale.getDefault()).format(Date(timestampMillis))
+    }
+
+    /**
+     * Some visible apps delegate work to a sibling package signed and installed under the same
+     * Android UID. Treating that helper as an unrelated app breaks photo/edit/share flows and
+     * forces users to manage packages that never appear as launchable icons. Shared-UID expansion
+     * is deliberately applied only to packages the user already allowed.
+     */
+    private fun expandAllowedPackagesWithSharedUid(packageNames: Set<String>): Set<String> {
+        val expandedPackages = SafetyGate.expandedUserAllowedPackages(packageNames).toMutableSet()
+        packageNames.forEach { packageName ->
+            val uid = runCatching {
+                packageManager.getApplicationInfo(packageName, 0).uid
+            }.getOrNull() ?: return@forEach
+            packageManager.getPackagesForUid(uid)
+                .orEmpty()
+                .filter { relatedPackageName -> relatedPackageName.isNotBlank() }
+                .forEach(expandedPackages::add)
+        }
+        return expandedPackages
+    }
+
     private fun blockOverlayButton(
         text: String,
         primary: Boolean = false,
         outline: Boolean = false,
+        iconRes: Int? = null,
+        iconColor: Int = Color.rgb(37, 99, 235),
         onClick: () -> Unit,
     ): Button {
         return Button(this).apply {
@@ -2367,14 +3108,261 @@ class UsageMonitorForegroundService : Service() {
             if (primary) {
                 setTextColor(Color.WHITE)
             }
-            minHeight = dp(42)
+            iconRes?.let { resourceId ->
+                setCompoundDrawablesWithIntrinsicBounds(resourceId, 0, 0, 0)
+                compoundDrawableTintList = ColorStateList.valueOf(iconColor)
+                compoundDrawablePadding = dp(12)
+            }
+            gravity = Gravity.CENTER
+            setPadding(dp(18), 0, dp(18), 0)
+            minHeight = dp(52)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(42),
+                dp(52),
             ).apply {
-                topMargin = dp(6)
+                topMargin = dp(10)
             }
             setOnClickListener { onClick() }
+        }
+    }
+
+    private fun bindLevelOneCountdown(
+        button: Button,
+        readyAtMillis: Long,
+        strings: BlockOverlayStrings,
+    ) {
+        if (readyAtMillis <= 0L) {
+            button.text = strings.hardshipReflectionAction
+            button.isEnabled = true
+            return
+        }
+        val update = object : Runnable {
+            override fun run() {
+                val remainingMillis = (readyAtMillis - System.currentTimeMillis()).coerceAtLeast(0L)
+                if (remainingMillis <= 0L) {
+                    button.text = if (strings.hardshipReflectionAction.startsWith("Reflect")) {
+                        "Allow for 5 minutes"
+                    } else {
+                        "5분 임시 허용"
+                    }
+                    button.isEnabled = true
+                    return
+                }
+                val totalSeconds = (remainingMillis + 999L) / 1_000L
+                val minutes = totalSeconds / 60L
+                val seconds = totalSeconds % 60L
+                val prefix = if (strings.hardshipReflectionAction.startsWith("Reflect")) {
+                    "Reflecting"
+                } else {
+                    "숙고 중"
+                }
+                button.text = "$prefix · %02d:%02d".format(minutes, seconds)
+                button.isEnabled = false
+                button.postDelayed(this, 1_000L)
+            }
+        }
+        button.removeCallbacks(update)
+        update.run()
+    }
+
+    private fun showOverlayTimePicker(
+        root: FrameLayout,
+        initialMinutes: Int,
+        strings: BlockOverlayStrings,
+        onConfirm: (Int) -> Unit,
+    ) {
+        val modal = createOverlayModal(root)
+        val content = modal.content
+        content.addView(blockOverlayText(strings.selectExtraTime, 19, Color.rgb(17, 24, 39), true))
+
+        val maxSelectableMinutes = MAX_TEMPORARY_EXTRA_MINUTES
+        val maxSelectableHours = maxSelectableMinutes / 60
+        val maxMinutesAtLastHour = maxSelectableMinutes % 60
+        val normalizedInitialMinutes = initialMinutes.coerceIn(1, maxSelectableMinutes)
+        val selectedValueText = blockOverlayText(
+            formatLimitMinutesLabel(normalizedInitialMinutes),
+            21,
+            Color.rgb(30, 64, 175),
+            true,
+        ).apply {
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.rgb(219, 234, 254))
+            }
+            setPadding(dp(22), dp(10), dp(22), dp(10))
+        }
+        content.addView(
+            selectedValueText,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(8)
+            },
+        )
+        val hourPicker = NumberPicker(this).apply {
+            minValue = 0
+            maxValue = maxSelectableHours
+            value = normalizedInitialMinutes / 60
+            wrapSelectorWheel = false
+        }
+        val minutePicker = NumberPicker(this).apply {
+            minValue = 0
+            maxValue = if (hourPicker.value == maxSelectableHours) maxMinutesAtLastHour else 59
+            value = if (hourPicker.value == maxSelectableHours) {
+                (normalizedInitialMinutes % 60).coerceAtMost(maxMinutesAtLastHour)
+            } else {
+                normalizedInitialMinutes % 60
+            }
+            wrapSelectorWheel = true
+        }
+        fun updateSelectedValue() {
+            val selectedMinutes = ((hourPicker.value * 60) + minutePicker.value)
+                .coerceIn(0, maxSelectableMinutes)
+            selectedValueText.text = formatLimitMinutesLabel(selectedMinutes)
+        }
+        hourPicker.setOnValueChangedListener { _, _, newValue ->
+            val previousMinute = minutePicker.value
+            minutePicker.maxValue = if (newValue == maxSelectableHours) maxMinutesAtLastHour else 59
+            minutePicker.value = if (newValue == maxSelectableHours) {
+                previousMinute.coerceAtMost(maxMinutesAtLastHour)
+            } else {
+                previousMinute.coerceAtMost(59)
+            }
+            updateSelectedValue()
+        }
+        minutePicker.setOnValueChangedListener { _, _, _ -> updateSelectedValue() }
+        val pickerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(16).toFloat()
+                setColor(Color.rgb(243, 244, 246))
+            }
+            addView(hourPicker, LinearLayout.LayoutParams(0, dp(150), 1f))
+            addView(blockOverlayText(strings.hoursUnit, 15, Color.rgb(55, 65, 81), true))
+            addView(minutePicker, LinearLayout.LayoutParams(0, dp(150), 1f))
+            addView(blockOverlayText(strings.minutesUnit, 15, Color.rgb(55, 65, 81), true))
+        }
+        content.addView(
+            pickerRow,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
+        val errorText = blockOverlayText("", 13, Color.rgb(229, 91, 74), true)
+        content.addView(errorText)
+        content.addView(
+            overlayDialogButtons(
+                cancelText = strings.cancel,
+                confirmText = strings.next,
+                onCancel = modal.dismiss,
+                onConfirm = {
+                    val selectedMinutes = (hourPicker.value * 60) + minutePicker.value
+                    if (selectedMinutes <= 0) {
+                        errorText.text = strings.timeRequired
+                    } else {
+                        modal.dismiss()
+                        onConfirm(selectedMinutes.coerceAtMost(maxSelectableMinutes))
+                    }
+                },
+            ),
+        )
+    }
+
+    private fun showOverlayPinDialog(
+        root: FrameLayout,
+        title: String,
+        strings: BlockOverlayStrings,
+        onConfirm: (pin: String, statusText: TextView, dismiss: () -> Unit) -> Unit,
+    ) {
+        val modal = createOverlayModal(root)
+        val content = modal.content
+        content.addView(blockOverlayText(title, 19, Color.rgb(17, 24, 39), true))
+        val inputScroll = ScrollView(this).apply { isFillViewport = true }
+        val pinInput = blockOverlayPinInput(title, inputScroll, strings)
+        inputScroll.addView(
+            pinInput.container,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(50)),
+        )
+        content.addView(
+            inputScroll,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(54)).apply {
+                topMargin = dp(10)
+            },
+        )
+        val statusText = blockOverlayText("", 13, Color.rgb(229, 91, 74), true)
+        content.addView(statusText)
+        content.addView(
+            overlayDialogButtons(
+                cancelText = strings.cancel,
+                confirmText = strings.confirm,
+                onCancel = modal.dismiss,
+                onConfirm = {
+                    val pin = pinInput.input.text?.toString().orEmpty()
+                    if (pin.isBlank()) {
+                        statusText.text = strings.pinRequired
+                    } else {
+                        onConfirm(pin, statusText, modal.dismiss)
+                    }
+                },
+            ),
+        )
+        pinInput.input.requestFocus()
+        showOverlayKeyboard(pinInput.input)
+    }
+
+    private fun createOverlayModal(root: FrameLayout): OverlayModal {
+        val modalLayer = FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = true
+            setBackgroundColor(Color.argb(165, 0, 0, 0))
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(18), dp(18), dp(18), dp(14))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(22).toFloat()
+                setColor(Color.WHITE)
+            }
+        }
+        modalLayer.addView(
+            content,
+            FrameLayout.LayoutParams(
+                dp(360).coerceAtMost(resources.displayMetrics.widthPixels - dp(32)),
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            ),
+        )
+        val dismiss = {
+            val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            inputMethodManager?.hideSoftInputFromWindow(modalLayer.windowToken, 0)
+            root.removeView(modalLayer)
+            Unit
+        }
+        root.addView(
+            modalLayer,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
+        )
+        modalLayer.bringToFront()
+        return OverlayModal(content = content, dismiss = dismiss)
+    }
+
+    private fun overlayDialogButtons(
+        cancelText: String,
+        confirmText: String,
+        onCancel: () -> Unit,
+        onConfirm: () -> Unit,
+    ): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(
+                blockOverlayButton(cancelText, outline = true, onClick = onCancel),
+                LinearLayout.LayoutParams(0, dp(46), 1f).apply { rightMargin = dp(6) },
+            )
+            addView(
+                blockOverlayButton(confirmText, primary = true, onClick = onConfirm),
+                LinearLayout.LayoutParams(0, dp(46), 1f).apply { leftMargin = dp(6) },
+            )
         }
     }
 
@@ -2531,11 +3519,25 @@ class UsageMonitorForegroundService : Service() {
         val targetGroupName: String?,
         val targetGroupUsedMillis: Long?,
         val targetGroupLimitMillis: Long?,
+        val hardshipLevel: HardshipLevel,
+        val hardshipPolicyType: HardshipPolicyType?,
+        val hardshipPolicyKey: HardshipPolicyKey?,
+        val activeHardshipPolicyKeys: Set<HardshipPolicyKey>,
+        val canRequestParent: Boolean,
+        val hardshipAllowanceEnded: Boolean,
+        val levelOneReflectionReadyAtMillis: Long,
+        val emergencyPassNextAvailableAtMillis: Long,
+        val activeBlockCount: Int,
     )
 
     private data class BlockOverlayPinInput(
         val container: View,
         val input: EditText,
+    )
+
+    private data class OverlayModal(
+        val content: LinearLayout,
+        val dismiss: () -> Unit,
     )
 
     private data class BlockOverlayVisualStyle(
@@ -2557,10 +3559,12 @@ class UsageMonitorForegroundService : Service() {
         val showPin: String,
         val hidePin: String,
         val extraTime: String,
+        val selectExtraTime: String,
         val addTime: String,
         val unlockToday: String,
         val requestParent: String,
         val requestSent: String,
+        val requestRetrying: String,
         val requestWaiting: String,
         val requestPublishFailed: String,
         val requestApproved: String,
@@ -2568,15 +3572,39 @@ class UsageMonitorForegroundService : Service() {
         val requestExpired: String,
         val requestFailed: String,
         val parentNotLinked: String,
-        val emergencyPin: String,
-        val emergencyUnlock: String,
+        val safeRecovery: String,
         val openManager: String,
         val home: String,
+        val cancel: String,
+        val next: String,
+        val confirm: String,
+        val hoursUnit: String,
+        val minutesUnit: String,
+        val timeRequired: String,
+        val pinRequired: String,
         val adminPinRequired: String,
         val invalidAdminPin: String,
-        val invalidEmergencyPin: String,
         val addedPrefix: String,
         val unlockedForToday: String,
+        val hardshipLevelPrefix: String,
+        val hardshipLevel1Description: String,
+        val hardshipLevel2Description: String,
+        val hardshipParentApprovalAvailable: String,
+        val hardshipLevel3Description: String,
+        val hardshipReflectionAction: String,
+        val hardshipReflectionStarted: String,
+        val hardshipReflectionWaiting: String,
+        val hardshipFiveMinutesGranted: String,
+        val hardshipAllowanceExpired: String,
+        val hardshipAllowanceLimitReached: String,
+        val hardshipUnavailable: String,
+        val emergencyPass: String,
+        val emergencyPassUsed: String,
+        val emergencyPassCooldown: String,
+        val hardshipLevel2Action: String,
+        val hardshipLevel2Started: String,
+        val hardshipLevel2Waiting: String,
+        val hardshipLevel2Unlocked: String,
     )
 
     companion object {
@@ -2618,10 +3646,14 @@ class UsageMonitorForegroundService : Service() {
         private const val DEBUG_USAGE_ADJUST_LOG_THRESHOLD_MILLIS = 1_000L
         private const val MONITOR_STATUS_WRITE_INTERVAL_MILLIS = 5_000L
         private const val USAGE_MAP_CACHE_MILLIS = 1_000L
+        private const val HARDSHIP_LIFECYCLE_CHECK_INTERVAL_MILLIS = 5_000L
         private const val REMOTE_PARENT_SYNC_INTERVAL_MILLIS = 15_000L
+        private const val REMOTE_PARENT_BACKGROUND_SYNC_INTERVAL_MILLIS = 60_000L
         private const val REMOTE_PARENT_FAST_SYNC_INTERVAL_MILLIS = 2_000L
         private const val REMOTE_PARENT_FAST_SYNC_WINDOW_MILLIS = 2L * 60L * 1_000L
         private const val REMOTE_PARENT_REQUEST_STATUS_WINDOW_MILLIS = 10L * 60L * 1_000L
+        private const val REMOTE_PARENT_REQUEST_RETRY_INITIAL_MILLIS = 2_000L
+        private const val REMOTE_PARENT_REQUEST_RETRY_MAX_MILLIS = 30_000L
         private const val FOREGROUND_DEBUG_TAG = "STM-Foreground"
 
         fun start(context: Context): Boolean {
@@ -2687,19 +3719,13 @@ class UsageMonitorForegroundService : Service() {
             }
         }
 
-        fun scheduleExactRecoveryAlarm(
+        fun scheduleRecoveryAlarm(
             context: Context,
             reason: String,
             delayMillis: Long = 60_000L,
         ) {
             val appContext = context.applicationContext
             val alarmManager = appContext.getSystemService(AlarmManager::class.java)
-            if (
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                !alarmManager.canScheduleExactAlarms()
-            ) {
-                return
-            }
             val pendingIntent = PendingIntent.getBroadcast(
                 appContext,
                 EXACT_RECOVERY_ALARM_REQUEST_CODE,
@@ -2710,19 +3736,11 @@ class UsageMonitorForegroundService : Service() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
             val triggerAt = SystemClock.elapsedRealtime() + delayMillis.coerceAtLeast(1_000L)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerAt,
-                    pendingIntent,
-                )
-            } else {
-                alarmManager.setExact(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerAt,
-                    pendingIntent,
-                )
-            }
+            alarmManager.setAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                triggerAt,
+                pendingIntent,
+            )
         }
     }
 }
