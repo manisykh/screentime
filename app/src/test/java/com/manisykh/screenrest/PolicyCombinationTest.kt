@@ -1,10 +1,13 @@
 package com.manisykh.screenrest
 
 import com.manisykh.screenrest.data.AppGroupPolicy
+import com.manisykh.screenrest.data.ImmediateBlockState
+import com.manisykh.screenrest.data.HardshipLevel
 import com.manisykh.screenrest.data.ScheduleTemplatePolicy
 import com.manisykh.screenrest.data.UsagePolicySettings
 import com.manisykh.screenrest.data.activeScheduleTemplate
 import com.manisykh.screenrest.data.hasStructuralPolicyConflict
+import com.manisykh.screenrest.data.isScheduleBlockingNow
 import com.manisykh.screenrest.data.overlappingSchedulePairs
 import com.manisykh.screenrest.data.normalizedAppGroups
 import com.manisykh.screenrest.data.selectedScheduleTemplate
@@ -23,6 +26,67 @@ import java.time.LocalDateTime
 
 class PolicyCombinationTest {
     private val packageName = "com.example.video"
+
+    @Test
+    fun immediateBlock_blocksOrdinaryApp_withoutChangingSavedPolicies() {
+        val now = System.currentTimeMillis()
+        val result = BlockDecisionEngine.evaluate(
+            packageName = packageName,
+            appName = "Video",
+            safeModeEnabled = false,
+            policyEnforcementEnabled = true,
+            settings = UsagePolicySettings(),
+            appUsedMinutes = 0,
+            totalUsedMinutes = 0,
+            exceededGroupPackages = emptySet(),
+            immediateBlockState = ImmediateBlockState(
+                requestId = "test-order", requestedAtMillis = now - 1_000L,
+                expiresAtMillis = now + 60_000L,
+            ),
+        )
+        assertEquals(BlockDecision.WouldBlockImmediate, result.decision)
+    }
+
+    @Test
+    fun immediateBlock_respectsUnrestrictedAppAndExpiry() {
+        val now = System.currentTimeMillis()
+        val active = ImmediateBlockState(
+            requestId = "test-order", requestedAtMillis = now - 1_000L,
+            expiresAtMillis = now + 60_000L,
+        )
+        fun decide(order: ImmediateBlockState, exempt: Boolean) = BlockDecisionEngine.evaluate(
+            packageName = packageName, appName = "Video",
+            safeModeEnabled = false, policyEnforcementEnabled = true,
+            settings = UsagePolicySettings(), appUsedMinutes = 0, totalUsedMinutes = 0,
+            exceededGroupPackages = emptySet(),
+            userAllowedPackages = if (exempt) setOf(packageName) else emptySet(),
+            immediateBlockState = order,
+        ).decision
+        assertEquals(BlockDecision.AllowedWhitelist, decide(active, true))
+        assertTrue(decide(active.copy(expiresAtMillis = now - 1L), false) !=
+            BlockDecision.WouldBlockImmediate)
+    }
+
+    @Test
+    fun immediateBlock_preservesExistingLevelThreeBlockReason() {
+        val now = System.currentTimeMillis()
+        val evaluation = BlockDecisionEngine.evaluateDetailed(
+            packageName = packageName, appName = "Video",
+            safeModeEnabled = false, policyEnforcementEnabled = true,
+            settings = UsagePolicySettings(
+                appLimitRules = "$packageName=0",
+                appLimitsHardshipLevel = HardshipLevel.Level3,
+            ),
+            appUsedMillis = 0L, totalUsedMillis = 0L,
+            immediateBlockState = ImmediateBlockState(
+                requestId = "test-order", requestedAtMillis = now - 1_000L,
+                expiresAtMillis = now + 60_000L,
+            ),
+        )
+        assertEquals(BlockDecision.WouldBlockAppLimit, evaluation.result.decision)
+        assertEquals(HardshipLevel.Level3, evaluation.hardshipLevel)
+        assertTrue(BlockDecision.WouldBlockImmediate in evaluation.activeBlockDecisions)
+    }
 
     @Test
     fun allowOnlyAdmission_doesNotBypassAppTimeLimit() {
@@ -198,6 +262,29 @@ class PolicyCombinationTest {
         )
 
         assertTrue(schedules.overlappingSchedulePairs().isEmpty())
+    }
+
+    @Test
+    fun disabledSchedule_isExcludedFromOverlapAndRuntime() {
+        val monday = LocalDateTime.of(2026, 8, 31, 12, 0)
+        val enabled = ScheduleTemplatePolicy("one", "One", 11 * 60, 13 * 60, setOf(1))
+        val disabled = ScheduleTemplatePolicy(
+            id = "two",
+            name = "Two",
+            startMinutes = 11 * 60,
+            endMinutes = 13 * 60,
+            days = setOf(1),
+            enabled = false,
+        )
+        val settings = UsagePolicySettings(
+            scheduleBlockingEnabled = true,
+            scheduleTemplates = listOf(enabled, disabled).toScheduleTemplatesEncoded(),
+        )
+
+        assertTrue(listOf(enabled, disabled).overlappingSchedulePairs().isEmpty())
+        assertEquals(enabled, settings.activeScheduleTemplate(monday))
+        assertTrue(settings.isScheduleBlockingNow(monday))
+        assertNull(settings.copy(scheduleTemplates = listOf(disabled).toScheduleTemplatesEncoded()).activeScheduleTemplate(monday))
     }
 
     @Test

@@ -261,6 +261,144 @@ service cloud.firestore {
         );
     }
 
+    function validTopAppUsage(item, todayUsedMillis) {
+      return item is map && item.keys().hasOnly(["appName", "usedMillis"]) &&
+        item.keys().hasAll(["appName", "usedMillis"]) &&
+        item.appName is string && item.appName.size() > 0 && item.appName.size() <= 80 &&
+        item.usedMillis is int && item.usedMillis > 0 &&
+        item.usedMillis <= todayUsedMillis;
+    }
+
+    function validChildUsageSnapshot(childDeviceId) {
+      let data = request.resource.data;
+      let appUsageSharingEnabled = data.get("appUsageSharingEnabled", false);
+      let topApps = data.get("topApps", []);
+      return data.keys().hasAll([
+          "childDeviceId", "childUid", "dateKey", "capturedAtMillis",
+          "todayUsedMillis", "dailyCountedUsageMillis", "effectiveDailyLimitMinutes", "dailyUnlockedForToday",
+          "usageAccessReady", "protectionPaused"
+        ]) &&
+        data.keys().hasOnly([
+          "childDeviceId", "childUid", "dateKey", "capturedAtMillis",
+          "todayUsedMillis", "dailyCountedUsageMillis", "effectiveDailyLimitMinutes", "dailyUnlockedForToday",
+          "usageAccessReady", "protectionPaused", "appUsageSharingEnabled", "topApps"
+        ]) &&
+        data.childDeviceId == childDeviceId &&
+        data.childUid == request.auth.uid &&
+        data.dateKey is string &&
+        data.dateKey.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        data.capturedAtMillis is int && data.capturedAtMillis > 0 &&
+        data.todayUsedMillis is int &&
+        data.todayUsedMillis >= 0 && data.todayUsedMillis <= 86400000 &&
+        data.dailyCountedUsageMillis is int &&
+        data.dailyCountedUsageMillis >= 0 &&
+        data.dailyCountedUsageMillis <= data.todayUsedMillis &&
+        (data.effectiveDailyLimitMinutes == null ||
+          (data.effectiveDailyLimitMinutes is int &&
+            data.effectiveDailyLimitMinutes >= 0 &&
+            data.effectiveDailyLimitMinutes <= 2880)) &&
+        data.dailyUnlockedForToday is bool &&
+        data.usageAccessReady is bool &&
+        data.protectionPaused is bool &&
+        appUsageSharingEnabled is bool &&
+        topApps is list && topApps.size() <= 5 &&
+        (appUsageSharingEnabled && data.usageAccessReady || topApps.size() == 0) &&
+        (topApps.size() < 1 || validTopAppUsage(topApps[0], data.todayUsedMillis)) &&
+        (topApps.size() < 2 || validTopAppUsage(topApps[1], data.todayUsedMillis)) &&
+        (topApps.size() < 3 || validTopAppUsage(topApps[2], data.todayUsedMillis)) &&
+        (topApps.size() < 4 || validTopAppUsage(topApps[3], data.todayUsedMillis)) &&
+        (topApps.size() < 5 || validTopAppUsage(topApps[4], data.todayUsedMillis));
+    }
+
+    function validUsageRefreshIssue(childDeviceId) {
+      let data = request.resource.data;
+      return data.keys().hasAll([
+          "requestId", "childDeviceId", "parentUid", "requestedAtMillis",
+          "expiresAtMillis", "completedAtMillis"
+        ]) &&
+        data.keys().hasOnly([
+          "requestId", "childDeviceId", "parentUid", "requestedAtMillis",
+          "expiresAtMillis", "completedAtMillis"
+        ]) &&
+        data.requestId is string && data.requestId.size() >= 16 && data.requestId.size() <= 100 &&
+        data.childDeviceId == childDeviceId &&
+        data.parentUid == request.auth.uid &&
+        data.requestedAtMillis is int &&
+        data.requestedAtMillis >= request.time.toMillis() - 120000 &&
+        data.requestedAtMillis <= request.time.toMillis() + 120000 &&
+        data.expiresAtMillis is int &&
+        data.expiresAtMillis > data.requestedAtMillis &&
+        data.expiresAtMillis <= data.requestedAtMillis + 1800000 &&
+        data.completedAtMillis == 0;
+    }
+
+    function validUsageRefreshRenew(childDeviceId) {
+      return validUsageRefreshIssue(childDeviceId) &&
+        request.resource.data.requestId != resource.data.requestId &&
+        request.time.toMillis() - resource.data.get("requestedAtMillis", 0) >= 60000;
+    }
+
+    function validUsageRefreshAcknowledgement() {
+      return resource.data.completedAtMillis == 0 &&
+        resource.data.expiresAtMillis > request.time.toMillis() &&
+        request.resource.data.completedAtMillis is int &&
+        request.resource.data.completedAtMillis >= request.time.toMillis() - 120000 &&
+        request.resource.data.completedAtMillis <= request.time.toMillis() + 120000 &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["completedAtMillis"]);
+    }
+
+    function validImmediateBlockIssue(childDeviceId) {
+      let data = request.resource.data;
+      return data.keys().hasAll([
+          "requestId", "childDeviceId", "parentUid", "requestedAtMillis",
+          "expiresAtMillis", "revokedAtMillis", "appliedAtMillis", "releasedAtMillis"
+        ]) &&
+        data.keys().hasOnly([
+          "requestId", "childDeviceId", "parentUid", "requestedAtMillis",
+          "expiresAtMillis", "revokedAtMillis", "appliedAtMillis", "releasedAtMillis"
+        ]) &&
+        data.requestId is string && data.requestId.size() >= 16 && data.requestId.size() <= 100 &&
+        data.childDeviceId == childDeviceId &&
+        data.parentUid == request.auth.uid &&
+        data.requestedAtMillis is int &&
+        data.requestedAtMillis >= request.time.toMillis() - 120000 &&
+        data.requestedAtMillis <= request.time.toMillis() + 120000 &&
+        data.expiresAtMillis is int &&
+        data.expiresAtMillis > data.requestedAtMillis &&
+        data.expiresAtMillis <= data.requestedAtMillis + 86400000 &&
+        data.revokedAtMillis == 0 && data.appliedAtMillis == 0 &&
+        data.releasedAtMillis == 0;
+    }
+
+    function validImmediateBlockRevoke() {
+      return request.resource.data.requestId == resource.data.requestId &&
+        request.resource.data.revokedAtMillis is int &&
+        request.resource.data.revokedAtMillis >= request.time.toMillis() - 120000 &&
+        request.resource.data.revokedAtMillis <= request.time.toMillis() + 120000 &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["revokedAtMillis"]);
+    }
+
+    function validImmediateBlockAcknowledgement() {
+      return request.resource.data.requestId == resource.data.requestId &&
+        resource.data.revokedAtMillis == 0 &&
+        resource.data.expiresAtMillis > request.time.toMillis() &&
+        resource.data.appliedAtMillis == 0 &&
+        request.resource.data.appliedAtMillis is int &&
+        request.resource.data.appliedAtMillis >= request.time.toMillis() - 120000 &&
+        request.resource.data.appliedAtMillis <= request.time.toMillis() + 120000 &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["appliedAtMillis"]);
+    }
+
+    function validImmediateBlockReleaseAcknowledgement() {
+      return request.resource.data.requestId == resource.data.requestId &&
+        resource.data.revokedAtMillis > 0 &&
+        resource.data.releasedAtMillis == 0 &&
+        request.resource.data.releasedAtMillis is int &&
+        request.resource.data.releasedAtMillis >= request.time.toMillis() - 120000 &&
+        request.resource.data.releasedAtMillis <= request.time.toMillis() + 120000 &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["releasedAtMillis"]);
+    }
+
     match /screenrest_pairing_codes/{pairingCode} {
       allow create: if signedIn() && validPairingCreate(pairingCode);
       allow get: if signedIn() &&
@@ -295,6 +433,40 @@ service cloud.firestore {
           (isLinkedParent(childDeviceId) && validParentDecisionUpdate());
         allow delete: if isChildOwner(childDeviceId) &&
           isOlderThanRemoteRetention(resource.data.get("createdAtMillis", 0));
+      }
+
+      match /usage_snapshots/{snapshotId} {
+        allow get: if isChildOwner(childDeviceId) || isLinkedParent(childDeviceId);
+        allow list: if false;
+        allow create, update: if snapshotId == "current" &&
+          isChildOwner(childDeviceId) && validChildUsageSnapshot(childDeviceId);
+        allow delete: if isChildOwner(childDeviceId);
+      }
+
+      match /usage_refresh/{documentId} {
+        allow get: if documentId == "current" &&
+          (isChildOwner(childDeviceId) || isLinkedParent(childDeviceId));
+        allow list, delete: if false;
+        allow create: if documentId == "current" && isLinkedParent(childDeviceId) &&
+          validUsageRefreshIssue(childDeviceId);
+        allow update: if documentId == "current" &&
+          ((isLinkedParent(childDeviceId) && validUsageRefreshRenew(childDeviceId)) ||
+            (isChildOwner(childDeviceId) && validUsageRefreshAcknowledgement()));
+      }
+
+      match /immediate_block/{documentId} {
+        allow get: if documentId == "current" &&
+          (isChildOwner(childDeviceId) || isLinkedParent(childDeviceId));
+        allow list, delete: if false;
+        allow create: if documentId == "current" && isLinkedParent(childDeviceId) &&
+          validImmediateBlockIssue(childDeviceId);
+        allow update: if documentId == "current" &&
+          ((isLinkedParent(childDeviceId) &&
+            (validImmediateBlockIssue(childDeviceId) ||
+              validImmediateBlockRevoke())) ||
+            (isChildOwner(childDeviceId) &&
+              (validImmediateBlockAcknowledgement() ||
+                validImmediateBlockReleaseAcknowledgement())));
       }
 
       match /remote_commands/{commandId} {

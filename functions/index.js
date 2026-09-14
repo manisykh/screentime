@@ -33,6 +33,104 @@ const INVALID_TOKEN_CODES = new Set([
 ]);
 const REQUEST_DOCUMENT_PATH =
   `${CHILDREN_COLLECTION}/{childDeviceId}/unlock_requests/{requestId}`;
+const IMMEDIATE_BLOCK_DOCUMENT_PATH =
+  `${CHILDREN_COLLECTION}/{childDeviceId}/immediate_block/current`;
+const USAGE_REFRESH_DOCUMENT_PATH =
+  `${CHILDREN_COLLECTION}/{childDeviceId}/usage_refresh/current`;
+
+exports.processCreatedChildUsageRefreshPush = onDocumentCreated(
+    USAGE_REFRESH_DOCUMENT_PATH,
+    async (event) => {
+      if (event.data) await processChildUsageRefreshChange(null, event.data.data(), event.params);
+    },
+);
+
+exports.processUpdatedChildUsageRefreshPush = onDocumentUpdated(
+    USAGE_REFRESH_DOCUMENT_PATH,
+    async (event) => {
+      if (event.data) {
+        await processChildUsageRefreshChange(
+            event.data.before.data(), event.data.after.data(), event.params,
+        );
+      }
+    },
+);
+
+async function processChildUsageRefreshChange(before, after, params) {
+  if (!after || after.childDeviceId !== params.childDeviceId ||
+      typeof after.requestId !== "string" || !after.requestId ||
+      Number(after.completedAtMillis || 0) !== 0 ||
+      (before && before.requestId === after.requestId)) return;
+  const remaining = Number(after.expiresAtMillis || 0) - Date.now();
+  if (remaining <= 0) return;
+  const childSnapshot = await db.collection(CHILDREN_COLLECTION)
+      .doc(params.childDeviceId).get();
+  if (!childSnapshot.exists || childSnapshot.get("status") === "unlinked") return;
+  const parentUids = stringSet(childSnapshot.get("parentUids"));
+  if (!parentUids.has(after.parentUid)) return;
+  const childUid = childSnapshot.get("childUid");
+  if (typeof childUid !== "string" || !childUid) return;
+  await sendToLinkedDevices({
+    childDeviceId: params.childDeviceId,
+    role: "child",
+    allowedUids: new Set([childUid]),
+    data: {
+      type: "child_usage_refresh_requested",
+      childDeviceId: params.childDeviceId,
+      requestId: after.requestId,
+      eventKey: `usage-refresh:${params.childDeviceId}:${after.requestId}`,
+    },
+    collapseKey: `usage-refresh-${params.childDeviceId}`,
+    ttlMillis: Math.min(remaining, 30 * 60 * 1000),
+    androidPriority: "normal",
+  });
+}
+
+exports.processCreatedImmediateBlockPush = onDocumentCreated(
+    IMMEDIATE_BLOCK_DOCUMENT_PATH,
+    async (event) => {
+      if (event.data) await processImmediateBlockChange(null, event.data.data(), event.params);
+    },
+);
+
+exports.processUpdatedImmediateBlockPush = onDocumentUpdated(
+    IMMEDIATE_BLOCK_DOCUMENT_PATH,
+    async (event) => {
+      if (event.data) {
+        await processImmediateBlockChange(
+            event.data.before.data(), event.data.after.data(), event.params,
+        );
+      }
+    },
+);
+
+async function processImmediateBlockChange(before, after, params) {
+  if (!after || after.childDeviceId !== params.childDeviceId ||
+      typeof after.requestId !== "string") return;
+  if (before && before.requestId === after.requestId &&
+      before.revokedAtMillis === after.revokedAtMillis) return;
+  const childSnapshot = await db.collection(CHILDREN_COLLECTION)
+      .doc(params.childDeviceId).get();
+  if (!childSnapshot.exists || childSnapshot.get("status") === "unlinked") return;
+  const childUid = childSnapshot.get("childUid");
+  if (typeof childUid !== "string" || !childUid) return;
+  const revoked = Number(after.revokedAtMillis || 0) > 0;
+  const remaining = Number(after.expiresAtMillis || 0) - Date.now();
+  if (!revoked && remaining <= 0) return;
+  await sendToLinkedDevices({
+    childDeviceId: params.childDeviceId,
+    role: "child",
+    allowedUids: new Set([childUid]),
+    data: {
+      type: "immediate_block_changed",
+      childDeviceId: params.childDeviceId,
+      requestId: after.requestId,
+      eventKey: `immediate:${params.childDeviceId}:${after.requestId}:${after.revokedAtMillis}`,
+    },
+    collapseKey: `immediate-${params.childDeviceId}`,
+    ttlMillis: revoked ? 60 * 60 * 1000 : Math.min(remaining, 24 * 60 * 60 * 1000),
+  });
+}
 
 exports.processCreatedUnlockRequestPush = onDocumentCreated(
     REQUEST_DOCUMENT_PATH,
@@ -229,6 +327,7 @@ async function sendToLinkedDevices({
   data,
   collapseKey,
   ttlMillis,
+  androidPriority = "high",
 }) {
   const tokenSnapshot = await db.collection(CHILDREN_COLLECTION)
       .doc(childDeviceId)
@@ -261,7 +360,7 @@ async function sendToLinkedDevices({
       tokens: chunk.map((registration) => registration.token),
       data,
       android: {
-        priority: "high",
+        priority: androidPriority,
         ttl: ttlMillis,
         collapseKey,
       },

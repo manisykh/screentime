@@ -13,6 +13,7 @@ import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.MetadataChanges
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.SetOptions
+import com.google.firebase.firestore.Source
 import com.google.firebase.functions.FirebaseFunctions
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.channels.awaitClose
@@ -123,6 +124,61 @@ class FirebaseParentRemoteSyncDataSource(
                         )
                     }
                 }
+            val usageRegistration = if (deviceRole == ParentDeviceRole.Parent) {
+                usageSnapshotsCollection(childDeviceId).document("current")
+                    .addSnapshotListener(MetadataChanges.INCLUDE) { snapshot, error ->
+                        if (error != null) {
+                            // Older deployed rules may not grant this optional read yet.
+                            // Keep request/command listeners alive in that case.
+                        } else if (snapshot != null) {
+                            updateConnected()
+                            trySend(
+                                ParentRemoteChange(
+                                    childDeviceId = childDeviceId,
+                                    type = ParentRemoteChangeType.ChildUsageSnapshot,
+                                    fromCache = snapshot.metadata.isFromCache,
+                                    hasPendingWrites = snapshot.metadata.hasPendingWrites(),
+                                    usageSnapshot = snapshot.toChildUsageSnapshot(childDeviceId),
+                                ),
+                            )
+                        }
+                    }
+            } else {
+                null
+            }
+            val usageRefreshRegistration = usageRefreshDocument(childDeviceId)
+                .addSnapshotListener(MetadataChanges.INCLUDE) { snapshot, error ->
+                    if (error == null && snapshot != null) {
+                        updateConnected()
+                        trySend(
+                            ParentRemoteChange(
+                                childDeviceId = childDeviceId,
+                                type = ParentRemoteChangeType.ChildUsageRefresh,
+                                fromCache = snapshot.metadata.isFromCache,
+                                hasPendingWrites = snapshot.metadata.hasPendingWrites(),
+                                usageRefreshRequest = snapshot.toChildUsageRefreshRequest(childDeviceId),
+                            ),
+                        )
+                    }
+                    // Keep existing listeners alive until the updated optional rules are deployed.
+                }
+            val immediateBlockRegistration = immediateBlockDocument(childDeviceId)
+                .addSnapshotListener(MetadataChanges.INCLUDE) { snapshot, error ->
+                    if (error == null && snapshot != null) {
+                        updateConnected()
+                        trySend(
+                            ParentRemoteChange(
+                                childDeviceId = childDeviceId,
+                                type = ParentRemoteChangeType.ImmediateBlock,
+                                fromCache = snapshot.metadata.isFromCache,
+                                hasPendingWrites = snapshot.metadata.hasPendingWrites(),
+                                immediateBlockState = snapshot.toImmediateBlockState(childDeviceId),
+                                immediateBlockDocumentExists = snapshot.exists(),
+                            ),
+                        )
+                    }
+                    // Older rules may not include this document; keep existing listeners alive.
+                }
             val commandRegistration = if (deviceRole == ParentDeviceRole.Child) {
                 commandsCollection(childDeviceId)
                     .orderBy("timestampMillis", Query.Direction.DESCENDING)
@@ -146,7 +202,9 @@ class FirebaseParentRemoteSyncDataSource(
             } else {
                 null
             }
-            listOfNotNull(childRegistration, requestRegistration, commandRegistration)
+            listOfNotNull(childRegistration, requestRegistration, usageRegistration,
+                usageRefreshRegistration,
+                immediateBlockRegistration, commandRegistration)
         }
 
         awaitClose {
@@ -519,6 +577,188 @@ class FirebaseParentRemoteSyncDataSource(
                 )
                 .awaitResult()
         }
+    }
+
+    override suspend fun publishChildUsageSnapshot(snapshot: ChildUsageSnapshot): ParentRemoteSyncResult {
+        if (snapshot.childDeviceId.isBlank()) {
+            return ParentRemoteSyncResult.Failed("Child usage snapshot is missing device id")
+        }
+        return runRemote("publish child usage snapshot") {
+            usageSnapshotsCollection(snapshot.childDeviceId).document("current")
+                .set(
+                    mapOf(
+                        "childDeviceId" to snapshot.childDeviceId,
+                        "childUid" to currentUid(),
+                        "dateKey" to snapshot.dateKey,
+                        "capturedAtMillis" to snapshot.capturedAtMillis,
+                        "todayUsedMillis" to snapshot.todayUsedMillis,
+                        "dailyCountedUsageMillis" to snapshot.dailyCountedUsageMillis,
+                        "effectiveDailyLimitMinutes" to snapshot.effectiveDailyLimitMinutes,
+                        "dailyUnlockedForToday" to snapshot.dailyUnlockedForToday,
+                        "usageAccessReady" to snapshot.usageAccessReady,
+                        "protectionPaused" to snapshot.protectionPaused,
+                        "appUsageSharingEnabled" to snapshot.appUsageSharingEnabled,
+                        "topApps" to snapshot.topApps.take(5).map { app ->
+                            mapOf(
+                                "appName" to app.appName,
+                                "usedMillis" to app.usedMillis,
+                            )
+                        },
+                    ),
+                )
+                .awaitResult()
+        }
+    }
+
+    override suspend fun fetchChildUsageSnapshot(childDeviceId: String): ChildUsageSnapshot? {
+        if (childDeviceId.isBlank()) return null
+        return try {
+            ensureSignedIn()
+            val document = usageSnapshotsCollection(childDeviceId).document("current")
+                .get()
+                .awaitResult()
+            updateConnected()
+            document.toChildUsageSnapshot(childDeviceId)
+        } catch (error: Throwable) {
+            updateFailed(error)
+            null
+        }
+    }
+
+    override suspend fun requestChildUsageRefresh(
+        childDeviceId: String,
+    ): Result<ChildUsageRefreshRequest> = runCatching {
+        require(childDeviceId.isNotBlank()) { "Child device id is missing" }
+        ensureSignedIn()
+        val ref = usageRefreshDocument(childDeviceId)
+        val request = firestore.runTransaction { transaction ->
+            val now = System.currentTimeMillis()
+            val current = transaction.get(ref).toChildUsageRefreshRequest(childDeviceId)
+            if (current != null && !current.canRequestAgain(now)) {
+                current
+            } else {
+                ChildUsageRefreshRequest(
+                    requestId = java.util.UUID.randomUUID().toString(),
+                    childDeviceId = childDeviceId,
+                    parentUid = currentUid(),
+                    requestedAtMillis = now,
+                    expiresAtMillis = now + 30 * 60_000L,
+                ).also { next ->
+                    transaction.set(ref, next.toRemoteMap())
+                }
+            }
+        }.awaitResult()
+        updateConnected()
+        request
+    }.onFailure(::updateFailed)
+
+    override suspend fun fetchChildUsageRefresh(
+        childDeviceId: String,
+    ): Result<ChildUsageRefreshRequest?> = runCatching {
+        require(childDeviceId.isNotBlank()) { "Child device id is missing" }
+        ensureSignedIn()
+        val request = usageRefreshDocument(childDeviceId).get(Source.SERVER).awaitResult()
+            .toChildUsageRefreshRequest(childDeviceId)
+        updateConnected()
+        request
+    }.onFailure(::updateFailed)
+
+    override suspend fun acknowledgeChildUsageRefresh(
+        childDeviceId: String,
+        requestId: String,
+    ): ParentRemoteSyncResult = runRemote("acknowledge child usage refresh") {
+        val ref = usageRefreshDocument(childDeviceId)
+        firestore.runTransaction { transaction ->
+            val current = transaction.get(ref).toChildUsageRefreshRequest(childDeviceId)
+            if (current?.requestId == requestId && current.isPending(System.currentTimeMillis())) {
+                transaction.update(ref, "completedAtMillis", System.currentTimeMillis())
+            }
+        }.awaitResult()
+    }
+
+    override suspend fun issueImmediateBlock(
+        childDeviceId: String,
+        durationMinutes: Int,
+    ): ParentRemoteSyncResult {
+        if (childDeviceId.isBlank() || durationMinutes !in 1..1440) {
+            return ParentRemoteSyncResult.Failed("Invalid immediate block target or duration")
+        }
+        return runRemote("issue immediate block") {
+            val now = System.currentTimeMillis()
+            immediateBlockDocument(childDeviceId).set(
+                mapOf(
+                    "requestId" to java.util.UUID.randomUUID().toString(),
+                    "childDeviceId" to childDeviceId,
+                    "parentUid" to currentUid(),
+                    "requestedAtMillis" to now,
+                    "expiresAtMillis" to now + durationMinutes * 60_000L,
+                    "revokedAtMillis" to 0L,
+                    "appliedAtMillis" to 0L,
+                    "releasedAtMillis" to 0L,
+                ),
+            ).awaitResult()
+        }
+    }
+
+    override suspend fun revokeImmediateBlock(
+        childDeviceId: String,
+        requestId: String,
+    ): ParentRemoteSyncResult = runRemote("revoke immediate block") {
+        val ref = immediateBlockDocument(childDeviceId)
+        firestore.runTransaction { transaction ->
+            val current = transaction.get(ref)
+            if (current.getString("requestId") != requestId) {
+                throw IllegalStateException("Immediate block changed before revocation")
+            }
+            transaction.update(ref, "revokedAtMillis", System.currentTimeMillis())
+        }.awaitResult()
+    }
+
+    override suspend fun fetchImmediateBlock(childDeviceId: String): Result<ImmediateBlockState?> =
+        runCatching {
+            ensureSignedIn()
+            val snapshot = immediateBlockDocument(childDeviceId).get(Source.SERVER).awaitResult()
+            updateConnected()
+            snapshot.toImmediateBlockState(childDeviceId).also { block ->
+                if (snapshot.exists() && block == null) {
+                    throw IllegalStateException("Invalid immediate block document")
+                }
+            }
+        }.onFailure(::updateFailed)
+
+    override suspend fun acknowledgeImmediateBlock(
+        childDeviceId: String,
+        requestId: String,
+    ): ParentRemoteSyncResult = runRemote("acknowledge immediate block") {
+        val ref = immediateBlockDocument(childDeviceId)
+        firestore.runTransaction { transaction ->
+            val current = transaction.get(ref)
+            if (current.getString("requestId") != requestId ||
+                (current.getLong("revokedAtMillis") ?: 0L) != 0L ||
+                (current.getLong("expiresAtMillis") ?: 0L) <= System.currentTimeMillis()
+            ) {
+                return@runTransaction null
+            }
+            if ((current.getLong("appliedAtMillis") ?: 0L) == 0L) {
+                transaction.update(ref, "appliedAtMillis", System.currentTimeMillis())
+            }
+        }.awaitResult()
+    }
+
+    override suspend fun acknowledgeImmediateBlockRelease(
+        childDeviceId: String,
+        requestId: String,
+    ): ParentRemoteSyncResult = runRemote("acknowledge immediate block release") {
+        val ref = immediateBlockDocument(childDeviceId)
+        firestore.runTransaction { transaction ->
+            val current = transaction.get(ref)
+            if (current.getString("requestId") != requestId ||
+                (current.getLong("revokedAtMillis") ?: 0L) == 0L
+            ) return@runTransaction null
+            if ((current.getLong("releasedAtMillis") ?: 0L) == 0L) {
+                transaction.update(ref, "releasedAtMillis", System.currentTimeMillis())
+            }
+        }.awaitResult()
     }
 
     override suspend fun publishUnlockDecision(
@@ -896,6 +1136,15 @@ class FirebaseParentRemoteSyncDataSource(
             .document(childDeviceId)
             .collection("unlock_requests")
 
+    private fun usageSnapshotsCollection(childDeviceId: String) =
+        childrenCollection().document(childDeviceId).collection("usage_snapshots")
+
+    private fun usageRefreshDocument(childDeviceId: String) =
+        childrenCollection().document(childDeviceId).collection("usage_refresh").document("current")
+
+    private fun immediateBlockDocument(childDeviceId: String) =
+        childrenCollection().document(childDeviceId).collection("immediate_block").document("current")
+
     private fun commandsCollection(childDeviceId: String) =
         firestore.collection("screenrest_children")
             .document(childDeviceId)
@@ -986,6 +1235,97 @@ private fun ParentRemoteUnlockDecision.toRemoteCommand(request: RemoteUnlockRequ
         minutes = commandMinutes,
         status = if (approved) RemoteParentCommandStatus.Applied else RemoteParentCommandStatus.Failed,
         message = message,
+    )
+}
+
+private fun DocumentSnapshot.toChildUsageSnapshot(expectedChildDeviceId: String): ChildUsageSnapshot? {
+    if (!exists() || getString("childDeviceId") != expectedChildDeviceId) return null
+    val dateKey = getString("dateKey") ?: return null
+    val capturedAtMillis = getLong("capturedAtMillis") ?: return null
+    val todayUsedMillis = getLong("todayUsedMillis") ?: return null
+    val dailyCountedUsageMillis = getLong("dailyCountedUsageMillis") ?: return null
+    if (dateKey.length != 10 || capturedAtMillis <= 0L || todayUsedMillis < 0L ||
+        dailyCountedUsageMillis < 0L || dailyCountedUsageMillis > todayUsedMillis
+    ) return null
+    val appUsageSharingEnabled = getBoolean("appUsageSharingEnabled") ?: false
+    return ChildUsageSnapshot(
+        childDeviceId = expectedChildDeviceId,
+        dateKey = dateKey,
+        capturedAtMillis = capturedAtMillis,
+        todayUsedMillis = todayUsedMillis,
+        dailyCountedUsageMillis = dailyCountedUsageMillis,
+        effectiveDailyLimitMinutes = getLong("effectiveDailyLimitMinutes")?.toInt(),
+        dailyUnlockedForToday = getBoolean("dailyUnlockedForToday") ?: false,
+        usageAccessReady = getBoolean("usageAccessReady") ?: false,
+        protectionPaused = getBoolean("protectionPaused") ?: false,
+        appUsageSharingEnabled = appUsageSharingEnabled,
+        topApps = (if (appUsageSharingEnabled) get("topApps") as? List<*> else null)
+            ?.take(5)?.mapNotNull { item ->
+            val app = item as? Map<*, *> ?: return@mapNotNull null
+            val appName = (app["appName"] as? String)?.trim().orEmpty()
+            val usedMillis = (app["usedMillis"] as? Number)?.toLong() ?: 0L
+            if (appName.isBlank() || appName.length > 80 ||
+                usedMillis <= 0L || usedMillis > todayUsedMillis
+            ) null else ChildTopAppUsage(appName, usedMillis)
+        }.orEmpty(),
+    )
+}
+
+private fun ChildUsageRefreshRequest.toRemoteMap(): Map<String, Any> = mapOf(
+    "requestId" to requestId,
+    "childDeviceId" to childDeviceId,
+    "parentUid" to parentUid,
+    "requestedAtMillis" to requestedAtMillis,
+    "expiresAtMillis" to expiresAtMillis,
+    "completedAtMillis" to completedAtMillis,
+)
+
+private fun DocumentSnapshot.toChildUsageRefreshRequest(
+    expectedChildDeviceId: String,
+): ChildUsageRefreshRequest? {
+    if (!exists() || getString("childDeviceId") != expectedChildDeviceId) return null
+    val requestId = getString("requestId") ?: return null
+    val parentUid = getString("parentUid") ?: return null
+    val requestedAtMillis = getLong("requestedAtMillis") ?: return null
+    val expiresAtMillis = getLong("expiresAtMillis") ?: return null
+    val completedAtMillis = getLong("completedAtMillis") ?: return null
+    if (requestId.isBlank() || parentUid.isBlank() || requestedAtMillis <= 0L ||
+        expiresAtMillis <= requestedAtMillis ||
+        expiresAtMillis - requestedAtMillis > 30 * 60_000L ||
+        completedAtMillis < 0L
+    ) return null
+    return ChildUsageRefreshRequest(
+        requestId = requestId,
+        childDeviceId = expectedChildDeviceId,
+        parentUid = parentUid,
+        requestedAtMillis = requestedAtMillis,
+        expiresAtMillis = expiresAtMillis,
+        completedAtMillis = completedAtMillis,
+    )
+}
+
+private fun DocumentSnapshot.toImmediateBlockState(expectedChildDeviceId: String): ImmediateBlockState? {
+    if (!exists() || getString("childDeviceId") != expectedChildDeviceId) return null
+    val requestId = getString("requestId") ?: return null
+    val parentUid = getString("parentUid") ?: return null
+    val requestedAt = getLong("requestedAtMillis") ?: return null
+    val expiresAt = getLong("expiresAtMillis") ?: return null
+    val revokedAt = getLong("revokedAtMillis") ?: return null
+    val appliedAt = getLong("appliedAtMillis") ?: return null
+    val releasedAt = getLong("releasedAtMillis") ?: return null
+    if (requestId.isBlank() || parentUid.isBlank() || requestedAt <= 0L ||
+        expiresAt <= requestedAt || expiresAt - requestedAt > 24L * 60L * 60_000L ||
+        revokedAt < 0L || appliedAt < 0L || releasedAt < 0L
+    ) return null
+    return ImmediateBlockState(
+        requestId = requestId,
+        childDeviceId = expectedChildDeviceId,
+        requestedAtMillis = requestedAt,
+        expiresAtMillis = expiresAt,
+        revokedAtMillis = revokedAt,
+        parentUid = parentUid,
+        appliedAtMillis = appliedAt,
+        releasedAtMillis = releasedAt,
     )
 }
 

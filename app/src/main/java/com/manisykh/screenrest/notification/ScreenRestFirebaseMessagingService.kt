@@ -22,6 +22,7 @@ import com.manisykh.screenrest.data.RemotePushTokenTarget
 import com.manisykh.screenrest.data.SettingsRepository
 import com.manisykh.screenrest.data.settingsDataStore
 import com.manisykh.screenrest.worker.RemoteParentSyncWorker
+import com.manisykh.screenrest.worker.ChildUsageRefreshWorker
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -47,6 +48,10 @@ class ScreenRestFirebaseMessagingService : FirebaseMessagingService() {
         if (type !in SUPPORTED_MESSAGE_TYPES) {
             return
         }
+        if (type == MESSAGE_TYPE_USAGE_REFRESH) {
+            ChildUsageRefreshWorker.scheduleImmediate(applicationContext)
+            return
+        }
         val requestId = message.data[DATA_REQUEST_ID].orEmpty()
         val eventKey = message.data[DATA_EVENT_KEY]
             .orEmpty()
@@ -61,6 +66,7 @@ class ScreenRestFirebaseMessagingService : FirebaseMessagingService() {
     }
 
     override fun onDeletedMessages() {
+        ChildUsageRefreshWorker.scheduleImmediate(applicationContext)
         RemoteParentSyncWorker.scheduleImmediate(
             context = applicationContext,
             eventKey = "deleted-messages",
@@ -73,9 +79,13 @@ class ScreenRestFirebaseMessagingService : FirebaseMessagingService() {
         private const val DATA_EVENT_KEY = "eventKey"
         private const val MESSAGE_TYPE_REQUEST_CREATED = "unlock_request_created"
         private const val MESSAGE_TYPE_REQUEST_RESOLVED = "unlock_request_resolved"
+        private const val MESSAGE_TYPE_IMMEDIATE_BLOCK = "immediate_block_changed"
+        private const val MESSAGE_TYPE_USAGE_REFRESH = "child_usage_refresh_requested"
         private val SUPPORTED_MESSAGE_TYPES = setOf(
             MESSAGE_TYPE_REQUEST_CREATED,
             MESSAGE_TYPE_REQUEST_RESOLVED,
+            MESSAGE_TYPE_IMMEDIATE_BLOCK,
+            MESSAGE_TYPE_USAGE_REFRESH,
         )
     }
 }

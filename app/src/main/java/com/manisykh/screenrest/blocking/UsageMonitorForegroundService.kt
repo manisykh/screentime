@@ -49,6 +49,7 @@ import com.manisykh.screenrest.R
 import com.manisykh.screenrest.data.EventLogType
 import com.manisykh.screenrest.data.AppLanguage
 import com.manisykh.screenrest.data.HardshipLevel
+import com.manisykh.screenrest.data.ImmediateBlockState
 import com.manisykh.screenrest.data.HardshipLifecycleResult
 import com.manisykh.screenrest.data.MAX_TEMPORARY_EXTRA_MINUTES
 import com.manisykh.screenrest.data.HardshipPolicyKey
@@ -351,6 +352,10 @@ class UsageMonitorForegroundService : Service() {
                 repository.syncRemoteUnlockRequest(requestId)
             }
         repository.syncNewRemoteCommands()
+        repository.syncImmediateBlock(
+            canAcknowledge = usageRepository.hasUsageAccess() &&
+                OverlayPermissionChecker.state(this).canAttemptOverlay,
+        )
     }
 
     private suspend fun evaluateCurrentForegroundApp() {
@@ -676,7 +681,14 @@ class UsageMonitorForegroundService : Service() {
         }
         val temporaryUnlockState = repository.temporaryUnlockState.first().forToday()
         val hardshipRuntimeState = repository.hardshipRuntimeState.first().forToday()
-        val canRequestParent = repository.parentManagementState.first().canRequestParentApproval()
+        val parentStateForBlock = repository.parentManagementState.first()
+        val canRequestParent = parentStateForBlock.canRequestParentApproval()
+        val immediateBlockState = repository.immediateBlockState.first().takeIf { order ->
+            parentStateForBlock.paired &&
+                parentStateForBlock.deviceRole == ParentDeviceRole.Child &&
+                order.childDeviceId == parentStateForBlock.childDeviceId &&
+                parentStateForBlock.linkedParentDevices.any { parent -> parent.parentUid == order.parentUid }
+        } ?: ImmediateBlockState()
         val allowOnlyPackages = expandAllowedPackagesWithSharedUid(
             repository.allowOnlyAllowedAppPackages.first(),
         )
@@ -739,6 +751,7 @@ class UsageMonitorForegroundService : Service() {
             scheduleAllowedPackages = scheduleAllowedPackages,
             hardshipBypassedPolicies = hardshipRuntimeState.bypassedPolicies,
             hardshipBypassedPolicyKeys = hardshipRuntimeState.bypassedKeysForPackage(packageName),
+            immediateBlockState = immediateBlockState,
         )
         evaluation.activeHardshipPolicyKeys
             .filter { key -> resolvedSettings.hardshipLevelFor(key) != HardshipLevel.Off }
@@ -772,7 +785,8 @@ class UsageMonitorForegroundService : Service() {
             hardshipPolicyType = evaluation.hardshipPolicyType,
             hardshipPolicyKey = evaluation.hardshipPolicyKey,
             activeHardshipPolicyKeys = evaluation.activeHardshipPolicyKeys,
-            canRequestParent = canRequestParent,
+            canRequestParent = canRequestParent &&
+                evaluation.result.decision != BlockDecision.WouldBlockImmediate,
             hardshipAllowanceEnded = temporaryUnlockState.packageAllowances[packageName]
                 ?.hardshipAllowanceUntilMillis
                 ?.let { untilMillis -> untilMillis > 0L && untilMillis <= System.currentTimeMillis() }
@@ -1618,7 +1632,10 @@ class UsageMonitorForegroundService : Service() {
     private fun createBlockingOverlayView(decision: MonitorDecision): View {
         val isDailyLimitBlock = decision.result.decision == BlockDecision.WouldBlockTotalLimit
         val strings = blockOverlayStrings()
-        val style = decision.result.decision.overlayVisualStyle()
+        val style = BlockScreenVisualModel.forReason(
+            decision.result.decision.toLogReason(),
+            decision.hardshipLevel,
+        )
         val root = FrameLayout(this).apply {
             isClickable = true
             isFocusable = true
@@ -1628,7 +1645,7 @@ class UsageMonitorForegroundService : Service() {
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
                 View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
             background = GradientDrawable().apply {
-                setColor(style.backgroundColor)
+                setColor(style.background)
             }
             setOnApplyWindowInsetsListener { view, windowInsets ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -1664,14 +1681,19 @@ class UsageMonitorForegroundService : Service() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
+        val hero = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(6), dp(20), dp(6), dp(18))
+        }
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setPadding(dp(16), dp(12), dp(16), dp(22))
             background = GradientDrawable().apply {
                 cornerRadius = dp(24).toFloat()
-                setColor(style.cardColor)
-                setStroke(dp(2), style.borderColor)
+                setColor(style.panel)
+                setStroke(dp(1), style.panelBorder)
             }
         }
         root.addView(
@@ -1714,6 +1736,13 @@ class UsageMonitorForegroundService : Service() {
             ),
         )
         scrollContent.addView(
+            hero,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        scrollContent.addView(
             card,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1724,37 +1753,69 @@ class UsageMonitorForegroundService : Service() {
             },
         )
 
-        card.addView(blockOverlayText(strings.titleFor(decision.result.decision), 21, Color.rgb(17, 24, 39), true))
-        if (isDailyLimitBlock) {
-            card.addView(blockOverlayText(strings.dailyTime, 18, Color.rgb(17, 24, 39), true))
-        } else {
+        hero.addView(
+            ImageView(this).apply {
+                setImageResource(R.drawable.ic_block_lock)
+                setColorFilter(style.accent)
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                setPadding(dp(16), dp(16), dp(16), dp(16))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(style.accentSoft)
+                }
+            },
+            LinearLayout.LayoutParams(dp(84), dp(84)).apply { bottomMargin = dp(12) },
+        )
+        hero.addView(
+            blockOverlayText(
+                BlockScreenVisualModel.categoryLabel(
+                    decision.result.decision.toLogReason(),
+                    strings.hardshipLevelPrefix != "Level",
+                ),
+                13,
+                style.accent,
+                true,
+            ).apply {
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(20).toFloat()
+                    setColor(Color.rgb(42, 59, 89))
+                }
+                setPadding(dp(14), dp(6), dp(14), dp(6))
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(8) },
+        )
+        hero.addView(blockOverlayText(strings.titleFor(decision.result.decision), 24, style.onDark, true))
+        if (!isDailyLimitBlock) {
             val iconDrawable = runCatching {
                 packageManager.getApplicationIcon(decision.result.packageName)
             }.getOrNull()
             if (iconDrawable != null) {
-                card.addView(
+                hero.addView(
                     ImageView(this).apply {
                         setImageDrawable(iconDrawable)
                         contentDescription = decision.result.appName
                     },
-                    LinearLayout.LayoutParams(dp(56), dp(56)).apply {
+                    LinearLayout.LayoutParams(dp(48), dp(48)).apply {
                         topMargin = dp(8)
                         bottomMargin = dp(4)
                     },
                 )
             }
-            card.addView(blockOverlayText(decision.result.appName, 18, Color.rgb(17, 24, 39), true))
+            hero.addView(blockOverlayText(decision.result.appName, 17, style.onDark, true))
         }
-        card.addView(
+        hero.addView(
             blockOverlayText(
                 decision.toOverlayUsageText(),
-                14,
-                Color.rgb(107, 114, 128),
-                false,
+                19,
+                style.accent,
+                true,
             ),
         )
         if (decision.hardshipLevel != HardshipLevel.Off) {
-            card.addView(blockOverlayHardshipIndicator(decision.hardshipLevel, strings))
+            hero.addView(blockOverlayHardshipIndicator(decision.hardshipLevel, strings, style.accent))
         }
         val statusText = blockOverlayText(
             if (decision.hardshipLevel == HardshipLevel.Level1 && decision.hardshipAllowanceEnded) {
@@ -1763,11 +1824,21 @@ class UsageMonitorForegroundService : Service() {
                 ""
             },
             13,
-            Color.rgb(229, 91, 74),
+            Color.rgb(190, 56, 56),
             true,
         )
         card.addView(statusText)
-        when (decision.hardshipLevel) {
+        if (decision.result.decision == BlockDecision.WouldBlockImmediate) {
+            card.addView(blockOverlayText(
+                if (strings.addTime == "시간 추가") {
+                    "부모가 설정한 차단이 종료될 때까지 일반 앱을 사용할 수 없습니다. 제한 없는 앱은 계속 사용할 수 있습니다."
+                } else {
+                    "Apps are blocked until the parent's timer ends. Unrestricted apps remain available."
+                },
+                14, style.onPanelMuted, false,
+            ))
+            addStandardSafeRecovery(card, root, statusText, strings)
+        } else when (decision.hardshipLevel) {
             HardshipLevel.Off -> {
                 var requestedExtraMinutes = 5
                 card.addView(
@@ -1826,7 +1897,7 @@ class UsageMonitorForegroundService : Service() {
                 addStandardSafeRecovery(card, root, statusText, strings)
             }
             HardshipLevel.Level1 -> {
-                card.addView(blockOverlayText(strings.hardshipLevel1Description, 15, style.accentColor, true))
+                hero.addView(blockOverlayText(strings.hardshipLevel1Description, 15, style.onDarkMuted, true))
                 lateinit var levelOneButton: Button
                 levelOneButton = blockOverlayButton(
                     text = strings.hardshipReflectionAction,
@@ -1886,7 +1957,7 @@ class UsageMonitorForegroundService : Service() {
                 } else {
                     strings.hardshipLevel2Description
                 }
-                card.addView(blockOverlayText(levelTwoDescription, 15, style.accentColor, true))
+                hero.addView(blockOverlayText(levelTwoDescription, 15, style.onDarkMuted, true))
                 card.addView(
                     blockOverlayButton(
                         text = strings.hardshipLevel2Action,
@@ -1942,7 +2013,7 @@ class UsageMonitorForegroundService : Service() {
                 addStandardSafeRecovery(card, root, statusText, strings)
             }
             HardshipLevel.Level3 -> {
-                card.addView(blockOverlayText(strings.hardshipLevel3Description, 15, style.accentColor, true))
+                hero.addView(blockOverlayText(strings.hardshipLevel3Description, 15, style.onDarkMuted, true))
                 val emergencyPassAvailable = decision.emergencyPassNextAvailableAtMillis <= 0L ||
                     System.currentTimeMillis() >= decision.emergencyPassNextAvailableAtMillis
                 card.addView(
@@ -1957,17 +2028,15 @@ class UsageMonitorForegroundService : Service() {
                             }
                         },
                         14,
-                        if (emergencyPassAvailable) Color.rgb(37, 130, 78) else style.accentColor,
+                        if (emergencyPassAvailable) Color.rgb(25, 118, 75) else Color.rgb(158, 45, 68),
                         true,
                     ),
                 )
-                if (emergencyPassAvailable) {
-                    card.addView(
-                        blockOverlayButton(
-                            text = strings.emergencyPass,
-                            iconRes = R.drawable.ic_block_emergency,
-                            iconColor = Color.rgb(190, 24, 93),
-                        ) {
+                val emergencyPassButton = blockOverlayButton(
+                    text = strings.emergencyPass,
+                    iconRes = R.drawable.ic_block_emergency,
+                    iconColor = Color.rgb(190, 24, 93),
+                ) {
                             serviceScope.launch {
                                 val settings = repository.usagePolicySettings.first()
                                 val expiresAtMillis = decision.activeHardshipPolicyKeys.maxOfOrNull { policyKey ->
@@ -2027,9 +2096,9 @@ class UsageMonitorForegroundService : Service() {
                                     }
                                 }
                             }
-                        },
-                    )
                 }
+                emergencyPassButton.isEnabled = emergencyPassAvailable
+                card.addView(emergencyPassButton)
             }
         }
         card.addView(blockOverlayButton(
@@ -2047,14 +2116,34 @@ class UsageMonitorForegroundService : Service() {
             removeBlockingOverlay()
             openMainActivity()
         })
-        card.addView(blockOverlayButton(
+        scrollContent.addView(blockOverlayButton(
             strings.home,
             iconRes = R.drawable.ic_block_home,
-            iconColor = Color.rgb(71, 85, 105),
+            iconColor = Color.WHITE,
+            onDark = true,
         ) {
             allowHomeExitFromBlockedScreen(decision.result.packageName)
             sendHomeIntent(force = true)
         })
+        scrollContent.addView(
+            blockOverlayText(
+                if (strings.hardshipLevelPrefix == "Level") {
+                    "If blocking malfunctions, use Safe Recovery with the Admin PIN. Level 3 requires Emergency Pass."
+                } else {
+                    "오작동 시 관리 PIN으로 안전 복구할 수 있습니다. 고행 3단계에서는 Emergency Pass가 필요합니다."
+                },
+                12,
+                style.onDarkMuted,
+                false,
+            ),
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(12)
+            },
+        )
         return root
     }
 
@@ -2665,7 +2754,8 @@ class UsageMonitorForegroundService : Service() {
             this == BlockDecision.WouldBlockSchedule ||
             this == BlockDecision.WouldBlockAllowOnly ||
             this == BlockDecision.WouldBlockGroupLimit ||
-            this == BlockDecision.WouldBlockAppLimit
+            this == BlockDecision.WouldBlockAppLimit ||
+            this == BlockDecision.WouldBlockImmediate
     }
 
     private fun BlockDecision.toLogReason(): String {
@@ -2680,6 +2770,7 @@ class UsageMonitorForegroundService : Service() {
             BlockDecision.WouldBlockAllowOnly -> "allow-only mode active"
             BlockDecision.WouldBlockGroupLimit -> "group limit exceeded"
             BlockDecision.WouldBlockAppLimit -> "app limit exceeded"
+            BlockDecision.WouldBlockImmediate -> "parent immediate block active"
         }
     }
 
@@ -2690,6 +2781,7 @@ class UsageMonitorForegroundService : Service() {
             BlockDecision.WouldBlockAllowOnly -> RemoteRequestBlockReason.AllowOnlyMode
             BlockDecision.WouldBlockGroupLimit -> RemoteRequestBlockReason.AppGroupLimit
             BlockDecision.WouldBlockAppLimit,
+            BlockDecision.WouldBlockImmediate,
             BlockDecision.AllowedSafeMode,
             BlockDecision.AllowedPolicyDisabled,
             BlockDecision.AllowedWhitelist,
@@ -2705,6 +2797,7 @@ class UsageMonitorForegroundService : Service() {
             BlockDecision.WouldBlockTotalLimit -> "DAILY_LIMIT"
             BlockDecision.WouldBlockSchedule -> "SCHEDULE"
             BlockDecision.WouldBlockAllowOnly -> "ALLOW_ONLY"
+            BlockDecision.WouldBlockImmediate -> "PARENT_IMMEDIATE"
             BlockDecision.AllowedSafeMode -> "SAFE_MODE"
             BlockDecision.AllowedPolicyDisabled -> "POLICY_OFF"
             BlockDecision.AllowedWhitelist -> "WHITELIST"
@@ -2720,51 +2813,12 @@ class UsageMonitorForegroundService : Service() {
             BlockDecision.WouldBlockTotalLimit -> "?쇱씪 ?쒗븳 珥덇낵"
             BlockDecision.WouldBlockSchedule -> "?ㅼ?以?李⑤떒"
             BlockDecision.WouldBlockAllowOnly -> "?덉슜??紐⑤뱶 李⑤떒"
+            BlockDecision.WouldBlockImmediate -> "부모가 지금 차단 중"
             BlockDecision.AllowedSafeMode -> "?덉쟾 紐⑤뱶"
             BlockDecision.AllowedPolicyDisabled -> "?뺤콉 鍮꾪솢?깊솕"
             BlockDecision.AllowedWhitelist -> "?꾩닔 ?덉쇅"
             BlockDecision.AllowedNoLimit -> "?쒗븳 ?놁쓬"
             BlockDecision.AllowedUnderLimit -> "?쒗븳 誘몃쭔"
-        }
-    }
-
-    private fun BlockDecision.overlayVisualStyle(): BlockOverlayVisualStyle {
-        return when (this) {
-            BlockDecision.WouldBlockTotalLimit -> BlockOverlayVisualStyle(
-                backgroundColor = Color.rgb(58, 17, 20),
-                cardColor = Color.rgb(255, 230, 226),
-                accentColor = Color.rgb(226, 58, 46),
-                borderColor = Color.rgb(153, 27, 27),
-            )
-            BlockDecision.WouldBlockGroupLimit -> BlockOverlayVisualStyle(
-                backgroundColor = Color.rgb(42, 26, 5),
-                cardColor = Color.rgb(255, 244, 216),
-                accentColor = Color.rgb(245, 158, 11),
-                borderColor = Color.rgb(180, 83, 9),
-            )
-            BlockDecision.WouldBlockSchedule -> BlockOverlayVisualStyle(
-                backgroundColor = Color.rgb(30, 18, 53),
-                cardColor = Color.rgb(240, 231, 255),
-                accentColor = Color.rgb(124, 58, 237),
-                borderColor = Color.rgb(91, 33, 182),
-            )
-            BlockDecision.WouldBlockAllowOnly -> BlockOverlayVisualStyle(
-                backgroundColor = Color.rgb(5, 46, 43),
-                cardColor = Color.rgb(225, 251, 244),
-                accentColor = Color.rgb(15, 118, 110),
-                borderColor = Color.rgb(15, 118, 110),
-            )
-            BlockDecision.WouldBlockAppLimit,
-            BlockDecision.AllowedSafeMode,
-            BlockDecision.AllowedPolicyDisabled,
-            BlockDecision.AllowedWhitelist,
-            BlockDecision.AllowedNoLimit,
-            BlockDecision.AllowedUnderLimit -> BlockOverlayVisualStyle(
-                backgroundColor = Color.rgb(17, 24, 39),
-                cardColor = Color.rgb(234, 241, 255),
-                accentColor = Color.rgb(29, 78, 216),
-                borderColor = Color.rgb(30, 58, 138),
-            )
         }
     }
 
@@ -2904,6 +2958,7 @@ class UsageMonitorForegroundService : Service() {
             BlockDecision.WouldBlockTotalLimit -> dailyTitle
             BlockDecision.WouldBlockSchedule -> scheduleTitle
             BlockDecision.WouldBlockAllowOnly -> allowOnlyTitle
+            BlockDecision.WouldBlockImmediate -> if (addTime == "시간 추가") "부모가 지금 차단 중" else "Blocked by parent"
             BlockDecision.WouldBlockGroupLimit -> groupTitle
             BlockDecision.WouldBlockAppLimit -> appTitle
             else -> fallbackTitle
@@ -2942,13 +2997,9 @@ class UsageMonitorForegroundService : Service() {
     private fun blockOverlayHardshipIndicator(
         level: HardshipLevel,
         strings: BlockOverlayStrings,
+        accentColor: Int,
     ): View {
-        val color = when (level) {
-            HardshipLevel.Off -> Color.rgb(107, 114, 128)
-            HardshipLevel.Level1 -> Color.rgb(176, 122, 22)
-            HardshipLevel.Level2 -> Color.rgb(226, 104, 34)
-            HardshipLevel.Level3 -> Color.rgb(142, 39, 69)
-        }
+        val color = accentColor
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -3089,6 +3140,7 @@ class UsageMonitorForegroundService : Service() {
         outline: Boolean = false,
         iconRes: Int? = null,
         iconColor: Int = Color.rgb(37, 99, 235),
+        onDark: Boolean = false,
         onClick: () -> Unit,
     ): Button {
         return Button(this).apply {
@@ -3096,13 +3148,23 @@ class UsageMonitorForegroundService : Service() {
             textSize = 14.5f
             isAllCaps = false
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(if (primary || outline) Color.rgb(37, 99, 235) else Color.rgb(17, 24, 39))
+            setTextColor(if (onDark) Color.WHITE else Color.rgb(20, 35, 61))
             background = GradientDrawable().apply {
                 cornerRadius = dp(14).toFloat()
-                setColor(if (primary) Color.rgb(37, 99, 235) else Color.rgb(229, 231, 235))
-                if (outline) {
+                setColor(
+                    when {
+                        onDark -> Color.TRANSPARENT
+                        primary -> Color.rgb(37, 99, 235)
+                        else -> Color.WHITE
+                    },
+                )
+                if (onDark) {
+                    setStroke(dp(1), Color.rgb(119, 139, 174))
+                } else if (outline) {
                     setColor(Color.TRANSPARENT)
-                    setStroke(dp(1), Color.rgb(107, 114, 128))
+                    setStroke(dp(1), Color.rgb(65, 106, 182))
+                } else if (!primary) {
+                    setStroke(dp(1), Color.rgb(209, 218, 231))
                 }
             }
             if (primary) {
@@ -3538,13 +3600,6 @@ class UsageMonitorForegroundService : Service() {
     private data class OverlayModal(
         val content: LinearLayout,
         val dismiss: () -> Unit,
-    )
-
-    private data class BlockOverlayVisualStyle(
-        val backgroundColor: Int,
-        val cardColor: Int,
-        val accentColor: Int,
-        val borderColor: Int,
     )
 
     private data class BlockOverlayStrings(

@@ -124,15 +124,11 @@ class BlockedActivity : ComponentActivity() {
         val hardshipPolicyType = hardshipPolicyKey?.policyType ?: reason.toHardshipPolicyType()
         previewOnlyActivity = previewOnly
 
-        if (previewOnly) {
-            enableEdgeToEdge()
-        } else {
-            val blockedSystemBarStyle = SystemBarStyle.dark(BLOCK_SCREEN_BACKGROUND_ARGB)
-            enableEdgeToEdge(
-                statusBarStyle = blockedSystemBarStyle,
-                navigationBarStyle = blockedSystemBarStyle,
-            )
-        }
+        val blockedSystemBarStyle = SystemBarStyle.dark(BLOCK_SCREEN_BACKGROUND_ARGB)
+        enableEdgeToEdge(
+            statusBarStyle = blockedSystemBarStyle,
+            navigationBarStyle = blockedSystemBarStyle,
+        )
         window.isNavigationBarContrastEnforced = false
 
         onBackPressedDispatcher.addCallback(
@@ -181,7 +177,8 @@ class BlockedActivity : ComponentActivity() {
                     previewOnly = previewOnly,
                     hardshipLevel = hardshipLevel,
                     hardshipPolicyType = hardshipPolicyType,
-                    canRequestParent = parentState.canRequestParentApproval(),
+                    canRequestParent = parentState.canRequestParentApproval() &&
+                        reason != "parent immediate block active",
                     hardshipAllowanceEnded = hardshipAllowanceEnded,
                     levelOneReflectionReadyAtMillis = hardshipPolicyKey?.let { policyKey ->
                         hardshipRuntimeState.forToday()
@@ -362,7 +359,7 @@ class BlockedActivity : ComponentActivity() {
     }
 
     companion object {
-        private val BLOCK_SCREEN_BACKGROUND_ARGB = 0xFF102552.toInt()
+        private val BLOCK_SCREEN_BACKGROUND_ARGB = 0xFF101E36.toInt()
         private const val EXTRA_APP_NAME = "extra_app_name"
         private const val EXTRA_PACKAGE_NAME = "extra_package_name"
         private const val EXTRA_REASON = "extra_reason"
@@ -504,41 +501,51 @@ private fun BlockedScreen(
     }
     val emergencyPassAvailable = emergencyPassNextAvailableAtMillis <= 0L ||
         System.currentTimeMillis() >= emergencyPassNextAvailableAtMillis
-    val blockStyle = blockScreenStyle(reason = reason, previewOnly = previewOnly, showAppDetails = showAppDetails)
+    val visual = BlockScreenVisualModel.forReason(reason, hardshipLevel)
     val localizedReason = text.blockReason(reason)
     val blockedTitle = if (showAppDetails) text.blockTitle(reason) else text.dailyTitle
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(blockStyle.backgroundColor)
+            .background(Color(visual.background))
             .safeDrawingPadding()
-            .padding(24.dp),
+            .padding(horizontal = 18.dp, vertical = 12.dp),
         contentAlignment = Alignment.Center,
     ) {
         Card(
             modifier = Modifier
                 .fillMaxWidth()
                 .widthIn(max = 480.dp),
-            shape = RoundedCornerShape(20.dp),
-            colors = CardDefaults.cardColors(containerColor = blockStyle.cardColor),
-            border = BorderStroke(1.dp, blockStyle.borderColor),
-            elevation = CardDefaults.cardElevation(defaultElevation = if (previewOnly) 0.dp else 3.dp),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
         ) {
             Column(
                 modifier = Modifier
-                    .padding(20.dp)
+                    .padding(vertical = 10.dp)
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Surface(
                     shape = CircleShape,
-                    color = blockStyle.accentColor,
+                    color = Color(visual.accentSoft),
                 ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_block_lock),
+                        contentDescription = null,
+                        modifier = Modifier.padding(22.dp).size(42.dp),
+                        tint = Color(visual.accent),
+                    )
+                }
+                Surface(shape = CircleShape, color = Color(0xFF2A3B59)) {
                     Text(
-                        text = if (previewOnly) text.preview else text.blocked,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        text = if (previewOnly) text.preview else BlockScreenVisualModel.categoryLabel(
+                            reason,
+                            language == AppLanguage.Korean,
+                        ),
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                         color = Color.White,
@@ -549,72 +556,93 @@ private fun BlockedScreen(
                     text = blockedTitle,
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
-                    color = Color(0xFF172033),
+                    color = Color(visual.onDark),
                     textAlign = TextAlign.Center,
                 )
                 if (showAppDetails) {
                     AppIcon(
                         packageName = packageName,
                         contentDescription = appName,
-                        size = 64.dp,
+                        size = 48.dp,
                     )
                     Text(
                         text = appName,
-                        style = MaterialTheme.typography.titleLarge,
+                        style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF172033),
+                        color = Color(visual.onDark),
                         textAlign = TextAlign.Center,
                     )
                     Text(
-                        text = text.usedReason(usedMinutes, limitMinutes, localizedReason),
+                        text = if (reason == "parent immediate block active") {
+                            if (language == AppLanguage.Korean) "부모가 설정한 차단이 종료될 때까지 사용할 수 없습니다."
+                            else "Blocked until the parent's timer ends."
+                        } else text.usedReason(usedMinutes, limitMinutes, localizedReason),
                         style = MaterialTheme.typography.titleMedium,
-                        color = Color(0xFF6D7485),
+                        color = Color(visual.onDarkMuted),
                         textAlign = TextAlign.Center,
                     )
                 } else {
                     Text(
                         text = text.dailyReason(usedMinutes, limitMinutes),
                         style = MaterialTheme.typography.titleMedium,
-                        color = Color(0xFF6D7485),
+                        color = Color(visual.onDarkMuted),
                         textAlign = TextAlign.Center,
                     )
                 }
-                Text(
-                    text = text.remaining,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = blockStyle.accentColor,
-                    fontWeight = FontWeight.Bold,
-                )
+                if (reason != "parent immediate block active") {
+                    Text(
+                        text = text.remaining,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Color(visual.accent),
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
 
                 if (hardshipLevel == HardshipLevel.Level1 && hardshipAllowanceEnded) {
                     Surface(
                         shape = RoundedCornerShape(14.dp),
-                        color = AppOver.copy(alpha = 0.10f),
-                        border = BorderStroke(1.dp, AppOver.copy(alpha = 0.32f)),
+                        color = Color(visual.accentSoft),
+                        border = BorderStroke(1.dp, Color(visual.accent)),
                     ) {
                         Text(
                             text = text.hardshipAllowanceExpired,
                             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                             style = MaterialTheme.typography.bodyLarge,
                             fontWeight = FontWeight.SemiBold,
-                            color = AppOver,
+                            color = Color(visual.onDark),
                             textAlign = TextAlign.Center,
                         )
                     }
                 }
 
                 if (hardshipLevel != HardshipLevel.Off) {
-                    BlockedHardshipIndicator(level = hardshipLevel, text = text)
+                    BlockedHardshipIndicator(
+                        level = hardshipLevel,
+                        text = text,
+                        accentColor = Color(visual.accent),
+                    )
                     Text(
                         text = text.hardshipDescription(hardshipLevel, canRequestParent),
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.SemiBold,
-                        color = hardshipColor(hardshipLevel),
+                        color = Color(visual.onDarkMuted),
                         textAlign = TextAlign.Center,
                     )
                 }
 
-                if (!previewOnly && hardshipLevel == HardshipLevel.Off) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(22.dp),
+                    color = Color(visual.panel),
+                    border = BorderStroke(1.dp, Color(visual.panelBorder)),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+
+                if (!previewOnly && hardshipLevel == HardshipLevel.Off &&
+                    reason != "parent immediate block active") {
                     Column(
                         modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -781,7 +809,8 @@ private fun BlockedScreen(
                             BlockedPinAction.SafeRecovery
                         }
                     },
-                    enabled = hardshipLevel != HardshipLevel.Level3 || emergencyPassAvailable,
+                    enabled = !previewOnly &&
+                        (hardshipLevel != HardshipLevel.Level3 || emergencyPassAvailable),
                     modifier = Modifier.fillMaxWidth().height(58.dp),
                     shape = RoundedCornerShape(16.dp),
                     colors = androidx.compose.material3.ButtonDefaults.buttonColors(
@@ -816,18 +845,22 @@ private fun BlockedScreen(
                     }
                 }
 
+                    }
+                }
+
                 OutlinedButton(
                     onClick = onClosePreview,
                     modifier = Modifier.fillMaxWidth().height(58.dp),
                     shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, Color(0xFF778BAE)),
                     colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
-                        contentColor = Color(0xFF475569),
+                        contentColor = Color.White,
                     ),
                 ) {
                     BlockedActionLabel(
                         R.drawable.ic_block_home,
                         if (previewOnly) text.close else text.back,
-                        Color(0xFF475569),
+                        Color.White,
                     )
                 }
 
@@ -835,7 +868,7 @@ private fun BlockedScreen(
                 Text(
                     text = text.safetyNote,
                     style = MaterialTheme.typography.labelLarge,
-                    color = AppSafe,
+                    color = Color(visual.onDarkMuted),
                     textAlign = TextAlign.Center,
                 )
             }
@@ -1123,16 +1156,13 @@ private fun formatEmergencyPassTime(timestampMillis: Long): String {
     return SimpleDateFormat("M/d HH:mm", Locale.getDefault()).format(Date(timestampMillis))
 }
 
-private data class BlockScreenStyle(
-    val backgroundColor: Color,
-    val cardColor: Color,
-    val accentColor: Color,
-    val borderColor: Color,
-)
-
 @Composable
-private fun BlockedHardshipIndicator(level: HardshipLevel, text: BlockedScreenStrings) {
-    val levelColor = hardshipColor(level)
+private fun BlockedHardshipIndicator(
+    level: HardshipLevel,
+    text: BlockedScreenStrings,
+    accentColor: Color,
+) {
+    val levelColor = accentColor
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1159,69 +1189,6 @@ private fun hardshipColor(level: HardshipLevel): Color {
         HardshipLevel.Level1 -> Color(0xFFB07A16)
         HardshipLevel.Level2 -> Color(0xFFE26822)
         HardshipLevel.Level3 -> Color(0xFF8E2745)
-    }
-}
-
-@Composable
-private fun blockScreenStyle(
-    reason: String,
-    previewOnly: Boolean,
-    showAppDetails: Boolean,
-): BlockScreenStyle {
-    if (previewOnly) {
-        return BlockScreenStyle(
-            backgroundColor = MaterialTheme.colorScheme.background,
-            cardColor = MaterialTheme.colorScheme.surface,
-            accentColor = MaterialTheme.colorScheme.primary,
-            borderColor = MaterialTheme.colorScheme.outlineVariant,
-        )
-    }
-    return when (reason) {
-        "total limit exceeded" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF102552),
-            cardColor = Color(0xFFFFF8F6),
-            accentColor = Color(0xFFC85C58),
-            borderColor = Color(0xFFEECBC8),
-        )
-        "group limit exceeded" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF102552),
-            cardColor = Color(0xFFFFFAF0),
-            accentColor = Color(0xFFB98226),
-            borderColor = Color(0xFFE9D7A4),
-        )
-        "schedule block active" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF102552),
-            cardColor = Color(0xFFF7F9FE),
-            accentColor = Color(0xFF3657D8),
-            borderColor = Color(0xFFD9E0F4),
-        )
-        "allow-only mode active" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF102552),
-            cardColor = Color(0xFFF4FBF9),
-            accentColor = Color(0xFF3C9F8F),
-            borderColor = Color(0xFFCDEAE4),
-        )
-        "app limit exceeded" -> BlockScreenStyle(
-            backgroundColor = Color(0xFF102552),
-            cardColor = Color(0xFFF7F9FE),
-            accentColor = Color(0xFF3657D8),
-            borderColor = Color(0xFFD9E0F4),
-        )
-        else -> if (showAppDetails) {
-            BlockScreenStyle(
-                backgroundColor = Color(0xFF102552),
-                cardColor = Color(0xFFF7F9FE),
-                accentColor = Color(0xFF3657D8),
-                borderColor = Color(0xFFD9E0F4),
-            )
-        } else {
-            BlockScreenStyle(
-                backgroundColor = Color(0xFF102552),
-                cardColor = Color(0xFFFFF8F6),
-                accentColor = Color(0xFFC85C58),
-                borderColor = Color(0xFFEECBC8),
-            )
-        }
     }
 }
 
@@ -1325,6 +1292,7 @@ private fun blockedScreenStrings(language: AppLanguage): BlockedScreenStrings {
                     "allow-only mode active" -> "\uD5C8\uC6A9\uB41C \uC571\uC774 \uC544\uB2D9\uB2C8\uB2E4"
                     "group limit exceeded" -> "\uADF8\uB8F9 \uC0AC\uC6A9 \uC2DC\uAC04\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4"
                     "app limit exceeded" -> "\uC774 \uC571\uC758 \uC0AC\uC6A9 \uC2DC\uAC04\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4"
+                    "parent immediate block active" -> "부모가 지금 차단 중입니다"
                     else -> "\uC774 \uC571\uC740 \uD604\uC7AC \uCC28\uB2E8\uB418\uC5C8\uC2B5\uB2C8\uB2E4"
                 }
             },
@@ -1335,6 +1303,7 @@ private fun blockedScreenStrings(language: AppLanguage): BlockedScreenStrings {
                     "allow-only mode active" -> "\uD5C8\uC6A9\uB41C \uC571\uB9CC \uC0AC\uC6A9 \uAC00\uB2A5"
                     "group limit exceeded" -> "\uADF8\uB8F9 \uC81C\uD55C \uCD08\uACFC"
                     "app limit exceeded" -> "\uC571 \uC81C\uD55C \uCD08\uACFC"
+                    "parent immediate block active" -> "부모 즉시 차단"
                     else -> reason
                 }
             },
@@ -1395,6 +1364,7 @@ private fun blockedScreenStrings(language: AppLanguage): BlockedScreenStrings {
                     "allow-only mode active" -> "This app is not allowed now"
                     "group limit exceeded" -> "Group time is over"
                     "app limit exceeded" -> "This app's time is over"
+                    "parent immediate block active" -> "Blocked by parent"
                     else -> "This app is blocked"
                 }
             },
@@ -1405,6 +1375,7 @@ private fun blockedScreenStrings(language: AppLanguage): BlockedScreenStrings {
                     "allow-only mode active" -> "allow-only mode"
                     "group limit exceeded" -> "group limit exceeded"
                     "app limit exceeded" -> "app limit exceeded"
+                    "parent immediate block active" -> "parent block"
                     else -> reason
                 }
             },

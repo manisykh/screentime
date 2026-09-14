@@ -27,17 +27,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
@@ -67,6 +64,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -84,6 +82,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -112,6 +111,9 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.CornerRadius
@@ -159,6 +161,12 @@ import com.manisykh.screenrest.data.HardshipPolicyKey
 import com.manisykh.screenrest.data.HardshipPolicyType
 import com.manisykh.screenrest.data.HardshipRuntimeState
 import com.manisykh.screenrest.data.ParentManagementState
+import com.manisykh.screenrest.data.ChildUsageSnapshot
+import com.manisykh.screenrest.data.ChildUsageRefreshRequest
+import com.manisykh.screenrest.data.ImmediateBlockState
+import com.manisykh.screenrest.data.ImmediateBlockReadState
+import com.manisykh.screenrest.data.ImmediateBlockAvailability
+import com.manisykh.screenrest.data.immediateBlockAvailability
 import com.manisykh.screenrest.data.ParentAccountAuthState
 import com.manisykh.screenrest.data.ParentDeviceRole
 import com.manisykh.screenrest.data.ParentNotificationState
@@ -167,6 +175,7 @@ import com.manisykh.screenrest.data.LinkedParentDevice
 import com.manisykh.screenrest.data.RemoteRequestBlockReason
 import com.manisykh.screenrest.data.RemoteUnlockRequest
 import com.manisykh.screenrest.data.RemoteUnlockRequestStatus
+import com.manisykh.screenrest.data.groupRemoteRequestsForDisplay
 import com.manisykh.screenrest.data.ScheduleTemplatePolicy
 import com.manisykh.screenrest.data.SystemHealthStatus
 import com.manisykh.screenrest.data.TemporaryUnlockState
@@ -227,7 +236,17 @@ import com.manisykh.screenrest.ui.safety.buildTemporaryAllowedAppSummaries
 import com.manisykh.screenrest.ui.safety.appLimitMap
 import com.manisykh.screenrest.ui.safety.dailyLimitMinutesByDayOrNull
 import com.manisykh.screenrest.ui.safety.toAppLimitRules
-import com.manisykh.screenrest.ui.theme.ScreenTimeManagerTheme
+import com.manisykh.screenrest.ui.designsystem.ScreenRestCard
+import com.manisykh.screenrest.ui.designsystem.ScreenRestDesignTheme
+import com.manisykh.screenrest.ui.designsystem.ScreenRestIconContainer
+import com.manisykh.screenrest.ui.designsystem.ScreenRestListRow
+import com.manisykh.screenrest.ui.designsystem.ScreenRestPalette
+import com.manisykh.screenrest.ui.designsystem.ScreenRestPageHeader
+import com.manisykh.screenrest.ui.designsystem.ScreenRestPrimaryButton
+import com.manisykh.screenrest.ui.designsystem.ScreenRestSectionHeader
+import com.manisykh.screenrest.ui.designsystem.ScreenRestStatusPill
+import com.manisykh.screenrest.ui.designsystem.ScreenRestTheme
+import com.manisykh.screenrest.ui.designsystem.ScreenRestTone
 import com.manisykh.screenrest.ui.theme.AppOver
 import com.manisykh.screenrest.ui.theme.AppSafe
 import com.manisykh.screenrest.ui.theme.AppWarn
@@ -269,7 +288,7 @@ class MainActivity : ComponentActivity() {
         UsageNotificationHelper(this).ensureParentRequestChannel()
         enableEdgeToEdge()
         setContent {
-            ScreenTimeManagerTheme {
+            ScreenRestDesignTheme {
                 val uiState by safeModeViewModel.uiState.collectAsStateWithLifecycle()
                 if (!uiState.monitoringDisclosureLoaded) {
                     Surface(
@@ -372,6 +391,10 @@ class MainActivity : ComponentActivity() {
                             onUnlinkLinkedChildDevice = safeModeViewModel::unlinkLinkedChildDevice,
                             onUnlinkLinkedParentDevice = safeModeViewModel::unlinkLinkedParentDevice,
                             onSyncParentDevice = safeModeViewModel::syncParentDevice,
+                            onCheckImmediateBlock = safeModeViewModel::checkImmediateBlock,
+                            onChildTopAppsSharingChanged = safeModeViewModel::setChildTopAppsSharingEnabled,
+                            onStartImmediateBlock = safeModeViewModel::startImmediateBlock,
+                            onStopImmediateBlock = safeModeViewModel::stopImmediateBlock,
                             onClearRemoteParentCommands = safeModeViewModel::clearRemoteParentCommands,
                             onRemoteAppExtraTime = safeModeViewModel::applyRemoteAppExtraTime,
                             onRemoteAppUnlockToday = safeModeViewModel::applyRemoteAppUnlockToday,
@@ -614,9 +637,9 @@ private fun MonitoringDisclosureScreen(
                     MonitoringDisclosureItem(
                         title = if (korean) "연결된 부모에게 전송" else "Shared with a linked parent",
                         body = if (korean) {
-                            "자녀 기기를 연결한 경우 차단 대상, 사용·제한 시간, 승인 요청과 처리 상태, 기기 연결 식별자 및 알림 토큰을 Firebase를 통해 연결된 부모에게만 전송합니다."
+                            "자녀 기기를 연결하면 차단 대상, 전체 사용·제한 시간, 승인 요청과 처리 상태, 기기 연결 식별자 및 알림 토큰을 Firebase를 통해 연결된 부모에게 전송합니다. 앱별 공유에 별도 동의하면 오늘 많이 사용한 앱 최대 5개의 이름과 사용 시간도 전송합니다."
                         } else {
-                            "When a child device is linked, blocked targets, used and limited time, approval request status, a device-link identifier, and notification token are sent through Firebase only to the linked parent."
+                            "When a child device is linked, blocked targets, total used and limited time, approval requests and decisions, a device-link identifier, and notification token are sent through Firebase to linked parents. With separate app-usage sharing consent, names and durations of up to five most-used apps are also sent."
                         },
                     )
                     MonitoringDisclosureItem(
@@ -798,12 +821,41 @@ private fun InitialPinSetupScreen(
 }
 
 private enum class ScreenTab {
-    Overview,
+    Today,
+    Rules,
+    Stats,
+    Family,
+    More,
     Time,
     Blocking,
-    Stats,
     Safety,
     Settings,
+}
+
+private enum class ScreenLayoutMode {
+    Modern,
+    Classic,
+}
+
+private const val SCREEN_LAYOUT_PREFS = "screen_layout"
+private const val SCREEN_LAYOUT_MODE_KEY = "mode"
+
+private enum class MoreDestination {
+    Home,
+    ProtectionStatus,
+    AdminPin,
+    EmergencyPass,
+    Permissions,
+    Notifications,
+    Language,
+    GoogleAccount,
+    Help,
+    Diagnostics,
+}
+
+private enum class FamilyDestination {
+    Home,
+    Management,
 }
 
 private enum class SafetyPinAction {
@@ -812,7 +864,15 @@ private enum class SafetyPinAction {
 }
 
 private val PrimaryScreenTabs = listOf(
-    ScreenTab.Overview,
+    ScreenTab.Today,
+    ScreenTab.Rules,
+    ScreenTab.Stats,
+    ScreenTab.Family,
+    ScreenTab.More,
+)
+
+private val ClassicScreenTabs = listOf(
+    ScreenTab.Today,
     ScreenTab.Time,
     ScreenTab.Blocking,
     ScreenTab.Stats,
@@ -820,14 +880,9 @@ private val PrimaryScreenTabs = listOf(
     ScreenTab.Settings,
 )
 
-private fun ScreenTab.next(): ScreenTab {
-    val index = PrimaryScreenTabs.indexOf(this).takeIf { tabIndex -> tabIndex >= 0 } ?: 0
-    return PrimaryScreenTabs[(index + 1).coerceAtMost(PrimaryScreenTabs.lastIndex)]
-}
-
-private fun ScreenTab.previous(): ScreenTab {
-    val index = PrimaryScreenTabs.indexOf(this).takeIf { tabIndex -> tabIndex >= 0 } ?: PrimaryScreenTabs.lastIndex
-    return PrimaryScreenTabs[(index - 1).coerceAtLeast(0)]
+private fun ScreenLayoutMode.tabs(): List<ScreenTab> = when (this) {
+    ScreenLayoutMode.Modern -> PrimaryScreenTabs
+    ScreenLayoutMode.Classic -> ClassicScreenTabs
 }
 
 @Composable
@@ -871,6 +926,10 @@ fun ScreenTimeManagerScreen(
     onUnlinkLinkedChildDevice: (String, String) -> Unit,
     onUnlinkLinkedParentDevice: (String, String) -> Unit,
     onSyncParentDevice: () -> Unit,
+    onCheckImmediateBlock: (String) -> Unit,
+    onChildTopAppsSharingChanged: (Boolean) -> Unit,
+    onStartImmediateBlock: (String, Int, String) -> Unit,
+    onStopImmediateBlock: (String, String, String) -> Unit,
     onClearRemoteParentCommands: (String) -> Unit,
     onRemoteAppExtraTime: (String, String, Int) -> Unit,
     onRemoteAppUnlockToday: (String, String) -> Unit,
@@ -893,7 +952,9 @@ fun ScreenTimeManagerScreen(
     openParentRequestsSignal: Int = 0,
     modifier: Modifier = Modifier,
 ) {
-    var selectedTab by remember { mutableStateOf(ScreenTab.Overview) }
+    var selectedTab by remember { mutableStateOf(ScreenTab.Today) }
+    var moreDestination by rememberSaveable { mutableStateOf(MoreDestination.Home) }
+    var familyDestination by rememberSaveable { mutableStateOf(FamilyDestination.Home) }
     var previousTab by remember { mutableStateOf<ScreenTab?>(null) }
     var tabTransitionDirection by remember { mutableStateOf(1) }
     var safeRecoveryAdminPin by remember { mutableStateOf("") }
@@ -905,6 +966,19 @@ fun ScreenTimeManagerScreen(
     var showInitialPermissionSetupDialog by remember { mutableStateOf(false) }
     val text = appStrings(uiState.appLanguage)
     val context = LocalContext.current
+    val layoutPrefs = remember(context) {
+        context.getSharedPreferences(SCREEN_LAYOUT_PREFS, android.content.Context.MODE_PRIVATE)
+    }
+    var layoutMode by rememberSaveable {
+        mutableStateOf(
+            runCatching {
+                ScreenLayoutMode.valueOf(
+                    layoutPrefs.getString(SCREEN_LAYOUT_MODE_KEY, ScreenLayoutMode.Modern.name)
+                        ?: ScreenLayoutMode.Modern.name,
+                )
+            }.getOrDefault(ScreenLayoutMode.Modern),
+        )
+    }
     val permissionSetupRequired = !uiState.hasUsageAccess ||
         !uiState.blockingReadiness.overlayPermissionReady ||
         !uiState.blockingReadiness.notificationPermissionReady
@@ -993,6 +1067,12 @@ fun ScreenTimeManagerScreen(
         if (selectedTab == ScreenTab.Stats) {
             onRefreshStatistics()
         }
+        if (selectedTab != ScreenTab.More) {
+            moreDestination = MoreDestination.Home
+        }
+        if (selectedTab != ScreenTab.Family) {
+            familyDestination = FamilyDestination.Home
+        }
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -1011,17 +1091,47 @@ fun ScreenTimeManagerScreen(
     }
 
     fun selectTab(nextTab: ScreenTab) {
+        if (nextTab !in layoutMode.tabs()) return
         if (nextTab == selectedTab) {
+            if (nextTab == ScreenTab.More) {
+                moreDestination = MoreDestination.Home
+            }
+            if (nextTab == ScreenTab.Family) {
+                familyDestination = FamilyDestination.Home
+            }
             return
         }
         previousTab = selectedTab
-        tabTransitionDirection = if (nextTab.ordinal > selectedTab.ordinal) 1 else -1
+        tabTransitionDirection = if (
+            layoutMode.tabs().indexOf(nextTab) > layoutMode.tabs().indexOf(selectedTab)
+        ) 1 else -1
         selectedTab = nextTab
+    }
+
+    fun changeLayoutMode(nextMode: ScreenLayoutMode) {
+        if (nextMode == layoutMode) return
+        layoutPrefs.edit().putString(SCREEN_LAYOUT_MODE_KEY, nextMode.name).apply()
+        layoutMode = nextMode
+        selectedTab = ScreenTab.Today
+        previousTab = null
+        moreDestination = MoreDestination.Home
+        familyDestination = FamilyDestination.Home
+    }
+
+    BackHandler(
+        enabled = selectedTab == ScreenTab.More && moreDestination != MoreDestination.Home,
+    ) {
+        moreDestination = MoreDestination.Home
+    }
+    BackHandler(
+        enabled = selectedTab == ScreenTab.Family && familyDestination != FamilyDestination.Home,
+    ) {
+        familyDestination = FamilyDestination.Home
     }
 
     LaunchedEffect(openParentRequestsSignal) {
         if (openParentRequestsSignal > 0) {
-            selectTab(ScreenTab.Settings)
+            selectTab(if (layoutMode == ScreenLayoutMode.Modern) ScreenTab.Family else ScreenTab.Settings)
             onSettingsParentManagementExpandedChange(true)
         }
     }
@@ -1035,6 +1145,9 @@ fun ScreenTimeManagerScreen(
         val isExpanded = maxWidth >= 720.dp
         val isLandscape = maxWidth > maxHeight
         val screenScrollState = rememberScrollState()
+        LaunchedEffect(selectedTab, moreDestination, familyDestination) {
+            screenScrollState.scrollTo(0)
+        }
         val isKeyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
         val bottomBarOuterVerticalPadding = if (isLandscape && isExpanded) 2.dp else 10.dp
         val contentBottomPadding = when {
@@ -1054,11 +1167,6 @@ fun ScreenTimeManagerScreen(
                 .align(Alignment.TopCenter),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Header(
-                showPermissionWarning = permissionSetupRequired,
-                text = text,
-            )
-
             Box(
                 modifier = Modifier.fillMaxWidth(),
             ) {
@@ -1069,81 +1177,197 @@ fun ScreenTimeManagerScreen(
                     onAnimationFinished = { previousTab = null },
                 ) { tab ->
                     when (tab) {
-                        ScreenTab.Overview -> OverviewContent(
+                        ScreenTab.Today -> OverviewContent(
                             uiState = uiState,
+                            parentAccountAuthState = parentAccountAuthState,
+                            permissionSetupRequired = permissionSetupRequired,
                             text = text,
                             isExpanded = isExpanded,
                             onRefreshUsageStats = onRefreshUsageStats,
+                            onOpenRules = { selectTab(if (layoutMode == ScreenLayoutMode.Modern) ScreenTab.Rules else ScreenTab.Time) },
+                            onOpenFamily = { selectTab(if (layoutMode == ScreenLayoutMode.Modern) ScreenTab.Family else ScreenTab.Settings) },
+                            onOpenStatistics = { selectTab(ScreenTab.Stats) },
                         )
 
-                        ScreenTab.Time -> UsagePolicySection(
-                            settings = uiState.policyDraftSettings,
-                            temporaryUnlockState = uiState.temporaryUnlockState,
-                            activeHardshipPolicyKeys = uiState.hardshipRuntimeState.activePolicyKeys,
-                            hardshipRuntimeState = uiState.hardshipRuntimeState,
-                            installedApps = uiState.installedApps,
-                            allowedAppPackages = uiState.allowedAppPackages,
-                            allRestrictionsExemptPackages = uiState.allRestrictionsExemptPackages,
+                        ScreenTab.Rules -> RulesContent(
+                            uiState = uiState,
+                            parentAccountAuthState = parentAccountAuthState,
                             text = text,
-                            isExpanded = isExpanded,
-                            contentMode = PolicyContentMode.TimeControls,
-                            dailyPolicyExpanded = uiState.dailyPolicyExpanded,
-                            onDailyPolicyExpandedChange = onDailyPolicyExpandedChange,
-                            appGroupsExpanded = uiState.appGroupsExpanded,
-                            onAppGroupsExpandedChange = onAppGroupsExpandedChange,
-                            appLimitsExpanded = uiState.appLimitsExpanded,
-                            onAppLimitsExpandedChange = onAppLimitsExpandedChange,
-                            scheduleBlockingExpanded = uiState.scheduleBlockingExpanded,
-                            onScheduleBlockingExpandedChange = onScheduleBlockingExpandedChange,
-                            allowOnlyModeExpanded = uiState.allowOnlyModeExpanded,
-                            onAllowOnlyModeExpandedChange = onAllowOnlyModeExpandedChange,
-                            onPolicyDraftChanged = onPolicyDraftChanged,
-                            onStartHardshipConfigurationReflection = onStartHardshipConfigurationReflection,
-                            onHardshipPolicyDraftChanged = { nextSettings, adminPin ->
-                                onPolicyDraftChanged(nextSettings)
-                                policyAdminPin = adminPin
-                                showPolicySaveDialog = true
-                            },
-                            onAllowedAppsChanged = onAllowedAppsChanged,
-                            onAllRestrictionsExemptAppsChanged = onAllRestrictionsExemptAppsChanged,
-                        )
-
-                        ScreenTab.Blocking -> UsagePolicySection(
-                            settings = uiState.policyDraftSettings,
-                            temporaryUnlockState = uiState.temporaryUnlockState,
-                            activeHardshipPolicyKeys = uiState.hardshipRuntimeState.activePolicyKeys,
-                            hardshipRuntimeState = uiState.hardshipRuntimeState,
-                            installedApps = uiState.installedApps,
-                            allowedAppPackages = uiState.allowedAppPackages,
-                            allRestrictionsExemptPackages = uiState.allRestrictionsExemptPackages,
-                            text = text,
-                            isExpanded = isExpanded,
-                            contentMode = PolicyContentMode.BlockingControls,
-                            dailyPolicyExpanded = uiState.dailyPolicyExpanded,
-                            onDailyPolicyExpandedChange = onDailyPolicyExpandedChange,
-                            appGroupsExpanded = uiState.appGroupsExpanded,
-                            onAppGroupsExpandedChange = onAppGroupsExpandedChange,
-                            appLimitsExpanded = uiState.appLimitsExpanded,
-                            onAppLimitsExpandedChange = onAppLimitsExpandedChange,
-                            scheduleBlockingExpanded = uiState.scheduleBlockingExpanded,
-                            onScheduleBlockingExpandedChange = onScheduleBlockingExpandedChange,
-                            allowOnlyModeExpanded = uiState.allowOnlyModeExpanded,
-                            onAllowOnlyModeExpandedChange = onAllowOnlyModeExpandedChange,
-                            onPolicyDraftChanged = onPolicyDraftChanged,
-                            onStartHardshipConfigurationReflection = onStartHardshipConfigurationReflection,
-                            onHardshipPolicyDraftChanged = { nextSettings, adminPin ->
-                                onPolicyDraftChanged(nextSettings)
-                                policyAdminPin = adminPin
-                                showPolicySaveDialog = true
-                            },
-                            onAllowedAppsChanged = onAllowedAppsChanged,
-                            onAllRestrictionsExemptAppsChanged = onAllRestrictionsExemptAppsChanged,
-                        )
+                            onOpenFamily = { selectTab(if (layoutMode == ScreenLayoutMode.Modern) ScreenTab.Family else ScreenTab.Settings) },
+                        ) {
+                            UsagePolicySection(
+                                settings = uiState.policyDraftSettings,
+                                temporaryUnlockState = uiState.temporaryUnlockState,
+                                activeHardshipPolicyKeys = uiState.hardshipRuntimeState.activePolicyKeys,
+                                hardshipRuntimeState = uiState.hardshipRuntimeState,
+                                installedApps = uiState.installedApps,
+                                allowedAppPackages = uiState.allowedAppPackages,
+                                allRestrictionsExemptPackages = uiState.allRestrictionsExemptPackages,
+                                text = text,
+                                isExpanded = isExpanded,
+                                contentMode = PolicyContentMode.AllControls,
+                                dailyPolicyExpanded = uiState.dailyPolicyExpanded,
+                                onDailyPolicyExpandedChange = onDailyPolicyExpandedChange,
+                                appGroupsExpanded = uiState.appGroupsExpanded,
+                                onAppGroupsExpandedChange = onAppGroupsExpandedChange,
+                                appLimitsExpanded = uiState.appLimitsExpanded,
+                                onAppLimitsExpandedChange = onAppLimitsExpandedChange,
+                                scheduleBlockingExpanded = uiState.scheduleBlockingExpanded,
+                                onScheduleBlockingExpandedChange = onScheduleBlockingExpandedChange,
+                                allowOnlyModeExpanded = uiState.allowOnlyModeExpanded,
+                                onAllowOnlyModeExpandedChange = onAllowOnlyModeExpandedChange,
+                                onPolicyDraftChanged = onPolicyDraftChanged,
+                                onStartHardshipConfigurationReflection = onStartHardshipConfigurationReflection,
+                                onHardshipPolicyDraftChanged = { nextSettings, adminPin ->
+                                    onPolicyDraftChanged(nextSettings)
+                                    policyAdminPin = adminPin
+                                    showPolicySaveDialog = true
+                                },
+                                onAllowedAppsChanged = onAllowedAppsChanged,
+                                onAllRestrictionsExemptAppsChanged = onAllRestrictionsExemptAppsChanged,
+                            )
+                        }
 
                         ScreenTab.Stats -> StatisticsContent(
                             uiState = uiState,
+                            parentAccountAuthState = parentAccountAuthState,
                             text = text,
                             isExpanded = isExpanded,
+                            onOpenFamily = { selectTab(if (layoutMode == ScreenLayoutMode.Modern) ScreenTab.Family else ScreenTab.Settings) },
+                        )
+
+                        ScreenTab.Family -> FamilyContent(
+                            destination = familyDestination,
+                            onDestinationChanged = { familyDestination = it },
+                            parentState = uiState.parentManagementState,
+                            childTopAppsSharingEnabled = uiState.childTopAppsSharingEnabled,
+                            childUsageSnapshots = uiState.childUsageSnapshots,
+                            childUsageRefreshRequests = uiState.childUsageRefreshRequests,
+                            childImmediateBlocks = uiState.childImmediateBlocks,
+                            localImmediateBlock = uiState.localImmediateBlock,
+                            parentAccountAuthState = parentAccountAuthState,
+                            notificationState = uiState.parentNotificationState,
+                            parentRequestNotificationReady = uiState.parentRequestNotificationReady,
+                            parentRequestNotificationIssue = uiState.parentRequestNotificationIssue,
+                            installedApps = uiState.installedApps,
+                            policySummary = uiState.policySummary,
+                            safeModeEnabled = uiState.safeModeEnabled,
+                            policyEnforcementEnabled = uiState.policyEnforcementEnabled,
+                            text = text,
+                            onPairParentAccount = onPairParentAccount,
+                            onParentProfileNameChanged = onParentProfileNameChanged,
+                            onParentDeviceRoleChanged = onParentDeviceRoleChanged,
+                            onGenerateChildPairingCode = onGenerateChildPairingCode,
+                            onRegisterChildPairingCode = onRegisterChildPairingCode,
+                            onParentGoogleSignIn = onParentGoogleSignIn,
+                            onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
+                            onUnlinkParentAccount = onUnlinkParentAccount,
+                            onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
+                            onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
+                            onSyncParentDevice = onSyncParentDevice,
+                            onCheckImmediateBlock = onCheckImmediateBlock,
+                            onChildTopAppsSharingChanged = onChildTopAppsSharingChanged,
+                            onStartImmediateBlock = onStartImmediateBlock,
+                            onStopImmediateBlock = onStopImmediateBlock,
+                            pendingParentManagementAction = pendingParentManagementAction,
+                            onPendingParentManagementActionChanged = { pendingParentManagementAction = it },
+                            onClearRemoteParentCommands = onClearRemoteParentCommands,
+                            onRemoteAppExtraTime = onRemoteAppExtraTime,
+                            onRemoteAppUnlockToday = onRemoteAppUnlockToday,
+                            onRemoteTotalExtraTime = onRemoteTotalExtraTime,
+                            onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
+                            onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
+                            onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
+                            onOpenLocalRules = {
+                                selectTab(ScreenTab.Rules)
+                            },
+                        )
+
+                        ScreenTab.More -> MoreContent(
+                            destination = moreDestination,
+                            onDestinationChanged = { moreDestination = it },
+                            uiState = uiState,
+                            parentAccountAuthState = parentAccountAuthState,
+                            safeRecoveryAdminPin = safeRecoveryAdminPin,
+                            text = text,
+                            isExpanded = isExpanded,
+                            onSafeModeChanged = onSafeModeChanged,
+                            onSafeModeEnableWithPin = onSafeModeEnableWithPin,
+                            onSafeModePinStatusSeen = onSafeModePinStatusSeen,
+                            onPolicyEnforcementChanged = onPolicyEnforcementChanged,
+                            onPolicyEnforcementDisableWithPin = onPolicyEnforcementDisableWithPin,
+                            onOpenBlockScreenPreview = { result ->
+                                context.startActivity(
+                                    BlockedActivity.previewIntent(
+                                        context = context,
+                                        appName = result.appName,
+                                        packageName = result.packageName,
+                                        reason = text.blockDecision(result.decision),
+                                        usedMinutes = result.usedMinutes,
+                                        limitMinutes = result.limitMinutes,
+                                        showAppDetails = result.decision != BlockDecision.WouldBlockTotalLimit,
+                                    ),
+                                )
+                            },
+                            onSafeRecoveryPinChanged = { value ->
+                                safeRecoveryAdminPin = value
+                                onSafeRecoveryPinChanged()
+                            },
+                            onSafeRecoveryClick = {
+                                onSafeRecovery(safeRecoveryAdminPin)
+                                safeRecoveryAdminPin = ""
+                            },
+                            onAppLanguageChanged = onAppLanguageChanged,
+                            onWarningNotificationsChanged = onWarningNotificationsChanged,
+                            onLimitNotificationsChanged = onLimitNotificationsChanged,
+                            onOpenUsageAccessSettings = onOpenUsageAccessSettings,
+                            onOpenOverlaySettings = onOpenOverlaySettings,
+                            onOpenNotificationAccessSettings = onOpenNotificationAccessSettings,
+                            onOpenExactAlarmSettings = onOpenExactAlarmSettings,
+                            onRequestNotificationPermission = onRequestNotificationPermission,
+                            onUpdateAdminPin = onUpdateAdminPin,
+                            onPinInputChanged = onPinInputChanged,
+                            onParentGoogleSignIn = onParentGoogleSignIn,
+                            onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
+                            onClearEventLog = onClearEventLog,
+                            layoutMode = layoutMode,
+                            onLayoutModeChanged = ::changeLayoutMode,
+                        )
+
+                        ScreenTab.Time, ScreenTab.Blocking -> UsagePolicySection(
+                            settings = uiState.policyDraftSettings,
+                            temporaryUnlockState = uiState.temporaryUnlockState,
+                            activeHardshipPolicyKeys = uiState.hardshipRuntimeState.activePolicyKeys,
+                            hardshipRuntimeState = uiState.hardshipRuntimeState,
+                            installedApps = uiState.installedApps,
+                            allowedAppPackages = uiState.allowedAppPackages,
+                            allRestrictionsExemptPackages = uiState.allRestrictionsExemptPackages,
+                            text = text,
+                            isExpanded = isExpanded,
+                            contentMode = if (tab == ScreenTab.Time) {
+                                PolicyContentMode.TimeControls
+                            } else {
+                                PolicyContentMode.BlockingControls
+                            },
+                            dailyPolicyExpanded = uiState.dailyPolicyExpanded,
+                            onDailyPolicyExpandedChange = onDailyPolicyExpandedChange,
+                            appGroupsExpanded = uiState.appGroupsExpanded,
+                            onAppGroupsExpandedChange = onAppGroupsExpandedChange,
+                            appLimitsExpanded = uiState.appLimitsExpanded,
+                            onAppLimitsExpandedChange = onAppLimitsExpandedChange,
+                            scheduleBlockingExpanded = uiState.scheduleBlockingExpanded,
+                            onScheduleBlockingExpandedChange = onScheduleBlockingExpandedChange,
+                            allowOnlyModeExpanded = uiState.allowOnlyModeExpanded,
+                            onAllowOnlyModeExpandedChange = onAllowOnlyModeExpandedChange,
+                            onPolicyDraftChanged = onPolicyDraftChanged,
+                            onStartHardshipConfigurationReflection = onStartHardshipConfigurationReflection,
+                            onHardshipPolicyDraftChanged = { nextSettings, adminPin ->
+                                onPolicyDraftChanged(nextSettings)
+                                policyAdminPin = adminPin
+                                showPolicySaveDialog = true
+                            },
+                            onAllowedAppsChanged = onAllowedAppsChanged,
+                            onAllRestrictionsExemptAppsChanged = onAllRestrictionsExemptAppsChanged,
                         )
 
                         ScreenTab.Safety -> SafetyContent(
@@ -1179,48 +1403,55 @@ fun ScreenTimeManagerScreen(
                             },
                         )
 
-                        ScreenTab.Settings -> SettingsContent(
-                            uiState = uiState,
-                            parentAccountAuthState = parentAccountAuthState,
-                            text = text,
-                            isExpanded = isExpanded,
-                            onAppLanguageChanged = onAppLanguageChanged,
-                            onWarningNotificationsChanged = onWarningNotificationsChanged,
-                            onLimitNotificationsChanged = onLimitNotificationsChanged,
-                            onOpenUsageAccessSettings = onOpenUsageAccessSettings,
-                            onOpenOverlaySettings = onOpenOverlaySettings,
-                            onOpenNotificationAccessSettings = onOpenNotificationAccessSettings,
-                            onOpenExactAlarmSettings = onOpenExactAlarmSettings,
-                            onRequestNotificationPermission = onRequestNotificationPermission,
-                            onUpdateAdminPin = onUpdateAdminPin,
-                            onPinInputChanged = onPinInputChanged,
-                            onPairParentAccount = onPairParentAccount,
-                            onParentProfileNameChanged = onParentProfileNameChanged,
-                            onParentDeviceRoleChanged = onParentDeviceRoleChanged,
-                            onGenerateChildPairingCode = onGenerateChildPairingCode,
-                            onRegisterChildPairingCode = onRegisterChildPairingCode,
-                            onParentGoogleSignIn = onParentGoogleSignIn,
-                            onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
-                            onUnlinkParentAccount = onUnlinkParentAccount,
-                            onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
-                            onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
-                            onSyncParentDevice = onSyncParentDevice,
-                            pendingParentManagementAction = pendingParentManagementAction,
-                            onPendingParentManagementActionChanged = { pendingParentManagementAction = it },
-                            onClearRemoteParentCommands = onClearRemoteParentCommands,
-                            onRemoteAppExtraTime = onRemoteAppExtraTime,
-                            onRemoteAppUnlockToday = onRemoteAppUnlockToday,
-                            onRemoteTotalExtraTime = onRemoteTotalExtraTime,
-                            onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
-                            onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
-                            onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
-                            onClearEventLog = onClearEventLog,
-                            onSettingsLanguageExpandedChange = onSettingsLanguageExpandedChange,
-                            onSettingsNotificationExpandedChange = onSettingsNotificationExpandedChange,
-                            onSettingsPinExpandedChange = onSettingsPinExpandedChange,
-                            onSettingsParentManagementExpandedChange = onSettingsParentManagementExpandedChange,
-                            onSettingsEventLogExpandedChange = onSettingsEventLogExpandedChange,
-                        )
+                        ScreenTab.Settings -> Column {
+                            ScreenLayoutModePicker(
+                                layoutMode = layoutMode,
+                                text = text,
+                                onLayoutModeChanged = ::changeLayoutMode,
+                            )
+                            SettingsContent(
+                                uiState = uiState,
+                                parentAccountAuthState = parentAccountAuthState,
+                                text = text,
+                                isExpanded = isExpanded,
+                                onAppLanguageChanged = onAppLanguageChanged,
+                                onWarningNotificationsChanged = onWarningNotificationsChanged,
+                                onLimitNotificationsChanged = onLimitNotificationsChanged,
+                                onOpenUsageAccessSettings = onOpenUsageAccessSettings,
+                                onOpenOverlaySettings = onOpenOverlaySettings,
+                                onOpenNotificationAccessSettings = onOpenNotificationAccessSettings,
+                                onOpenExactAlarmSettings = onOpenExactAlarmSettings,
+                                onRequestNotificationPermission = onRequestNotificationPermission,
+                                onUpdateAdminPin = onUpdateAdminPin,
+                                onPinInputChanged = onPinInputChanged,
+                                onPairParentAccount = onPairParentAccount,
+                                onParentProfileNameChanged = onParentProfileNameChanged,
+                                onParentDeviceRoleChanged = onParentDeviceRoleChanged,
+                                onGenerateChildPairingCode = onGenerateChildPairingCode,
+                                onRegisterChildPairingCode = onRegisterChildPairingCode,
+                                onParentGoogleSignIn = onParentGoogleSignIn,
+                                onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
+                                onUnlinkParentAccount = onUnlinkParentAccount,
+                                onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
+                                onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
+                                onSyncParentDevice = onSyncParentDevice,
+                                pendingParentManagementAction = pendingParentManagementAction,
+                                onPendingParentManagementActionChanged = { pendingParentManagementAction = it },
+                                onClearRemoteParentCommands = onClearRemoteParentCommands,
+                                onRemoteAppExtraTime = onRemoteAppExtraTime,
+                                onRemoteAppUnlockToday = onRemoteAppUnlockToday,
+                                onRemoteTotalExtraTime = onRemoteTotalExtraTime,
+                                onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
+                                onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
+                                onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
+                                onClearEventLog = onClearEventLog,
+                                onSettingsLanguageExpandedChange = onSettingsLanguageExpandedChange,
+                                onSettingsNotificationExpandedChange = onSettingsNotificationExpandedChange,
+                                onSettingsPinExpandedChange = onSettingsPinExpandedChange,
+                                onSettingsParentManagementExpandedChange = onSettingsParentManagementExpandedChange,
+                                onSettingsEventLogExpandedChange = onSettingsEventLogExpandedChange,
+                            )
+                        }
                     }
                 }
             }
@@ -1240,16 +1471,13 @@ fun ScreenTimeManagerScreen(
             }
             BottomTabBar(
                 selectedTab = selectedTab,
+                layoutMode = layoutMode,
                 text = text,
-                policySaveStatus = uiState.policySaveStatus,
-                hasPolicyChanges = hasSaveChanges,
-                budgetValidation = saveBudgetValidation,
                 onTabSelected = { tab -> selectTab(tab) },
-                onRequestSavePolicy = { showPolicySaveDialog = true },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(horizontal = 20.dp, vertical = bottomBarOuterVerticalPadding)
-                    .widthIn(max = 680.dp),
+                    .padding(horizontal = 12.dp, vertical = bottomBarOuterVerticalPadding)
+                    .widthIn(max = 720.dp),
             )
         }
 
@@ -1937,30 +2165,27 @@ private fun PendingPolicySaveBanner(
 @Composable
 private fun BottomTabBar(
     selectedTab: ScreenTab,
+    layoutMode: ScreenLayoutMode,
     text: AppStrings,
-    policySaveStatus: PolicySaveStatus,
-    hasPolicyChanges: Boolean,
-    budgetValidation: PolicyBudgetValidation,
     onTabSelected: (ScreenTab) -> Unit,
-    onRequestSavePolicy: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.98f),
-        tonalElevation = 1.dp,
-        shadowElevation = 2.dp,
+        shape = RoundedCornerShape(ScreenRestTheme.radii.card),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.99f),
+        tonalElevation = 0.dp,
+        shadowElevation = 6.dp,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(6.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                .padding(horizontal = 6.dp, vertical = 5.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            PrimaryScreenTabs.forEach { tab ->
+            layoutMode.tabs().forEach { tab ->
                 BottomTabItem(
                     tab = tab,
                     label = text.tabLabel(tab),
@@ -1969,108 +2194,6 @@ private fun BottomTabBar(
                     modifier = Modifier.weight(1f),
                 )
             }
-            BottomSaveAction(
-                text = text,
-                policySaveStatus = policySaveStatus,
-                hasPolicyChanges = hasPolicyChanges,
-                hasBudgetOverflow = budgetValidation.hasOverflow,
-                onClick = onRequestSavePolicy,
-                modifier = Modifier.weight(1.35f),
-            )
-        }
-    }
-}
-
-@Composable
-private fun BottomSaveAction(
-    text: AppStrings,
-    policySaveStatus: PolicySaveStatus,
-    hasPolicyChanges: Boolean,
-    hasBudgetOverflow: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val pulseTransition = rememberInfiniteTransition(label = "bottom-save-pulse")
-    val pulseAlpha by pulseTransition.animateFloat(
-        initialValue = 0.62f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 780),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "bottom-save-pulse-alpha",
-    )
-    val activeAlpha = if ((hasPolicyChanges || hasBudgetOverflow) && policySaveStatus != PolicySaveStatus.Saved) pulseAlpha else 1f
-    val status = when {
-        hasBudgetOverflow -> LimitStatus.Exceeded
-        policySaveStatus == PolicySaveStatus.InvalidAdminPin -> LimitStatus.Exceeded
-        policySaveStatus == PolicySaveStatus.BudgetExceeded -> LimitStatus.Exceeded
-        policySaveStatus == PolicySaveStatus.PolicyConflict -> LimitStatus.Exceeded
-        policySaveStatus == PolicySaveStatus.HardshipLocked -> LimitStatus.Exceeded
-        policySaveStatus == PolicySaveStatus.HardshipReflectionRequired -> LimitStatus.Exceeded
-        policySaveStatus == PolicySaveStatus.HardshipReflectionWaiting -> LimitStatus.Warning
-        hasPolicyChanges -> LimitStatus.Exceeded
-        else -> LimitStatus.Normal
-    }
-    val containerColor = when (status) {
-        LimitStatus.Normal -> if (policySaveStatus == PolicySaveStatus.Saved) {
-            AppSafe.copy(alpha = 0.18f)
-        } else {
-            Color.Transparent
-        }
-        LimitStatus.Warning -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = activeAlpha)
-        LimitStatus.Exceeded -> AppOver.copy(alpha = 0.10f * activeAlpha)
-    }
-    val contentColor = when (status) {
-        LimitStatus.Normal -> if (policySaveStatus == PolicySaveStatus.Saved) AppSafe else MaterialTheme.colorScheme.onSurfaceVariant
-        LimitStatus.Warning -> Color(0xFF9A6500)
-        LimitStatus.Exceeded -> AppOver
-    }
-    val borderColor = when {
-        hasBudgetOverflow || hasPolicyChanges -> AppOver.copy(alpha = 0.72f * activeAlpha)
-        policySaveStatus == PolicySaveStatus.Saved -> AppSafe.copy(alpha = 0.78f)
-        else -> MaterialTheme.colorScheme.outlineVariant
-    }
-    val dotColor = when {
-        hasBudgetOverflow || hasPolicyChanges -> AppOver
-        policySaveStatus == PolicySaveStatus.Saved -> AppSafe
-        else -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Surface(
-        onClick = onClick,
-        modifier = modifier.height(60.dp),
-        shape = RoundedCornerShape(14.dp),
-        color = containerColor,
-        border = BorderStroke(1.dp, borderColor),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 4.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-        ) {
-            Box(
-                modifier = Modifier.size(22.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Canvas(modifier = Modifier.size(14.dp)) {
-                    drawCircle(color = dotColor)
-                }
-            }
-            Spacer(modifier = Modifier.height(3.dp))
-            Text(
-                text = if (hasPolicyChanges) text.shortSaveLabel() else text.shortPolicyUpToDateLabel(),
-                style = MaterialTheme.typography.labelMedium.copy(
-                    fontSize = 12.sp,
-                    lineHeight = 16.sp,
-                ),
-                fontWeight = if (hasPolicyChanges || hasBudgetOverflow) FontWeight.Bold else FontWeight.SemiBold,
-                color = contentColor,
-                maxLines = 2,
-                overflow = TextOverflow.Clip,
-                textAlign = TextAlign.Center,
-            )
         }
     }
 }
@@ -2088,23 +2211,32 @@ private fun BottomTabItem(
     val contentColor = if (selected) activeColor else inactiveColor
     Surface(
         onClick = onClick,
-        modifier = modifier.height(56.dp),
-        shape = RoundedCornerShape(14.dp),
-        color = if (selected) activeColor.copy(alpha = 0.10f) else Color.Transparent,
+        modifier = modifier.height(64.dp),
+        shape = RoundedCornerShape(ScreenRestTheme.radii.control),
+        color = Color.Transparent,
     ) {
         Column(
             modifier = Modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            BottomTabIcon(tab = tab, color = contentColor)
-            Spacer(modifier = Modifier.height(3.dp))
+            Surface(
+                shape = RoundedCornerShape(999.dp),
+                color = if (selected) ScreenRestPalette.CobaltSoft else Color.Transparent,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .width(48.dp)
+                        .height(30.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    BottomTabIcon(tab = tab, color = contentColor)
+                }
+            }
+            Spacer(modifier = Modifier.height(2.dp))
             Text(
                 text = label,
-                style = MaterialTheme.typography.labelMedium.copy(
-                    fontSize = 12.sp,
-                    lineHeight = 16.sp,
-                ),
+                style = MaterialTheme.typography.labelMedium,
                 fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
                 color = contentColor,
                 maxLines = 1,
@@ -2116,135 +2248,34 @@ private fun BottomTabItem(
 
 @Composable
 private fun BottomTabIcon(tab: ScreenTab, color: Color) {
-    Canvas(modifier = Modifier.size(22.dp)) {
-        val stroke = 2.1.dp.toPx()
-        val center = Offset(size.width / 2f, size.height / 2f)
-        when (tab) {
-            ScreenTab.Overview -> {
-                drawCircle(color = color, radius = size.minDimension * 0.36f, style = Stroke(width = stroke))
-                drawLine(
-                    color = color,
-                    start = center,
-                    end = Offset(size.width * 0.72f, size.height * 0.35f),
-                    strokeWidth = stroke,
-                    cap = StrokeCap.Round,
-                )
-            }
-
-            ScreenTab.Time -> {
-                drawRoundRect(
-                    color = color,
-                    topLeft = Offset(size.width * 0.18f, size.height * 0.22f),
-                    size = Size(size.width * 0.64f, size.height * 0.62f),
-                    cornerRadius = CornerRadius(4.dp.toPx(), 4.dp.toPx()),
-                    style = Stroke(width = stroke),
-                )
-                drawLine(
-                    color = color,
-                    start = Offset(size.width * 0.3f, size.height * 0.12f),
-                    end = Offset(size.width * 0.3f, size.height * 0.32f),
-                    strokeWidth = stroke,
-                    cap = StrokeCap.Round,
-                )
-                drawLine(
-                    color = color,
-                    start = Offset(size.width * 0.7f, size.height * 0.12f),
-                    end = Offset(size.width * 0.7f, size.height * 0.32f),
-                    strokeWidth = stroke,
-                    cap = StrokeCap.Round,
-                )
-                drawLine(
-                    color = color,
-                    start = Offset(size.width * 0.28f, size.height * 0.46f),
-                    end = Offset(size.width * 0.72f, size.height * 0.46f),
-                    strokeWidth = stroke,
-                    cap = StrokeCap.Round,
-                )
-            }
-
-            ScreenTab.Blocking -> {
-                drawRoundRect(
-                    color = color,
-                    topLeft = Offset(size.width * 0.26f, size.height * 0.46f),
-                    size = Size(size.width * 0.48f, size.height * 0.34f),
-                    cornerRadius = CornerRadius(4.dp.toPx(), 4.dp.toPx()),
-                    style = Stroke(width = stroke),
-                )
-                drawArc(
-                    color = color,
-                    startAngle = 205f,
-                    sweepAngle = 130f,
-                    useCenter = false,
-                    topLeft = Offset(size.width * 0.33f, size.height * 0.18f),
-                    size = Size(size.width * 0.34f, size.height * 0.44f),
-                    style = Stroke(width = stroke, cap = StrokeCap.Round),
-                )
-            }
-
-            ScreenTab.Stats -> {
-                val barWidth = size.width * 0.14f
-                listOf(
-                    0.28f to 0.66f,
-                    0.50f to 0.42f,
-                    0.72f to 0.24f,
-                ).forEach { (x, top) ->
-                    drawRoundRect(
-                        color = color,
-                        topLeft = Offset(size.width * x - barWidth / 2f, size.height * top),
-                        size = Size(barWidth, size.height * (0.86f - top)),
-                        cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
-                    )
-                }
-                drawLine(
-                    color = color,
-                    start = Offset(size.width * 0.18f, size.height * 0.88f),
-                    end = Offset(size.width * 0.82f, size.height * 0.88f),
-                    strokeWidth = stroke,
-                    cap = StrokeCap.Round,
-                )
-            }
-
-            ScreenTab.Safety -> {
-                val points = listOf(
-                    Offset(size.width * 0.5f, size.height * 0.12f),
-                    Offset(size.width * 0.78f, size.height * 0.25f),
-                    Offset(size.width * 0.72f, size.height * 0.68f),
-                    Offset(size.width * 0.5f, size.height * 0.88f),
-                    Offset(size.width * 0.28f, size.height * 0.68f),
-                    Offset(size.width * 0.22f, size.height * 0.25f),
-                    Offset(size.width * 0.5f, size.height * 0.12f),
-                )
-                points.zipWithNext().forEach { (start, end) ->
-                    drawLine(color = color, start = start, end = end, strokeWidth = stroke, cap = StrokeCap.Round)
-                }
-            }
-
-            ScreenTab.Settings -> {
-                drawCircle(color = color, radius = size.minDimension * 0.34f, style = Stroke(width = stroke))
-                drawCircle(color = color, radius = size.minDimension * 0.13f, style = Stroke(width = stroke))
-                repeat(8) { index ->
-                    val angle = Math.toRadians((index * 45).toDouble())
-                    val inner = Offset(
-                        x = center.x + kotlin.math.cos(angle).toFloat() * size.minDimension * 0.42f,
-                        y = center.y + kotlin.math.sin(angle).toFloat() * size.minDimension * 0.42f,
-                    )
-                    val outer = Offset(
-                        x = center.x + kotlin.math.cos(angle).toFloat() * size.minDimension * 0.51f,
-                        y = center.y + kotlin.math.sin(angle).toFloat() * size.minDimension * 0.51f,
-                    )
-                    drawLine(color = color, start = inner, end = outer, strokeWidth = 3.dp.toPx(), cap = StrokeCap.Round)
-                }
-            }
-        }
+    val iconRes = when (tab) {
+        ScreenTab.Today -> R.drawable.ic_nav_today
+        ScreenTab.Rules -> R.drawable.ic_nav_rules
+        ScreenTab.Stats -> R.drawable.ic_nav_statistics
+        ScreenTab.Family -> R.drawable.ic_nav_family
+        ScreenTab.More -> R.drawable.ic_nav_more
+        ScreenTab.Time -> R.drawable.ic_family_clock
+        ScreenTab.Blocking -> R.drawable.ic_family_block
+        ScreenTab.Safety -> R.drawable.ic_more_protection
+        ScreenTab.Settings -> R.drawable.ic_more_account
     }
+    Icon(
+        painter = painterResource(iconRes),
+        contentDescription = null,
+        modifier = Modifier.size(22.dp),
+        tint = color,
+    )
 }
 
 private fun AppStrings.tabLabel(tab: ScreenTab): String {
     return when (tab) {
-        ScreenTab.Overview -> overview
+        ScreenTab.Today -> if (appLanguage == AppLanguage.Korean) "오늘" else "Today"
+        ScreenTab.Rules -> if (appLanguage == AppLanguage.Korean) "규칙" else "Rules"
+        ScreenTab.Stats -> stats
+        ScreenTab.Family -> if (appLanguage == AppLanguage.Korean) "가족" else "Family"
+        ScreenTab.More -> if (appLanguage == AppLanguage.Korean) "더보기" else "More"
         ScreenTab.Time -> time
         ScreenTab.Blocking -> blocking
-        ScreenTab.Stats -> stats
         ScreenTab.Safety -> safety
         ScreenTab.Settings -> settings
     }
@@ -2269,185 +2300,629 @@ fun ChoiceButton(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
+private fun RulesContent(
+    uiState: SafeModeUiState,
+    parentAccountAuthState: ParentAccountAuthState,
+    text: AppStrings,
+    onOpenFamily: () -> Unit,
+    editorContent: @Composable ColumnScope.() -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val profileName = screenProfileName(
+        parentState = uiState.parentManagementState,
+        authState = parentAccountAuthState,
+    )
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.lg)) {
+        ScreenRestPageHeader(
+            title = if (korean) "사용 규칙" else "Usage rules",
+            trailing = {
+                if (profileName.isNotBlank()) {
+                    CompactProfilePill(
+                        profileName = profileName,
+                        onClick = onOpenFamily,
+                    )
+                }
+            },
+        )
+        RulesAppliedResultCard(
+            uiState = uiState,
+            text = text,
+        )
+        if (uiState.policyDraftHasChanges) {
+            ScreenRestCard(tone = ScreenRestTone.Blocked) {
+                ScreenRestSectionHeader(
+                    title = if (korean) "저장 전 변경사항" else "Unsaved changes",
+                    supportingText = if (korean) {
+                        "아래 저장 버튼을 눌러야 변경한 규칙이 적용됩니다"
+                    } else {
+                        "Use the save button below to apply these rule changes"
+                    },
+                    action = {
+                        ScreenRestStatusPill(
+                            label = if (korean) "저장 필요" else "Save required",
+                            tone = ScreenRestTone.Blocked,
+                        )
+                    },
+                )
+            }
+        }
+        editorContent()
+        Text(
+            text = if (korean) {
+                "스케줄은 선택 사항이며, 시간 제한은 함께 적용됩니다."
+            } else {
+                "Schedules are optional; active time limits work together."
+            },
+            modifier = Modifier.padding(horizontal = ScreenRestTheme.spacing.xs),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun CompactProfilePill(
+    profileName: String,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(ScreenRestTheme.radii.button),
+        color = ScreenRestPalette.CobaltSoft,
+        border = BorderStroke(1.dp, ScreenRestPalette.Cobalt.copy(alpha = 0.18f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs),
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_more_account),
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = ScreenRestPalette.Cobalt,
+            )
+            Text(
+                text = profileName,
+                style = MaterialTheme.typography.labelLarge,
+                color = ScreenRestPalette.Navy,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun RulesAppliedResultCard(
+    uiState: SafeModeUiState,
+    text: AppStrings,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val summary = uiState.policySummary
+    val currentMode = when {
+        uiState.safeModeEnabled -> if (korean) "보호 일시 중지" else "Protection paused"
+        !uiState.policyEnforcementEnabled -> if (korean) "규칙 적용 꺼짐" else "Rules are off"
+        summary.activeScheduleSummary != null -> summary.activeScheduleSummary.name
+            .ifBlank { if (korean) "스케줄 적용" else "Schedule active" }
+        summary.allowOnlyModeEnabled -> if (korean) "허용앱만" else "Allow-only"
+        else -> if (korean) "일반 사용" else "Normal use"
+    }
+    val activeTimeLimitCount =
+        (if (summary.dailyPolicyEnabled && summary.totalLimitEnabled) 1 else 0) +
+            summary.groupSummaries.count { it.limitConfigured && it.activeToday } +
+            summary.appLimitSummaries.count { it.activeToday && !it.excludedFromRestrictions }
+    val earliest = if (!uiState.safeModeEnabled && uiState.policyEnforcementEnabled) {
+        summary.effectiveAppSummaries
+            .asSequence()
+            .filter { it.remainingMinutes != null && it.status != LimitStatus.Exceeded }
+            .minByOrNull { it.remainingMinutes ?: Int.MAX_VALUE }
+    } else {
+        null
+    }
+    val tone = when {
+        uiState.safeModeEnabled || !uiState.policyEnforcementEnabled -> ScreenRestTone.Warning
+        summary.activeScheduleSummary != null -> ScreenRestTone.Schedule
+        summary.allowOnlyModeEnabled -> ScreenRestTone.Success
+        summary.exceededCount > 0 -> ScreenRestTone.Blocked
+        else -> ScreenRestTone.Success
+    }
+    ScreenRestCard(tone = tone) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md),
+        ) {
+            MoreMenuIcon(R.drawable.ic_family_clock, tone)
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xxs),
+            ) {
+                Text(
+                    text = if (korean) "현재 적용 결과" else "Current result",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = currentMode,
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = tone.contentColor(),
+                )
+                Text(
+                    text = when {
+                        (uiState.safeModeEnabled || !uiState.policyEnforcementEnabled) && activeTimeLimitCount > 0 ->
+                            if (korean) "시간 제한 ${activeTimeLimitCount}개 설정됨 · 현재 미적용" else "$activeTimeLimitCount time limits configured · currently inactive"
+                        activeTimeLimitCount > 0 ->
+                            if (korean) "시간 제한 ${activeTimeLimitCount}개 적용 중" else "$activeTimeLimitCount time limits active"
+                        else -> if (korean) "적용 중인 시간 제한 없음" else "No active time limits"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        earliest?.let { app ->
+            Surface(
+                shape = RoundedCornerShape(ScreenRestTheme.radii.button),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+                ) {
+                    AppIcon(
+                        packageName = app.packageName,
+                        contentDescription = app.appName,
+                        size = 30.dp,
+                    )
+                    Text(
+                        text = if (korean) {
+                            "가장 먼저 끝나는 제한 · ${app.appName} ${formatLimitMinutesLabel(app.remainingMinutes ?: 0)} 남음"
+                        } else {
+                            "First limit · ${app.appName} ${formatLimitMinutesLabel(app.remainingMinutes ?: 0)} left"
+                        },
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun OverviewContent(
     uiState: SafeModeUiState,
+    parentAccountAuthState: ParentAccountAuthState,
+    permissionSetupRequired: Boolean,
     text: AppStrings,
     isExpanded: Boolean,
     onRefreshUsageStats: () -> Unit,
+    onOpenRules: () -> Unit,
+    onOpenFamily: () -> Unit,
+    onOpenStatistics: () -> Unit,
 ) {
-    AdaptiveTwoPane(
-        isExpanded = isExpanded,
-        leftContent = {
-            StatusCard(uiState, text)
-            PolicySummarySection(uiState.policySummary, text)
-        },
-        rightContent = {
-            UsageStatsSection(
-                hasUsageAccess = uiState.hasUsageAccess,
-                usageAccessChecking = uiState.usageAccessChecking,
-                lastUpdatedAtMillis = uiState.usageLastUpdatedAtMillis,
-                todayUsage = uiState.todayUsage,
-                policySummary = uiState.policySummary,
-                text = text,
-                onRefreshUsageStats = onRefreshUsageStats,
-            )
-        },
+    val profileName = screenProfileName(
+        parentState = uiState.parentManagementState,
+        authState = parentAccountAuthState,
     )
-}
-
-@Composable
-fun StatisticsContent(
-    uiState: SafeModeUiState,
-    text: AppStrings,
-    isExpanded: Boolean,
-) {
-    val dailyUsage = uiState.usageStatistics.dailyUsage
-    val todayUsage = uiState.todayUsage
-    val policySummary = uiState.policySummary
-
-    AdaptiveTwoPane(
-        isExpanded = isExpanded,
-        leftContent = {
-            StatisticsSummaryCard(
-                dailyUsage = dailyUsage,
-                todayUsage = todayUsage,
-                lastUpdatedAtMillis = uiState.statisticsLastUpdatedAtMillis,
-                refreshing = uiState.statisticsRefreshing,
-                text = text,
-            )
-            DailyTrendCard(
-                dailyUsage = dailyUsage,
-                text = text,
-            )
-        },
-        rightContent = {
-            TopAppsStatsCard(
-                topApps = uiState.usageStatistics.topApps,
-                policySummary = policySummary,
-                text = text,
-            )
-            GroupStatsCard(
-                groupSummaries = policySummary.groupSummaries,
-                text = text,
-            )
-        },
+    val presentation = todayStatusPresentation(
+        uiState = uiState,
+        permissionSetupRequired = permissionSetupRequired,
+        text = text,
     )
-}
-
-@Composable
-private fun StatisticsSummaryCard(
-    dailyUsage: List<DailyUsageInfo>,
-    todayUsage: List<AppUsageInfo>,
-    lastUpdatedAtMillis: Long,
-    refreshing: Boolean,
-    text: AppStrings,
-) {
-    val todayTotalMillis = todayUsage.sumOf { appUsage -> appUsage.totalTimeMillis }
-    val recordedDailyUsage = dailyUsage.filter { usage -> usage.hasRecordedData }
-    val averageMillis = if (recordedDailyUsage.isNotEmpty()) {
-        recordedDailyUsage.sumOf { usage -> usage.totalTimeMillis } / recordedDailyUsage.size
-    } else {
-        todayTotalMillis
-    }
-    val peakUsage = recordedDailyUsage.maxByOrNull { usage -> usage.totalTimeMillis }
-    val topApp = todayUsage.firstOrNull()
-
-    SimpleCard {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            SectionTitle(text.statistics, Modifier.weight(1f))
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.lg)) {
+        ScreenRestBrandHeader(
+            profileName = profileName,
+            text = text,
+            onProfileClick = onOpenFamily,
+        )
+        Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs)) {
             Text(
-                if (refreshing) text.updating else usageLastUpdatedLabel(lastUpdatedAtMillis, text),
-                style = MaterialTheme.typography.labelMedium,
+                text = presentation.title,
+                style = MaterialTheme.typography.displaySmall,
+                fontWeight = FontWeight.Bold,
+                color = presentation.tone.contentColor(),
+            )
+            Text(
+                text = presentation.subtitle,
+                style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        AdaptiveTwoPane(
+            isExpanded = isExpanded,
+            leftContent = {
+                TodayUsageSummaryCard(
+                    uiState = uiState,
+                    text = text,
+                    onRefreshUsageStats = onRefreshUsageStats,
+                )
+                TodayActiveRulesCard(
+                    summary = uiState.policySummary,
+                    rulesActive = !permissionSetupRequired &&
+                        !uiState.safeModeEnabled &&
+                        uiState.policyEnforcementEnabled,
+                    text = text,
+                    onOpenRules = onOpenRules,
+                )
+                TodayFamilyRequestCard(
+                    parentState = uiState.parentManagementState,
+                    text = text,
+                    onOpenFamily = onOpenFamily,
+                )
+            },
+            rightContent = {
+                TodayTopAppsCard(
+                    hasUsageAccess = uiState.hasUsageAccess,
+                    usageAccessChecking = uiState.usageAccessChecking,
+                    lastUpdatedAtMillis = uiState.usageLastUpdatedAtMillis,
+                    todayUsage = uiState.todayUsage,
+                    policySummary = uiState.policySummary,
+                    text = text,
+                    onRefreshUsageStats = onRefreshUsageStats,
+                    onOpenStatistics = onOpenStatistics,
+                )
+            },
+        )
+    }
+}
+
+private data class TodayStatusPresentation(
+    val title: String,
+    val subtitle: String,
+    val tone: ScreenRestTone,
+)
+
+private fun todayStatusPresentation(
+    uiState: SafeModeUiState,
+    permissionSetupRequired: Boolean,
+    text: AppStrings,
+): TodayStatusPresentation {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val summary = uiState.policySummary
+    return when {
+        permissionSetupRequired -> TodayStatusPresentation(
+            title = if (korean) "보호 상태 확인 필요" else "Protection needs attention",
+            subtitle = if (korean) "권한 또는 차단 준비 상태를 확인하세요" else "Review permissions or blocking readiness",
+            tone = ScreenRestTone.Blocked,
+        )
+        uiState.safeModeEnabled -> TodayStatusPresentation(
+            title = if (korean) "보호 일시 중지" else "Protection paused",
+            subtitle = if (korean) "규칙은 보존되지만 현재 차단하지 않습니다" else "Rules are preserved but blocking is paused",
+            tone = ScreenRestTone.Warning,
+        )
+        !uiState.policyEnforcementEnabled -> TodayStatusPresentation(
+            title = if (korean) "규칙 적용 꺼짐" else "Rules are off",
+            subtitle = if (korean) "설정은 보존되어 있으며 현재 적용되지 않습니다" else "Settings are preserved but not currently applied",
+            tone = ScreenRestTone.Warning,
+        )
+        summary.totalStatus == LimitStatus.Exceeded -> TodayStatusPresentation(
+            title = if (korean) "오늘 사용 시간이 끝났어요" else "Today's time is up",
+            subtitle = if (korean) "추가 허용 전까지 시간 제한 앱이 차단됩니다" else "Time-limited apps stay blocked until more time is allowed",
+            tone = ScreenRestTone.Blocked,
+        )
+        summary.activeScheduleSummary != null -> TodayStatusPresentation(
+            title = if (korean) "${summary.activeScheduleSummary.name} 적용 중" else "${summary.activeScheduleSummary.name} is active",
+            subtitle = if (korean) "허용된 앱만 사용할 수 있습니다" else "Only allowed apps can be used",
+            tone = ScreenRestTone.Schedule,
+        )
+        summary.allowOnlyModeEnabled -> TodayStatusPresentation(
+            title = if (korean) "허용된 앱만 사용 중" else "Allow-only mode",
+            subtitle = if (korean) "허용 앱 ${summary.allowOnlyAllowedAppCount}개를 사용할 수 있습니다" else "${summary.allowOnlyAllowedAppCount} apps are available",
+            tone = ScreenRestTone.Success,
+        )
+        summary.warningCount > 0 || summary.totalStatus == LimitStatus.Warning -> TodayStatusPresentation(
+            title = if (korean) "사용 시간이 얼마 남지 않았어요" else "Time is running low",
+            subtitle = if (korean) "가장 먼저 끝나는 제한을 확인하세요" else "Review the limit that will end first",
+            tone = ScreenRestTone.Warning,
+        )
+        else -> TodayStatusPresentation(
+            title = if (korean) "현재 자유 시간" else "Free time now",
+            subtitle = if (korean) "적용 중인 차단 없음" else "No active block",
+            tone = ScreenRestTone.Primary,
+        )
+    }
+}
+
+private fun ScreenRestTone.contentColor(): Color {
+    return when (this) {
+        ScreenRestTone.Success -> ScreenRestPalette.Teal
+        ScreenRestTone.Warning -> ScreenRestPalette.Amber
+        ScreenRestTone.Blocked -> ScreenRestPalette.Coral
+        ScreenRestTone.Schedule -> ScreenRestPalette.Indigo
+        ScreenRestTone.Primary -> ScreenRestPalette.Cobalt
+        ScreenRestTone.Neutral -> ScreenRestPalette.Navy
+    }
+}
+
+private fun screenProfileName(
+    parentState: ParentManagementState,
+    authState: ParentAccountAuthState,
+): String {
+    return parentState.localProfileName
+        .ifBlank { authState.displayName }
+        .ifBlank { parentState.childDeviceName }
+        .trim()
+}
+
+@Composable
+private fun ScreenRestBrandHeader(
+    profileName: String,
+    text: AppStrings,
+    onProfileClick: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = ScreenRestTheme.spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
         ) {
-            MetricTile(
-                label = text.todayStatus,
-                value = formatDuration(todayTotalMillis),
-                modifier = Modifier.weight(1f),
+            Image(
+                painter = painterResource(R.mipmap.app_icon_round),
+                contentDescription = if (korean) "폰 쉼 앱 아이콘" else "ScreenRest app icon",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(38.dp)
+                    .clip(CircleShape),
             )
-            MetricTile(
-                label = text.averageDaily,
-                value = formatDuration(averageMillis),
-                modifier = Modifier.weight(1f),
-            )
-        }
-        peakUsage?.takeIf { usage -> usage.totalTimeMillis > 0L }?.let { usage ->
-            MetricTile(
-                label = text.peakDay,
-                value = "${formatStatsDateLabel(usage.dayStartMillis)} · ${formatDuration(usage.totalTimeMillis)}",
-                modifier = Modifier.fillMaxWidth(),
+            Text(
+                text = if (korean) "폰 쉼" else "ScreenRest",
+                style = MaterialTheme.typography.headlineLarge,
+                fontWeight = FontWeight.Bold,
+                color = ScreenRestPalette.Navy,
             )
         }
-        if (topApp != null) {
-            AppRow(
-                appName = topApp.appName,
-                packageName = topApp.packageName,
-                supportingText = "",
-                trailingContent = {
-                    LimitTimeChip(formatDuration(topApp.totalTimeMillis))
-                },
-            )
-        } else {
-            Text(text.noStats, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (profileName.isNotBlank()) {
+            Surface(
+                onClick = onProfileClick,
+                shape = RoundedCornerShape(ScreenRestTheme.radii.button),
+                color = ScreenRestPalette.CobaltSoft,
+                border = BorderStroke(1.dp, ScreenRestPalette.Cobalt.copy(alpha = 0.18f)),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_more_account),
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                        tint = ScreenRestPalette.Cobalt,
+                    )
+                    Text(
+                        text = profileName,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = ScreenRestPalette.Navy,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Icon(
+                        painter = painterResource(R.drawable.ic_chevron_right),
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun DailyTrendCard(
-    dailyUsage: List<DailyUsageInfo>,
+private fun TodayUsageSummaryCard(
+    uiState: SafeModeUiState,
     text: AppStrings,
+    onRefreshUsageStats: () -> Unit,
 ) {
-    val hasDailyUsageData = dailyUsage.any { usage -> usage.totalTimeMillis > 0L }
-    val recordedDayCount = dailyUsage.count { usage -> usage.hasRecordedData }
-    val maxUsageMillis = dailyUsage.maxOfOrNull { usage -> usage.totalTimeMillis }?.coerceAtLeast(1L) ?: 1L
-    val listState = rememberLazyListState()
-
-    LaunchedEffect(dailyUsage.size, hasDailyUsageData) {
-        if (hasDailyUsageData) {
-            listState.scrollToItem((dailyUsage.lastIndex - 6).coerceAtLeast(0))
-        }
+    val korean = text.appLanguage == AppLanguage.Korean
+    val summary = uiState.policySummary
+    val availableMinutes = (summary.totalLimitMinutes + summary.totalExtraMinutes).coerceAtLeast(0)
+    val remainingMinutes = (availableMinutes - summary.totalUsedMinutes).coerceAtLeast(0)
+    val progress = if (summary.totalLimitEnabled && availableMinutes > 0) {
+        summary.totalUsedMinutes.toFloat().div(availableMinutes).coerceIn(0f, 1f)
+    } else {
+        0f
     }
-
-    SimpleCard {
+    ScreenRestCard(
+        tone = when (summary.totalStatus) {
+            LimitStatus.Normal -> ScreenRestTone.Success
+            LimitStatus.Warning -> ScreenRestTone.Warning
+            LimitStatus.Exceeded -> ScreenRestTone.Blocked
+        },
+    ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md),
         ) {
-            SectionTitle(text.dailyTrend, Modifier.weight(1f))
-            Text(
-                text.recordedDaysLabel(recordedDayCount, dailyUsage.size),
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.Bold,
+            MoreMenuIcon(R.drawable.ic_family_clock, ScreenRestTone.Success)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (summary.totalLimitEnabled) {
+                        if (korean) {
+                            "${formatLimitMinutesLabel(summary.actualTotalUsedMinutes)} 사용 · ${formatLimitMinutesLabel(remainingMinutes)} 남음"
+                        } else {
+                            "${formatLimitMinutesLabel(summary.actualTotalUsedMinutes)} used · ${formatLimitMinutesLabel(remainingMinutes)} left"
+                        }
+                    } else {
+                        if (korean) "${formatLimitMinutesLabel(summary.actualTotalUsedMinutes)} 사용" else "${formatLimitMinutesLabel(summary.actualTotalUsedMinutes)} used"
+                    },
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = if (summary.totalLimitEnabled) {
+                        if (korean) "오늘 ${formatLimitMinutesLabel(availableMinutes)}" else "Today ${formatLimitMinutesLabel(availableMinutes)}"
+                    } else {
+                        text.noLimit
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = onRefreshUsageStats, enabled = uiState.hasUsageAccess) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_family_sync),
+                    contentDescription = if (korean) "사용량 새로고침" else "Refresh usage",
+                    tint = ScreenRestPalette.Teal,
+                )
+            }
+        }
+        if (summary.totalLimitEnabled) {
+            FamilyUsageProgress(
+                progress = progress,
+                tone = when (summary.totalStatus) {
+                    LimitStatus.Normal -> ScreenRestTone.Success
+                    LimitStatus.Warning -> ScreenRestTone.Warning
+                    LimitStatus.Exceeded -> ScreenRestTone.Blocked
+                },
             )
         }
-        if (!hasDailyUsageData) {
-            Text(text.noStats, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(220.dp)
-                    .clip(RoundedCornerShape(22.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f))
-                    .padding(horizontal = 14.dp, vertical = 14.dp),
-            ) {
-                LazyRow(
-                    state = listState,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.Bottom,
-                    modifier = Modifier.fillMaxSize(),
-                ) {
-                    items(dailyUsage, key = { usage -> usage.dayStartMillis }) { usage ->
-                        DailyUsageBar(
-                            usage = usage,
-                            maxUsageMillis = maxUsageMillis,
+        if (summary.actualTotalUsedMinutes != summary.totalUsedMinutes) {
+            Text(
+                text = if (korean) {
+                    "제한에 계산된 사용량 ${formatLimitMinutesLabel(summary.totalUsedMinutes)}"
+                } else {
+                    "${formatLimitMinutesLabel(summary.totalUsedMinutes)} counted toward limits"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Text(
+            text = if (uiState.usageAccessChecking) text.updating else usageLastUpdatedLabel(uiState.usageLastUpdatedAtMillis, text),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+private data class TodayRuleItem(
+    val title: String,
+    val value: String,
+    val iconRes: Int,
+    val tone: ScreenRestTone,
+)
+
+private fun todayRuleItems(summary: PolicySummary, text: AppStrings): List<TodayRuleItem> {
+    val korean = text.appLanguage == AppLanguage.Korean
+    return buildList {
+        if (summary.dailyPolicyEnabled && summary.totalLimitEnabled) {
+            add(
+                TodayRuleItem(
+                    title = if (korean) "요일별 제한" else "Daily limit",
+                    value = formatLimitMinutesLabel((summary.totalLimitMinutes + summary.totalExtraMinutes).coerceAtLeast(0)),
+                    iconRes = R.drawable.ic_nav_today,
+                    tone = ScreenRestTone.Primary,
+                ),
+            )
+        }
+        val activeGroups = summary.groupSummaries.count { it.limitConfigured && it.activeToday }
+        if (activeGroups > 0) {
+            add(
+                TodayRuleItem(
+                    title = if (korean) "앱 그룹" else "App groups",
+                    value = if (korean) "${activeGroups}개 적용" else "$activeGroups active",
+                    iconRes = R.drawable.ic_nav_rules,
+                    tone = ScreenRestTone.Warning,
+                ),
+            )
+        }
+        val activeAppLimits = summary.appLimitSummaries.count { it.activeToday && !it.excludedFromRestrictions }
+        if (activeAppLimits > 0) {
+            add(
+                TodayRuleItem(
+                    title = if (korean) "앱별 제한" else "App limits",
+                    value = if (korean) "${activeAppLimits}개 적용" else "$activeAppLimits active",
+                    iconRes = R.drawable.ic_family_device,
+                    tone = ScreenRestTone.Primary,
+                ),
+            )
+        }
+        summary.activeScheduleSummary?.let { schedule ->
+            add(
+                TodayRuleItem(
+                    title = schedule.name.ifBlank { if (korean) "스케줄" else "Schedule" },
+                    value = if (korean) "허용 앱 ${schedule.allowedAppCount}개" else "${schedule.allowedAppCount} allowed apps",
+                    iconRes = R.drawable.ic_family_clock,
+                    tone = ScreenRestTone.Schedule,
+                ),
+            )
+        }
+        if (summary.activeScheduleSummary == null && summary.allowOnlyModeEnabled) {
+            add(
+                TodayRuleItem(
+                    title = if (korean) "허용앱만" else "Allow-only",
+                    value = if (korean) "허용 앱 ${summary.allowOnlyAllowedAppCount}개" else "${summary.allowOnlyAllowedAppCount} allowed apps",
+                    iconRes = R.drawable.ic_more_protection,
+                    tone = ScreenRestTone.Success,
+                ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun TodayActiveRulesCard(
+    summary: PolicySummary,
+    rulesActive: Boolean,
+    text: AppStrings,
+    onOpenRules: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val items = if (rulesActive) todayRuleItems(summary, text) else emptyList()
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm)) {
+        FamilySectionTitle(if (korean) "현재 적용 중" else "Active now")
+        ScreenRestCard(contentPadding = PaddingValues(vertical = ScreenRestTheme.spacing.xs)) {
+            if (items.isEmpty()) {
+                ScreenRestListRow(
+                    title = if (rulesActive) {
+                        if (korean) "적용 중인 규칙 없음" else "No active rules"
+                    } else {
+                        if (korean) "현재 규칙이 적용되지 않음" else "Rules are not currently applied"
+                    },
+                    supportingText = if (rulesActive) {
+                        if (korean) "필요할 때 규칙을 설정할 수 있습니다" else "Set a rule whenever you need one"
+                    } else {
+                        if (korean) "보호 상태를 확인하세요" else "Review protection status"
+                    },
+                    onClick = onOpenRules,
+                    leading = { MoreMenuIcon(R.drawable.ic_nav_rules, ScreenRestTone.Neutral) },
+                    trailing = { MoreChevron() },
+                )
+            } else {
+                items.forEachIndexed { index, item ->
+                    ScreenRestListRow(
+                        title = item.title,
+                        onClick = onOpenRules,
+                        leading = { MoreMenuIcon(item.iconRes, item.tone) },
+                        trailing = {
+                            Text(
+                                text = item.value,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                            )
+                            MoreChevron()
+                        },
+                    )
+                    if (index != items.lastIndex) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(1.dp)
+                                .background(ScreenRestTheme.colors.divider),
                         )
                     }
                 }
@@ -2457,59 +2932,548 @@ private fun DailyTrendCard(
 }
 
 @Composable
-private fun DailyUsageBar(
+private fun TodayFamilyRequestCard(
+    parentState: ParentManagementState,
+    text: AppStrings,
+    onOpenFamily: () -> Unit,
+) {
+    val connected = parentState.paired || parentState.linkedChildDevices.isNotEmpty() || parentState.linkedParentDevices.isNotEmpty()
+    if (!connected) return
+    val korean = text.appLanguage == AppLanguage.Korean
+    val request = when (parentState.deviceRole) {
+        ParentDeviceRole.Parent -> parentState.remoteUnlockRequests
+            .filter { it.status == RemoteUnlockRequestStatus.Pending }
+            .maxByOrNull { it.createdAtMillis }
+        ParentDeviceRole.Child -> parentState.remoteUnlockRequests.maxByOrNull { it.createdAtMillis }
+    } ?: return
+    val title = when (parentState.deviceRole) {
+        ParentDeviceRole.Parent -> if (korean) {
+            "${request.childDeviceName.ifBlank { request.targetAppName }}의 요청"
+        } else {
+            "Request from ${request.childDeviceName.ifBlank { request.targetAppName }}"
+        }
+        ParentDeviceRole.Child -> if (korean) "보낸 요청 ${familyRequestStatusLabel(request.status, true)}" else "Sent request ${familyRequestStatusLabel(request.status, false)}"
+    }
+    val detail = if (korean) {
+        "${request.targetAppName.ifBlank { request.remoteRequestTitle(text) }} · ${formatLimitMinutesLabel(request.requestedMinutes)} 요청"
+    } else {
+        "${request.targetAppName.ifBlank { request.remoteRequestTitle(text) }} · ${formatLimitMinutesLabel(request.requestedMinutes)} requested"
+    }
+    ScreenRestCard(tone = ScreenRestTone.Warning) {
+        ScreenRestListRow(
+            title = title,
+            supportingText = detail,
+            onClick = onOpenFamily,
+            leading = { MoreMenuIcon(R.drawable.ic_family_clock, ScreenRestTone.Warning) },
+            trailing = {
+                Text(
+                    text = if (korean) "요청 보기" else "View",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = ScreenRestPalette.Amber,
+                )
+                MoreChevron()
+            },
+        )
+    }
+}
+
+@Composable
+private fun TodayTopAppsCard(
+    hasUsageAccess: Boolean,
+    usageAccessChecking: Boolean,
+    lastUpdatedAtMillis: Long,
+    todayUsage: List<AppUsageInfo>,
+    policySummary: PolicySummary,
+    text: AppStrings,
+    onRefreshUsageStats: () -> Unit,
+    onOpenStatistics: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            FamilySectionTitle(if (korean) "오늘 많이 사용한 앱" else "Most used today")
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = onRefreshUsageStats, enabled = hasUsageAccess) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_family_sync),
+                    contentDescription = if (korean) "새로고침" else "Refresh",
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+        ScreenRestCard(contentPadding = PaddingValues(horizontal = ScreenRestTheme.spacing.md, vertical = ScreenRestTheme.spacing.xs)) {
+            when {
+                usageAccessChecking && hasUsageAccess -> Text(
+                    text = text.updating,
+                    modifier = Modifier.padding(vertical = ScreenRestTheme.spacing.lg),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                !hasUsageAccess -> Text(
+                    text = text.usageAccessRequired,
+                    modifier = Modifier.padding(vertical = ScreenRestTheme.spacing.md),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                todayUsage.isEmpty() -> Text(
+                    text = text.noUsageRecorded,
+                    modifier = Modifier.padding(vertical = ScreenRestTheme.spacing.md),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                else -> todayUsage.take(5).forEachIndexed { index, appUsage ->
+                    ScreenRestListRow(
+                        title = appUsage.appName,
+                        supportingText = if (index == 0) {
+                            if (korean) "오늘 가장 많이 사용" else "Most used today"
+                        } else {
+                            null
+                        },
+                        leading = {
+                            AppIcon(
+                                packageName = appUsage.packageName,
+                                contentDescription = appUsage.appName,
+                                size = 40.dp,
+                            )
+                        },
+                        trailing = {
+                            Text(
+                                text = formatDuration(appUsage.totalTimeMillis),
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                color = policySummary.statusForPackage(appUsage.packageName).semanticColor(),
+                            )
+                        },
+                    )
+                    if (index != todayUsage.take(5).lastIndex) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(1.dp)
+                                .background(ScreenRestTheme.colors.divider),
+                        )
+                    }
+                }
+            }
+            if (todayUsage.size > 5) {
+                TextButton(
+                    onClick = onOpenStatistics,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = if (korean) "전체 앱은 통계에서 보기" else "View all apps in Statistics",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Start,
+                    )
+                    MoreChevron()
+                }
+            }
+            Text(
+                text = if (usageAccessChecking) text.updating else usageLastUpdatedLabel(lastUpdatedAtMillis, text),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+fun StatisticsContent(
+    uiState: SafeModeUiState,
+    parentAccountAuthState: ParentAccountAuthState,
+    text: AppStrings,
+    isExpanded: Boolean,
+    onOpenFamily: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var selectedRange by rememberSaveable { mutableStateOf(StatisticsDisplayRange.SevenDays) }
+    val dayCount = selectedRange.dayCount
+    val selectedDailyUsage = uiState.usageStatistics.dailyUsage.takeLast(dayCount)
+    val selectedTopApps = when (selectedRange) {
+        StatisticsDisplayRange.SevenDays -> uiState.usageStatistics.topApps.sevenDays
+        StatisticsDisplayRange.ThirtyDays -> uiState.usageStatistics.topApps.thirtyDays
+    }
+    val profileName = screenProfileName(
+        parentState = uiState.parentManagementState,
+        authState = parentAccountAuthState,
+    )
+
+    Box(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        Column(
+            modifier = if (isExpanded) Modifier.fillMaxWidth(0.82f) else Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.lg),
+        ) {
+            ScreenRestPageHeader(
+                title = if (korean) "사용 흐름" else "Usage trends",
+                trailing = {
+                    if (profileName.isNotBlank()) {
+                        CompactProfilePill(
+                            profileName = profileName,
+                            onClick = onOpenFamily,
+                        )
+                    }
+                },
+            )
+            StatisticsRangeSelector(
+                selectedRange = selectedRange,
+                onRangeSelected = { selectedRange = it },
+                korean = korean,
+            )
+            StatisticsFlowCard(
+                dailyUsage = selectedDailyUsage,
+                previousDailyUsage = uiState.usageStatistics.dailyUsage
+                    .dropLast(dayCount)
+                    .takeLast(dayCount),
+                selectedRange = selectedRange,
+                text = text,
+            )
+            StatisticsTopAppsCard(
+                topApps = selectedTopApps,
+                policySummary = uiState.policySummary,
+                text = text,
+            )
+            GroupStatsCard(
+                groupSummaries = uiState.policySummary.groupSummaries,
+                text = text,
+            )
+            Text(
+                text = if (uiState.statisticsRefreshing) {
+                    text.updating
+                } else {
+                    usageLastUpdatedLabel(uiState.statisticsLastUpdatedAtMillis, text)
+                },
+                modifier = Modifier.padding(horizontal = ScreenRestTheme.spacing.xs),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+private enum class StatisticsDisplayRange(val dayCount: Int) {
+    SevenDays(7),
+    ThirtyDays(30),
+}
+
+@Composable
+private fun StatisticsRangeSelector(
+    selectedRange: StatisticsDisplayRange,
+    onRangeSelected: (StatisticsDisplayRange) -> Unit,
+    korean: Boolean,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(ScreenRestTheme.radii.button),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(modifier = Modifier.padding(4.dp)) {
+            StatisticsDisplayRange.entries.forEach { range ->
+                val selected = range == selectedRange
+                Surface(
+                    onClick = { onRangeSelected(range) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp),
+                    shape = RoundedCornerShape(ScreenRestTheme.radii.button - 4.dp),
+                    color = if (selected) ScreenRestPalette.Cobalt else Color.Transparent,
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            text = when (range) {
+                                StatisticsDisplayRange.SevenDays -> if (korean) "7일" else "7 days"
+                                StatisticsDisplayRange.ThirtyDays -> if (korean) "30일" else "30 days"
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatisticsFlowCard(
+    dailyUsage: List<DailyUsageInfo>,
+    previousDailyUsage: List<DailyUsageInfo>,
+    selectedRange: StatisticsDisplayRange,
+    text: AppStrings,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val recordedDailyUsage = dailyUsage.filter { usage -> usage.hasRecordedData }
+    val averageMillis = if (recordedDailyUsage.isNotEmpty()) {
+        recordedDailyUsage.sumOf { usage -> usage.totalTimeMillis } / recordedDailyUsage.size
+    } else {
+        0L
+    }
+    val previousRecordedUsage = previousDailyUsage.filter { usage -> usage.hasRecordedData }
+    val previousAverageMillis = previousRecordedUsage
+        .takeIf { values -> values.isNotEmpty() }
+        ?.let { values -> values.sumOf { usage -> usage.totalTimeMillis } / values.size }
+    val averageDifferenceMillis = previousAverageMillis?.let { previous -> averageMillis - previous }
+    val comparisonColor = when {
+        averageDifferenceMillis == null -> MaterialTheme.colorScheme.onSurfaceVariant
+        averageDifferenceMillis <= 0L -> ScreenRestPalette.Teal
+        else -> ScreenRestPalette.Coral
+    }
+    val comparisonLabel = when {
+        averageDifferenceMillis == null -> if (korean) {
+            "비교할 이전 기록이 아직 없어요"
+        } else {
+            "No earlier period to compare yet"
+        }
+        averageDifferenceMillis == 0L -> if (korean) "이전 기간과 같아요" else "Same as the previous period"
+        averageDifferenceMillis < 0L -> if (korean) {
+            "이전 기간보다 ${formatDuration(abs(averageDifferenceMillis))} 줄었어요"
+        } else {
+            "${formatDuration(abs(averageDifferenceMillis))} less than the previous period"
+        }
+        else -> if (korean) {
+            "이전 기간보다 ${formatDuration(averageDifferenceMillis)} 늘었어요"
+        } else {
+            "${formatDuration(averageDifferenceMillis)} more than the previous period"
+        }
+    }
+
+    ScreenRestCard(contentPadding = PaddingValues(ScreenRestTheme.spacing.lg)) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs),
+        ) {
+            Text(
+                text = when (selectedRange) {
+                    StatisticsDisplayRange.SevenDays -> if (korean) "최근 7일 평균" else "7-day average"
+                    StatisticsDisplayRange.ThirtyDays -> if (korean) "최근 30일 평균" else "30-day average"
+                },
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = if (recordedDailyUsage.isEmpty()) "—" else formatDuration(averageMillis),
+                style = MaterialTheme.typography.displaySmall,
+                fontWeight = FontWeight.Bold,
+                color = ScreenRestPalette.Navy,
+            )
+            Text(
+                text = comparisonLabel,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = comparisonColor,
+            )
+        }
+        StatisticsDailyTrendChart(
+            dailyUsage = dailyUsage,
+            text = text,
+        )
+        StatisticsGoalSummary(
+            dailyUsage = dailyUsage,
+            text = text,
+        )
+    }
+}
+
+@Composable
+private fun StatisticsDailyTrendChart(
+    dailyUsage: List<DailyUsageInfo>,
+    text: AppStrings,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val hasDailyUsageData = dailyUsage.any { usage -> usage.hasRecordedData }
+    val maxUsageMillis = dailyUsage.maxOfOrNull { usage ->
+        maxOf(usage.totalTimeMillis, (usage.dailyGoalMinutes ?: 0) * 60_000L)
+    }?.coerceAtLeast(1L) ?: 1L
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(dailyUsage.size, hasDailyUsageData) {
+        if (hasDailyUsageData && dailyUsage.size > 7) {
+            listState.scrollToItem((dailyUsage.lastIndex - 6).coerceAtLeast(0))
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = if (korean) "일별 사용" else "Daily use",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = ScreenRestPalette.Navy,
+            )
+            if (dailyUsage.size > 7) {
+                Text(
+                    text = if (korean) "좌우로 움직여 보세요" else "Swipe to see more",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (!hasDailyUsageData) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(180.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(text.noStats, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else {
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(220.dp),
+            ) {
+                val spacing = 6.dp
+                val itemWidth = if (dailyUsage.size <= 7) {
+                    ((maxWidth - spacing * (dailyUsage.size - 1).coerceAtLeast(0)) /
+                        dailyUsage.size.coerceAtLeast(1)).coerceAtLeast(38.dp)
+                } else {
+                    46.dp
+                }
+                LazyRow(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalArrangement = Arrangement.spacedBy(spacing),
+                    verticalAlignment = Alignment.Bottom,
+                ) {
+                    items(dailyUsage, key = { usage -> usage.dayStartMillis }) { usage ->
+                        StatisticsDailyUsageBar(
+                            usage = usage,
+                            maxUsageMillis = maxUsageMillis,
+                            itemWidth = itemWidth,
+                        )
+                    }
+                }
+            }
+        }
+        StatisticsDailyTrendLegend(korean = korean)
+    }
+}
+
+@Composable
+private fun StatisticsDailyTrendLegend(korean: Boolean) {
+    val noGoalColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        StatisticsDailyTrendLegendItem(
+            color = ScreenRestPalette.Teal,
+            label = if (korean) "목표 이내" else "Within goal",
+        )
+        StatisticsDailyTrendLegendItem(
+            color = ScreenRestPalette.Amber,
+            label = if (korean) "목표 임박" else "Near goal",
+        )
+        StatisticsDailyTrendLegendItem(
+            color = ScreenRestPalette.Coral,
+            label = if (korean) "목표 초과" else "Over goal",
+        )
+        StatisticsDailyTrendLegendItem(
+            color = noGoalColor,
+            label = if (korean) "목표·기록 없음" else "No goal/data",
+        )
+    }
+}
+
+@Composable
+private fun StatisticsDailyTrendLegendItem(
+    color: Color,
+    label: String,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(color),
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun StatisticsDailyUsageBar(
     usage: DailyUsageInfo,
     maxUsageMillis: Long,
+    itemWidth: androidx.compose.ui.unit.Dp,
 ) {
-    val fraction = if (maxUsageMillis <= 0L) {
-        0f
-    } else {
+    val fraction = if (maxUsageMillis <= 0L) 0f else {
         (usage.totalTimeMillis.toFloat() / maxUsageMillis.toFloat()).coerceIn(0f, 1f)
     }
     val animatedFraction by animateFloatAsState(
         targetValue = fraction,
         animationSpec = tween(durationMillis = 450),
-        label = "dailyUsageBar",
+        label = "statisticsDailyUsageBar",
     )
-    val isToday = isToday(usage.dayStartMillis)
-    val barColor = if (usage.hasRecordedData) {
-        usageIntensityColor(fraction)
-    } else {
-        MaterialTheme.colorScheme.outlineVariant
+    val today = isToday(usage.dayStartMillis)
+    val goalMillis = usage.dailyGoalMinutes?.times(60_000L)
+    val goalFraction = if (goalMillis == null || goalMillis <= 0L) null else {
+        usage.totalTimeMillis.toFloat() / goalMillis.toFloat()
     }
-    val labelColor = if (isToday) {
-        MaterialTheme.colorScheme.primary
-    } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
+    val noGoalColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+    val barColor = when {
+        !usage.hasRecordedData -> noGoalColor
+        !usage.hasRecordedGoal || goalMillis == null -> noGoalColor
+        usage.totalTimeMillis > goalMillis -> ScreenRestPalette.Coral
+        goalFraction != null && goalFraction >= 0.85f -> ScreenRestPalette.Amber
+        else -> ScreenRestPalette.Teal
     }
-    val barHeight = (132.dp * animatedFraction).coerceAtLeast(8.dp)
+    val labelColor = if (today) ScreenRestPalette.Cobalt else MaterialTheme.colorScheme.onSurfaceVariant
+    val barHeight = (126.dp * animatedFraction).coerceAtLeast(if (usage.hasRecordedData) 7.dp else 3.dp)
 
     Column(
-        modifier = Modifier.width(54.dp),
+        modifier = Modifier.width(itemWidth),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Bottom,
     ) {
         Text(
-            if (usage.hasRecordedData) formatDuration(usage.totalTimeMillis) else "—",
+            text = if (usage.hasRecordedData) {
+                formatDuration(usage.totalTimeMillis).replace(" ", "\n")
+            } else {
+                "—"
+            },
             style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Bold,
+            fontWeight = FontWeight.SemiBold,
             color = labelColor,
-            maxLines = 1,
+            maxLines = 2,
             overflow = TextOverflow.Clip,
+            textAlign = TextAlign.Center,
         )
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
         Box(
             modifier = Modifier
-                .width(22.dp)
-                .height(136.dp),
+                .width(24.dp)
+                .height(132.dp),
             contentAlignment = Alignment.BottomCenter,
         ) {
             Box(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .height(132.dp)
+                    .fillMaxSize()
                     .clip(RoundedCornerShape(50))
-                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.72f)),
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
             )
             Box(
                 modifier = Modifier
@@ -2519,82 +3483,163 @@ private fun DailyUsageBar(
                     .background(barColor),
             )
         }
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
         Text(
-            formatStatsWeekdayLabel(usage.dayStartMillis),
+            text = formatStatsWeekdayLabel(usage.dayStartMillis),
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Bold,
             color = labelColor,
             maxLines = 1,
         )
         Text(
-            formatStatsDateLabel(usage.dayStartMillis),
+            text = formatStatsDateLabel(usage.dayStartMillis),
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = labelColor,
             maxLines = 1,
         )
     }
 }
 
-private fun usageIntensityColor(fraction: Float): Color {
-    return when {
-        fraction < 0.25f -> Color(0xFF2F80ED)
-        fraction < 0.50f -> AppSafe
-        fraction < 0.75f -> AppWarn
-        else -> AppOver
+@Composable
+private fun StatisticsGoalSummary(
+    dailyUsage: List<DailyUsageInfo>,
+    text: AppStrings,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val goalDays = dailyUsage.filter { usage ->
+        usage.hasRecordedData && usage.hasRecordedGoal && usage.dailyGoalMinutes != null
     }
-}
-
-private enum class TopAppsStatsRange {
-    OneDay,
-    SevenDays,
-    ThirtyDays,
-}
-
-private fun TopAppsUsageSet.appsFor(range: TopAppsStatsRange): List<AppUsageInfo> {
-    return when (range) {
-        TopAppsStatsRange.OneDay -> oneDay
-        TopAppsStatsRange.SevenDays -> sevenDays
-        TopAppsStatsRange.ThirtyDays -> thirtyDays
+    if (goalDays.isEmpty()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(ScreenRestTheme.radii.button))
+                .background(ScreenRestPalette.CobaltSoft.copy(alpha = 0.48f))
+                .padding(ScreenRestTheme.spacing.md),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+        ) {
+            MoreMenuIcon(R.drawable.ic_nav_statistics, ScreenRestTone.Primary)
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = if (korean) "날짜별 목표 기록을 시작했어요" else "Daily goal tracking has started",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = ScreenRestPalette.Navy,
+                )
+                Text(
+                    text = if (korean) {
+                        "기록된 목표가 있는 날부터 달성 결과를 보여드립니다."
+                    } else {
+                        "Results appear only for days with a recorded goal."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    } else {
+        val withinGoalCount = goalDays.count { usage ->
+            usage.totalTimeMillis <= (usage.dailyGoalMinutes ?: 0) * 60_000L
+        }
+        val exceededGoalCount = goalDays.size - withinGoalCount
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(ScreenRestTheme.radii.button))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.52f))
+                .padding(vertical = ScreenRestTheme.spacing.md),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            StatisticsGoalMetric(
+                label = if (korean) "목표 안에서 사용" else "Within goal",
+                value = if (korean) "${withinGoalCount}일" else "$withinGoalCount days",
+                tone = ScreenRestTone.Success,
+                iconRes = R.drawable.ic_family_clock,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .height(54.dp)
+                    .background(ScreenRestTheme.colors.divider),
+            )
+            StatisticsGoalMetric(
+                label = if (korean) "목표 초과" else "Over goal",
+                value = if (korean) "${exceededGoalCount}일" else "$exceededGoalCount days",
+                tone = ScreenRestTone.Blocked,
+                iconRes = R.drawable.ic_family_block,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Text(
+            text = if (korean) {
+                "목표 기록 ${goalDays.size}일 기준"
+            } else {
+                "Based on ${goalDays.size} days with recorded goals"
+            },
+            modifier = Modifier.fillMaxWidth(),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
 @Composable
-private fun TopAppsStatsCard(
-    topApps: TopAppsUsageSet,
+private fun StatisticsGoalMetric(
+    label: String,
+    value: String,
+    tone: ScreenRestTone,
+    iconRes: Int,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier.padding(horizontal = ScreenRestTheme.spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+    ) {
+        MoreMenuIcon(iconRes = iconRes, tone = tone)
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                color = tone.contentColor(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatisticsTopAppsCard(
+    topApps: List<AppUsageInfo>,
     policySummary: PolicySummary,
     text: AppStrings,
 ) {
-    var selectedRange by remember { mutableStateOf(TopAppsStatsRange.OneDay) }
-    val selectedTopApps = topApps.appsFor(selectedRange)
-    val topUsageMillis = selectedTopApps.firstOrNull()?.totalTimeMillis?.coerceAtLeast(1L) ?: 1L
+    val korean = text.appLanguage == AppLanguage.Korean
+    val topUsageMillis = topApps.firstOrNull()?.totalTimeMillis?.coerceAtLeast(1L) ?: 1L
 
-    SimpleCard {
-        SectionTitle(text.topApps)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            AppFilterChip(text.statsRangeOneDay, selectedRange == TopAppsStatsRange.OneDay) {
-                selectedRange = TopAppsStatsRange.OneDay
-            }
-            AppFilterChip(text.statsRangeSevenDays, selectedRange == TopAppsStatsRange.SevenDays) {
-                selectedRange = TopAppsStatsRange.SevenDays
-            }
-            AppFilterChip(text.statsRangeThirtyDays, selectedRange == TopAppsStatsRange.ThirtyDays) {
-                selectedRange = TopAppsStatsRange.ThirtyDays
-            }
-        }
-        if (selectedTopApps.isEmpty()) {
+    ScreenRestCard {
+        ScreenRestSectionHeader(
+            title = if (korean) "많이 사용한 앱" else "Most used apps",
+            supportingText = if (korean) "아래 목록을 스크롤해 더 볼 수 있습니다." else "Scroll the list to see more.",
+        )
+        if (topApps.isEmpty()) {
             Text(text.noStats, color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else {
             ContainedLazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(max = 430.dp),
-                resetKey = selectedRange to selectedTopApps.map { usage -> usage.packageName },
+                resetKey = topApps.map { usage -> usage.packageName },
             ) {
-                items(selectedTopApps, key = { appUsage -> appUsage.packageName }) { appUsage ->
+                items(topApps, key = { appUsage -> appUsage.packageName }) { appUsage ->
                     UsageListRow(
                         appUsage = appUsage,
                         topUsageMillis = topUsageMillis,
@@ -2611,11 +3656,34 @@ private fun GroupStatsCard(
     groupSummaries: List<AppGroupSummary>,
     text: AppStrings,
 ) {
-    SimpleCard {
-        SectionTitle(text.groupStats)
-        if (groupSummaries.isEmpty()) {
-            Text(text.noStats, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    ScreenRestCard {
+        ScreenRestSectionHeader(
+            title = text.groupStats,
+            supportingText = if (groupSummaries.isEmpty()) {
+                text.noStats
+            } else if (korean) {
+                "${groupSummaries.size}개 그룹"
+            } else {
+                "${groupSummaries.size} groups"
+            },
+            action = if (groupSummaries.isEmpty()) null else {
+                {
+                    TextButton(onClick = { expanded = !expanded }) {
+                        Text(
+                            text = if (expanded) {
+                                if (korean) "접기" else "Collapse"
+                            } else {
+                                if (korean) "보기" else "View"
+                            },
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+            },
+        )
+        if (groupSummaries.isNotEmpty() && expanded) {
             groupSummaries.forEach { groupSummary ->
                 ProgressLine(
                     label = groupSummary.groupName.ifBlank { text.groupName },
@@ -3015,6 +4083,798 @@ fun LimitStatus.semanticColor(): Color {
     }
 }
 
+private data class MoreMenuItem(
+    val title: String,
+    val description: String,
+    val iconRes: Int,
+    val tone: ScreenRestTone,
+    val destination: MoreDestination,
+)
+
+@Composable
+private fun MoreContent(
+    destination: MoreDestination,
+    onDestinationChanged: (MoreDestination) -> Unit,
+    layoutMode: ScreenLayoutMode,
+    onLayoutModeChanged: (ScreenLayoutMode) -> Unit,
+    uiState: SafeModeUiState,
+    parentAccountAuthState: ParentAccountAuthState,
+    safeRecoveryAdminPin: String,
+    text: AppStrings,
+    isExpanded: Boolean,
+    onSafeModeChanged: (Boolean) -> Unit,
+    onSafeModeEnableWithPin: (String) -> Unit,
+    onSafeModePinStatusSeen: () -> Unit,
+    onPolicyEnforcementChanged: (Boolean) -> Unit,
+    onPolicyEnforcementDisableWithPin: (String) -> Unit,
+    onOpenBlockScreenPreview: (BlockDecisionResult) -> Unit,
+    onSafeRecoveryPinChanged: (String) -> Unit,
+    onSafeRecoveryClick: () -> Unit,
+    onAppLanguageChanged: (AppLanguage) -> Unit,
+    onWarningNotificationsChanged: (Boolean) -> Unit,
+    onLimitNotificationsChanged: (Boolean) -> Unit,
+    onOpenUsageAccessSettings: () -> Unit,
+    onOpenOverlaySettings: () -> Unit,
+    onOpenNotificationAccessSettings: () -> Unit,
+    onOpenExactAlarmSettings: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onUpdateAdminPin: (String, String) -> Unit,
+    onPinInputChanged: () -> Unit,
+    onParentGoogleSignIn: () -> Unit,
+    onDeleteAccountAndCloudData: (String) -> Unit,
+    onClearEventLog: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    when (destination) {
+        MoreDestination.Home -> MoreHomeContent(
+            uiState = uiState,
+            parentAccountAuthState = parentAccountAuthState,
+            text = text,
+            onDestinationChanged = onDestinationChanged,
+            layoutMode = layoutMode,
+            onLayoutModeChanged = onLayoutModeChanged,
+        )
+
+        MoreDestination.ProtectionStatus -> Column(
+            verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md),
+        ) {
+            MoreDetailHeader(
+                title = if (korean) "보호 상태" else "Protection status",
+                subtitle = if (korean) "차단 준비 상태와 보호 작동을 확인합니다" else "Review protection and blocking readiness",
+                onBack = { onDestinationChanged(MoreDestination.Home) },
+            )
+            SafetyContent(
+                uiState = uiState,
+                safeRecoveryAdminPin = safeRecoveryAdminPin,
+                text = text,
+                isExpanded = isExpanded,
+                onSafeModeChanged = onSafeModeChanged,
+                onSafeModeEnableWithPin = onSafeModeEnableWithPin,
+                onSafeModePinStatusSeen = onSafeModePinStatusSeen,
+                onPolicyEnforcementChanged = onPolicyEnforcementChanged,
+                onPolicyEnforcementDisableWithPin = onPolicyEnforcementDisableWithPin,
+                onOpenBlockScreenPreview = onOpenBlockScreenPreview,
+                onSafeRecoveryPinChanged = onSafeRecoveryPinChanged,
+                onSafeRecoveryClick = onSafeRecoveryClick,
+            )
+        }
+
+        MoreDestination.AdminPin -> MoreAdminPinContent(
+            uiState = uiState,
+            text = text,
+            onBack = { onDestinationChanged(MoreDestination.Home) },
+            onUpdateAdminPin = onUpdateAdminPin,
+            onPinInputChanged = onPinInputChanged,
+        )
+
+        MoreDestination.EmergencyPass -> MoreEmergencyPassContent(
+            summary = uiState.policySummary,
+            text = text,
+            onBack = { onDestinationChanged(MoreDestination.Home) },
+        )
+
+        MoreDestination.Permissions -> Column(
+            verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md),
+        ) {
+            MoreDetailHeader(
+                title = if (korean) "권한 및 작동 상태" else "Permissions and operation",
+                subtitle = if (korean) "차단에 필요한 Android 권한을 확인합니다" else "Review Android permissions required for blocking",
+                onBack = { onDestinationChanged(MoreDestination.Home) },
+            )
+            PermissionSettingsSection(
+                readiness = uiState.blockingReadiness,
+                text = text,
+                onOpenUsageAccessSettings = onOpenUsageAccessSettings,
+                onOpenOverlaySettings = onOpenOverlaySettings,
+                onRequestNotificationPermission = onRequestNotificationPermission,
+                onOpenNotificationAccessSettings = onOpenNotificationAccessSettings,
+                onOpenExactAlarmSettings = onOpenExactAlarmSettings,
+            )
+        }
+
+        MoreDestination.Notifications -> MoreNotificationContent(
+            uiState = uiState,
+            text = text,
+            onBack = { onDestinationChanged(MoreDestination.Home) },
+            onWarningNotificationsChanged = onWarningNotificationsChanged,
+            onLimitNotificationsChanged = onLimitNotificationsChanged,
+        )
+
+        MoreDestination.Language -> MoreLanguageContent(
+            appLanguage = uiState.appLanguage,
+            text = text,
+            onBack = { onDestinationChanged(MoreDestination.Home) },
+            onAppLanguageChanged = onAppLanguageChanged,
+        )
+
+        MoreDestination.GoogleAccount -> MoreGoogleAccountContent(
+            parentState = uiState.parentManagementState,
+            authState = parentAccountAuthState,
+            text = text,
+            onBack = { onDestinationChanged(MoreDestination.Home) },
+            onParentGoogleSignIn = onParentGoogleSignIn,
+            onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
+        )
+
+        MoreDestination.Help -> MoreHelpContent(
+            text = text,
+            onBack = { onDestinationChanged(MoreDestination.Home) },
+        )
+
+        MoreDestination.Diagnostics -> Column(
+            verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md),
+        ) {
+            MoreDetailHeader(
+                title = if (korean) "진단 정보" else "Diagnostics",
+                subtitle = if (korean) "최근 앱 작동 기록을 확인합니다" else "Review recent app activity records",
+                onBack = { onDestinationChanged(MoreDestination.Home) },
+            )
+            EventLogSection(
+                eventLog = uiState.eventLog,
+                text = text,
+                onClearEventLog = onClearEventLog,
+            )
+            ScreenRestCard {
+                ScreenRestListRow(
+                    title = if (korean) "상세 작동 진단" else "Detailed operation diagnostics",
+                    supportingText = if (korean) "감시 서비스와 차단 판단은 보호 상태에서 확인합니다" else "Monitor and blocking diagnostics are available under Protection status",
+                    onClick = { onDestinationChanged(MoreDestination.ProtectionStatus) },
+                    leading = {
+                        MoreMenuIcon(R.drawable.ic_more_protection, ScreenRestTone.Primary)
+                    },
+                    trailing = { MoreChevron() },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScreenLayoutModePicker(
+    layoutMode: ScreenLayoutMode,
+    text: AppStrings,
+    onLayoutModeChanged: (ScreenLayoutMode) -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    ScreenRestCard {
+        ScreenRestSectionHeader(
+            title = if (korean) "화면 구성" else "Screen layout",
+            supportingText = if (korean) {
+                "탭 배치만 바뀝니다. 규칙과 사용 기록은 그대로 유지됩니다."
+            } else {
+                "Only navigation changes. Rules and usage history stay the same."
+            },
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs)) {
+            ChoiceButton(
+                label = if (korean) "새 구성" else "New layout",
+                selected = layoutMode == ScreenLayoutMode.Modern,
+                onClick = { onLayoutModeChanged(ScreenLayoutMode.Modern) },
+            )
+            ChoiceButton(
+                label = if (korean) "기존 탭 구성" else "Classic tabs",
+                selected = layoutMode == ScreenLayoutMode.Classic,
+                onClick = { onLayoutModeChanged(ScreenLayoutMode.Classic) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun MoreHomeContent(
+    uiState: SafeModeUiState,
+    parentAccountAuthState: ParentAccountAuthState,
+    text: AppStrings,
+    onDestinationChanged: (MoreDestination) -> Unit,
+    layoutMode: ScreenLayoutMode,
+    onLayoutModeChanged: (ScreenLayoutMode) -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val protectionReady = uiState.blockingReadiness.readyForBlocking &&
+        uiState.policyEnforcementEnabled &&
+        !uiState.safeModeEnabled
+    val protectionTitle = when {
+        uiState.safeModeEnabled -> if (korean) "보호 일시 중지" else "Protection paused"
+        !uiState.blockingReadiness.readyForBlocking -> if (korean) "확인 필요" else "Needs attention"
+        !uiState.policyEnforcementEnabled -> if (korean) "규칙 적용 꺼짐" else "Rules are off"
+        else -> if (korean) "정상 작동 중" else "Working normally"
+    }
+    val protectionDescription = when {
+        uiState.safeModeEnabled -> if (korean) "규칙은 보존되지만 현재 차단하지 않습니다" else "Rules are preserved, but blocking is paused"
+        !uiState.blockingReadiness.readyForBlocking -> if (korean) "필수 권한 또는 감시 상태를 확인해 주세요" else "Review required permissions or monitoring status"
+        !uiState.policyEnforcementEnabled -> if (korean) "저장된 규칙을 적용하지 않고 있습니다" else "Saved rules are not being enforced"
+        else -> if (korean) "저장된 규칙과 차단 기능이 작동하고 있습니다" else "Saved rules and blocking are active"
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md)) {
+        ScreenRestPageHeader(
+            title = if (korean) "더보기" else "More",
+            subtitle = if (korean) "보호 상태와 앱 설정을 관리합니다" else "Manage protection and app settings",
+        )
+
+        ScreenLayoutModePicker(
+            layoutMode = layoutMode,
+            text = text,
+            onLayoutModeChanged = onLayoutModeChanged,
+        )
+
+        ScreenRestCard(tone = if (protectionReady) ScreenRestTone.Success else ScreenRestTone.Warning) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+            ) {
+                MoreMenuIcon(
+                    iconRes = R.drawable.ic_more_protection,
+                    tone = if (protectionReady) ScreenRestTone.Success else ScreenRestTone.Warning,
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = protectionTitle,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = protectionDescription,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                ScreenRestStatusPill(
+                    label = if (protectionReady) {
+                        if (korean) "정상" else "Ready"
+                    } else {
+                        if (korean) "확인" else "Check"
+                    },
+                    tone = if (protectionReady) ScreenRestTone.Success else ScreenRestTone.Warning,
+                )
+            }
+            ScreenRestPrimaryButton(
+                label = if (korean) "상태 확인" else "View status",
+                onClick = { onDestinationChanged(MoreDestination.ProtectionStatus) },
+            )
+        }
+
+        MoreMenuGroup(
+            title = if (korean) "보호 및 보안" else "Protection and security",
+            items = listOf(
+                MoreMenuItem(
+                    title = if (korean) "관리 PIN" else "Admin PIN",
+                    description = if (korean) "설정 변경과 보호 기능 확인" else "Confirm settings and protection actions",
+                    iconRes = R.drawable.ic_more_pin,
+                    tone = ScreenRestTone.Primary,
+                    destination = MoreDestination.AdminPin,
+                ),
+                MoreMenuItem(
+                    title = if (korean) "긴급 사용권" else "Emergency Pass",
+                    description = if (korean) {
+                        "Emergency Pass · ${moreEmergencyPassSummary(uiState.policySummary, true)}"
+                    } else {
+                        moreEmergencyPassSummary(uiState.policySummary, false)
+                    },
+                    iconRes = R.drawable.ic_more_emergency,
+                    tone = ScreenRestTone.Warning,
+                    destination = MoreDestination.EmergencyPass,
+                ),
+                MoreMenuItem(
+                    title = if (korean) "권한 및 작동 상태" else "Permissions and operation",
+                    description = if (uiState.blockingReadiness.readyForBlocking) {
+                        if (korean) "필수 권한 준비됨" else "Required permissions ready"
+                    } else {
+                        if (korean) "확인이 필요한 항목이 있습니다" else "Some items need attention"
+                    },
+                    iconRes = R.drawable.ic_more_protection,
+                    tone = if (uiState.blockingReadiness.readyForBlocking) ScreenRestTone.Success else ScreenRestTone.Warning,
+                    destination = MoreDestination.Permissions,
+                ),
+            ),
+            onDestinationChanged = onDestinationChanged,
+        )
+
+        MoreMenuGroup(
+            title = if (korean) "앱 설정" else "App settings",
+            items = listOf(
+                MoreMenuItem(
+                    title = if (korean) "알림" else "Notifications",
+                    description = if (korean) "경고 및 사용 초과 알림" else "Warnings and limit alerts",
+                    iconRes = R.drawable.ic_more_notifications,
+                    tone = ScreenRestTone.Primary,
+                    destination = MoreDestination.Notifications,
+                ),
+                MoreMenuItem(
+                    title = if (korean) "언어" else "Language",
+                    description = if (uiState.appLanguage == AppLanguage.Korean) "한국어" else "English",
+                    iconRes = R.drawable.ic_more_language,
+                    tone = ScreenRestTone.Success,
+                    destination = MoreDestination.Language,
+                ),
+            ),
+            onDestinationChanged = onDestinationChanged,
+        )
+
+        MoreMenuGroup(
+            title = if (korean) "계정 및 지원" else "Account and support",
+            items = listOf(
+                MoreMenuItem(
+                    title = if (korean) "Google 계정" else "Google account",
+                    description = when {
+                        parentAccountAuthState.recoverable -> parentAccountAuthState.email
+                            .ifBlank { parentAccountAuthState.displayName }
+                            .ifBlank { if (korean) "연결됨" else "Connected" }
+                        uiState.parentManagementState.deviceRole == ParentDeviceRole.Child ->
+                            if (korean) "자녀 기기 익명 계정" else "Child device anonymous account"
+                        else -> if (korean) "로그인 및 계정 관리" else "Sign in and manage account"
+                    },
+                    iconRes = R.drawable.ic_more_account,
+                    tone = ScreenRestTone.Primary,
+                    destination = MoreDestination.GoogleAccount,
+                ),
+                MoreMenuItem(
+                    title = if (korean) "도움말" else "Help",
+                    description = if (korean) "규칙과 보호 기능 알아보기" else "Learn about rules and protection",
+                    iconRes = R.drawable.ic_more_help,
+                    tone = ScreenRestTone.Schedule,
+                    destination = MoreDestination.Help,
+                ),
+                MoreMenuItem(
+                    title = if (korean) "진단 정보" else "Diagnostics",
+                    description = if (korean) "최근 작동 기록 ${uiState.eventLog.size}개" else "${uiState.eventLog.size} recent records",
+                    iconRes = R.drawable.ic_more_diagnostics,
+                    tone = ScreenRestTone.Neutral,
+                    destination = MoreDestination.Diagnostics,
+                ),
+            ),
+            onDestinationChanged = onDestinationChanged,
+        )
+    }
+}
+
+@Composable
+private fun MoreMenuGroup(
+    title: String,
+    items: List<MoreMenuItem>,
+    onDestinationChanged: (MoreDestination) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs)) {
+        Text(
+            text = title,
+            modifier = Modifier.padding(horizontal = ScreenRestTheme.spacing.xs),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        ScreenRestCard(contentPadding = PaddingValues(vertical = ScreenRestTheme.spacing.xxs)) {
+            items.forEachIndexed { index, item ->
+                ScreenRestListRow(
+                    title = item.title,
+                    supportingText = item.description,
+                    onClick = { onDestinationChanged(item.destination) },
+                    leading = { MoreMenuIcon(item.iconRes, item.tone) },
+                    trailing = { MoreChevron() },
+                )
+                if (index != items.lastIndex) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 72.dp, end = ScreenRestTheme.spacing.sm)
+                            .height(1.dp)
+                            .background(ScreenRestTheme.colors.divider),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MoreMenuIcon(iconRes: Int, tone: ScreenRestTone) {
+    val tint = when (tone) {
+        ScreenRestTone.Neutral -> MaterialTheme.colorScheme.onSurfaceVariant
+        ScreenRestTone.Primary -> MaterialTheme.colorScheme.primary
+        ScreenRestTone.Success -> ScreenRestTheme.colors.success
+        ScreenRestTone.Warning -> ScreenRestTheme.colors.warning
+        ScreenRestTone.Blocked -> ScreenRestTheme.colors.blocked
+        ScreenRestTone.Schedule -> ScreenRestTheme.colors.schedule
+    }
+    ScreenRestIconContainer(tone = tone) {
+        Icon(
+            painter = painterResource(iconRes),
+            contentDescription = null,
+            modifier = Modifier.size(ScreenRestTheme.sizes.icon),
+            tint = tint,
+        )
+    }
+}
+
+@Composable
+private fun MoreChevron() {
+    Icon(
+        painter = painterResource(R.drawable.ic_chevron_right),
+        contentDescription = null,
+        modifier = Modifier.size(20.dp),
+        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun MoreDetailHeader(title: String, subtitle: String, onBack: () -> Unit) {
+    ScreenRestPageHeader(
+        title = title,
+        subtitle = subtitle,
+        leading = {
+            IconButton(onClick = onBack) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_arrow_back),
+                    contentDescription = "Back",
+                    tint = MaterialTheme.colorScheme.onBackground,
+                )
+            }
+        },
+    )
+}
+
+@Composable
+private fun MoreAdminPinContent(
+    uiState: SafeModeUiState,
+    text: AppStrings,
+    onBack: () -> Unit,
+    onUpdateAdminPin: (String, String) -> Unit,
+    onPinInputChanged: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var currentAdminPin by remember { mutableStateOf("") }
+    var newAdminPin by remember { mutableStateOf("") }
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md)) {
+        MoreDetailHeader(
+            title = if (korean) "관리 PIN" else "Admin PIN",
+            subtitle = if (korean) "설정과 허용된 보호 동작을 확인합니다" else "Confirm settings and permitted protection actions",
+            onBack = onBack,
+        )
+        ScreenRestCard {
+            PinChangeFields(
+                currentPin = currentAdminPin,
+                newPin = newAdminPin,
+                currentLabel = text.currentAdminPin,
+                newLabel = text.newAdminPin,
+                onCurrentChanged = {
+                    currentAdminPin = it
+                    onPinInputChanged()
+                },
+                onNewChanged = {
+                    newAdminPin = it
+                    onPinInputChanged()
+                },
+                onSave = {
+                    onUpdateAdminPin(currentAdminPin, newAdminPin)
+                    currentAdminPin = ""
+                    newAdminPin = ""
+                },
+                status = uiState.pinChangeStatus,
+                text = text,
+            )
+            Text(
+                text = if (korean) {
+                    "관리 PIN은 설정 변경, 부모 연결, 허용된 차단 해제와 안전 복구에 사용됩니다. 고행 3단계는 PIN만으로 종료할 수 없습니다."
+                } else {
+                    "The Admin PIN confirms settings, pairing, allowed unlocks, and Safe Recovery. It cannot end active hardship level 3 by itself."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun MoreEmergencyPassContent(
+    summary: PolicySummary,
+    text: AppStrings,
+    onBack: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val nextAvailableAt = summary.emergencyPassNextAvailableAtMillis
+    val available = nextAvailableAt <= 0L || System.currentTimeMillis() >= nextAvailableAt
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md)) {
+        MoreDetailHeader(
+            title = if (korean) "긴급 사용권" else "Emergency Pass",
+            subtitle = if (korean) "고행 3단계의 제한된 긴급 예외 권한" else "A limited emergency exception for hardship level 3",
+            onBack = onBack,
+        )
+        ScreenRestCard(tone = if (available) ScreenRestTone.Success else ScreenRestTone.Warning) {
+            ScreenRestSectionHeader(
+                title = if (available) {
+                    if (korean) "사용 가능" else "Available"
+                } else {
+                    if (korean) "이미 사용함" else "Already used"
+                },
+                supportingText = if (available) {
+                    if (korean) "필요할 때 블록 화면에서 사용할 수 있습니다" else "Use it from the block screen when needed"
+                } else {
+                    if (korean) "다음 사용 가능 ${formatDateTime(nextAvailableAt)}" else "Available again ${formatDateTime(nextAvailableAt)}"
+                },
+                action = {
+                    ScreenRestStatusPill(
+                        label = if (available) {
+                            if (korean) "1회" else "1 use"
+                        } else {
+                            if (korean) "대기" else "Waiting"
+                        },
+                        tone = if (available) ScreenRestTone.Success else ScreenRestTone.Warning,
+                    )
+                },
+            )
+        }
+        ScreenRestCard {
+            MoreInformationRow(
+                title = if (korean) "공유 주기" else "Shared interval",
+                description = if (korean) "모든 고행 3단계에서 7일에 한 번" else "Once every 7 days across all level-3 policies",
+            )
+            MoreInformationRow(
+                title = if (korean) "적용 범위" else "Scope",
+                description = if (korean) "현재 차단된 앱 하나에만 적용" else "Applies only to the currently blocked app",
+            )
+            MoreInformationRow(
+                title = if (korean) "종료 시점" else "Expiration",
+                description = if (korean) "현재 차단 정책이 끝나면 자동 만료" else "Expires when the current blocking policy ends",
+            )
+            MoreInformationRow(
+                title = if (korean) "사용 위치" else "Where to use",
+                description = if (korean) "고행 3단계 블록 화면에서만 사용" else "Available only from a level-3 block screen",
+            )
+        }
+    }
+}
+
+@Composable
+private fun MoreInformationRow(title: String, description: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = ScreenRestTheme.spacing.xs),
+        verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xxs),
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Text(
+            description,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun MoreNotificationContent(
+    uiState: SafeModeUiState,
+    text: AppStrings,
+    onBack: () -> Unit,
+    onWarningNotificationsChanged: (Boolean) -> Unit,
+    onLimitNotificationsChanged: (Boolean) -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md)) {
+        MoreDetailHeader(
+            title = if (korean) "알림" else "Notifications",
+            subtitle = if (korean) "사용 시간과 차단 상태 알림을 설정합니다" else "Configure usage and blocking alerts",
+            onBack = onBack,
+        )
+        ScreenRestCard {
+            NotificationPreferenceRow(
+                title = text.warningNotifications,
+                checked = uiState.warningNotificationsEnabled,
+                onCheckedChange = onWarningNotificationsChanged,
+            )
+            NotificationPreferenceRow(
+                title = text.limitNotifications,
+                checked = uiState.limitNotificationsEnabled,
+                onCheckedChange = onLimitNotificationsChanged,
+            )
+        }
+    }
+}
+
+@Composable
+private fun MoreLanguageContent(
+    appLanguage: AppLanguage,
+    text: AppStrings,
+    onBack: () -> Unit,
+    onAppLanguageChanged: (AppLanguage) -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md)) {
+        MoreDetailHeader(
+            title = if (korean) "언어" else "Language",
+            subtitle = if (korean) "앱에서 사용할 언어를 선택합니다" else "Choose the language used in the app",
+            onBack = onBack,
+        )
+        ScreenRestCard {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs),
+            ) {
+                Box(modifier = Modifier.weight(1f)) {
+                    ChoiceButton(
+                        label = text.korean,
+                        selected = appLanguage == AppLanguage.Korean,
+                        onClick = { onAppLanguageChanged(AppLanguage.Korean) },
+                    )
+                }
+                Box(modifier = Modifier.weight(1f)) {
+                    ChoiceButton(
+                        label = "English",
+                        selected = appLanguage == AppLanguage.English,
+                        onClick = { onAppLanguageChanged(AppLanguage.English) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MoreGoogleAccountContent(
+    parentState: ParentManagementState,
+    authState: ParentAccountAuthState,
+    text: AppStrings,
+    onBack: () -> Unit,
+    onParentGoogleSignIn: () -> Unit,
+    onDeleteAccountAndCloudData: (String) -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var showDeleteDialog by remember { mutableStateOf(false) }
+    val isParent = parentState.deviceRole == ParentDeviceRole.Parent
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md)) {
+        MoreDetailHeader(
+            title = if (korean) "Google 계정" else "Google account",
+            subtitle = if (korean) "로그인과 클라우드 계정 데이터를 관리합니다" else "Manage sign-in and cloud account data",
+            onBack = onBack,
+        )
+        ScreenRestCard(tone = if (authState.recoverable) ScreenRestTone.Success else ScreenRestTone.Neutral) {
+            ScreenRestSectionHeader(
+                title = when {
+                    authState.recoverable -> if (korean) "Google 계정 연결됨" else "Google account connected"
+                    isParent -> if (korean) "Google 로그인 필요" else "Google sign-in required"
+                    else -> if (korean) "자녀 기기 계정" else "Child device account"
+                },
+                supportingText = when {
+                    authState.recoverable -> authState.email
+                        .ifBlank { authState.displayName }
+                        .ifBlank { authState.uid }
+                    isParent -> if (korean) "재설치 후 가족 연결을 복구하려면 로그인하세요" else "Sign in to restore family links after reinstalling"
+                    else -> if (korean) "자녀 기기는 익명 계정으로 연결 정보를 동기화합니다" else "Child devices sync links with an anonymous account"
+                },
+                action = {
+                    ScreenRestStatusPill(
+                        label = if (authState.recoverable) {
+                            if (korean) "연결됨" else "Connected"
+                        } else {
+                            if (korean) "미연결" else "Not linked"
+                        },
+                        tone = if (authState.recoverable) ScreenRestTone.Success else ScreenRestTone.Neutral,
+                    )
+                },
+            )
+            if (!authState.recoverable && isParent) {
+                ScreenRestPrimaryButton(
+                    label = if (korean) "Google 계정으로 로그인" else "Sign in with Google",
+                    onClick = onParentGoogleSignIn,
+                    enabled = authState.available,
+                )
+            }
+            authState.lastError.takeIf(String::isNotBlank)?.let { error ->
+                Text(
+                    text = error,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+        ScreenRestCard(tone = ScreenRestTone.Blocked) {
+            ScreenRestSectionHeader(
+                title = if (korean) "계정 및 클라우드 데이터 삭제" else "Delete account and cloud data",
+                supportingText = if (korean) {
+                    "부모·자녀 연결, 요청, 명령과 알림 토큰이 삭제되며 복구할 수 없습니다"
+                } else {
+                    "Family links, requests, commands, and notification tokens are permanently deleted"
+                },
+            )
+            OutlinedButton(
+                onClick = { showDeleteDialog = true },
+                enabled = authState.authenticated && (parentState.paired || authState.recoverable),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(ScreenRestTheme.radii.button),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.55f)),
+            ) {
+                Text(if (korean) "계정 데이터 삭제" else "Delete account data")
+            }
+        }
+    }
+    if (showDeleteDialog) {
+        AdminPinConfirmDialog(
+            title = if (korean) "계정 및 클라우드 데이터 삭제" else "Delete account and cloud data",
+            description = if (korean) {
+                "이 기기의 Firebase 계정과 연결된 클라우드 데이터를 삭제합니다. 삭제 후 복구할 수 없습니다."
+            } else {
+                "This deletes the Firebase account and linked cloud data. It cannot be undone."
+            },
+            confirmLabel = if (korean) "삭제" else "Delete",
+            text = text,
+            onDismiss = { showDeleteDialog = false },
+            onConfirm = { adminPin ->
+                showDeleteDialog = false
+                onDeleteAccountAndCloudData(adminPin)
+            },
+        )
+    }
+}
+
+@Composable
+private fun MoreHelpContent(text: AppStrings, onBack: () -> Unit) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md)) {
+        MoreDetailHeader(
+            title = if (korean) "도움말" else "Help",
+            subtitle = if (korean) "폰 쉼의 규칙과 보호 방식을 확인합니다" else "Learn how ScreenRest rules and protection work",
+            onBack = onBack,
+        )
+        listOf(
+            Pair(
+                if (korean) "시간 규칙" else "Time rules",
+                if (korean) "요일별·앱 그룹·앱별 제한은 함께 적용되며 가장 먼저 끝나는 제한으로 차단됩니다." else "Daily, app-group, and per-app limits work together; the first limit reached blocks usage.",
+            ),
+            Pair(
+                if (korean) "사용 가능 앱 규칙" else "Available-app rules",
+                if (korean) "스케줄 차단과 허용앱만 모드는 지금 실행할 수 있는 앱의 범위를 정합니다." else "Schedule blocking and allow-only mode decide which apps can run now.",
+            ),
+            Pair(
+                if (korean) "고행 모드" else "Hardship mode",
+                if (korean) "단계가 높을수록 변경과 해제가 더 엄격합니다. 3단계는 시작 후 정책 종료 전까지 관리 PIN만으로 해제할 수 없습니다." else "Higher levels make changes and unlocks stricter. Level 3 cannot be ended with the Admin PIN alone before the policy ends.",
+            ),
+            Pair(
+                if (korean) "부모 연결" else "Parent connection",
+                if (korean) "가족 탭에서 기기 역할, 연결 코드, 승인 요청과 연결 기기를 관리합니다." else "Use Family to manage device roles, pairing codes, approval requests, and linked devices.",
+            ),
+            Pair(
+                "Emergency Pass",
+                if (korean) "모든 고행 3단계에서 7일에 한 번 공유되며 블록 화면의 현재 앱에만 적용됩니다." else "Shared across all level-3 policies once every 7 days and applies only to the current app from the block screen.",
+            ),
+        ).forEach { (title, description) ->
+            ScreenRestCard {
+                MoreInformationRow(title = title, description = description)
+            }
+        }
+    }
+}
+
+private fun moreEmergencyPassSummary(summary: PolicySummary, korean: Boolean): String {
+    val nextAvailableAt = summary.emergencyPassNextAvailableAtMillis
+    return if (nextAvailableAt <= 0L || System.currentTimeMillis() >= nextAvailableAt) {
+        if (korean) "사용 가능 · 1회" else "Available · 1 use"
+    } else {
+        if (korean) "사용 완료 · ${formatDateTime(nextAvailableAt)} 갱신" else "Used · renews ${formatDateTime(nextAvailableAt)}"
+    }
+}
+
 @Composable
 fun SafetyContent(
     uiState: SafeModeUiState,
@@ -3056,13 +4916,22 @@ fun SafetyContent(
 
     val safetyCore: @Composable ColumnScope.() -> Unit = {
         SimpleCard {
-        SectionTitle(text.developerSafeMode)
+        SectionTitle(if (text.appLanguage == AppLanguage.Korean) "보호 제어" else "Protection controls")
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    if (uiState.safeModeEnabled) text.safeModeOn else text.safeModeOff,
+                    if (text.appLanguage == AppLanguage.Korean) "보호 일시 중지" else "Pause protection",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    if (uiState.safeModeEnabled) {
+                        if (text.appLanguage == AppLanguage.Korean) "사용 중 · 규칙은 보존되고 차단은 중지됩니다" else "On · rules are kept and blocking is paused"
+                    } else {
+                        if (text.appLanguage == AppLanguage.Korean) "사용 안 함 · 차단 기능이 작동할 수 있습니다" else "Off · blocking can operate normally"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             Switch(
@@ -3080,9 +4949,17 @@ fun SafetyContent(
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(text.policyEnforcement, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Text(
-                    if (uiState.policyEnforcementEnabled) text.policyEnforcementEnabled else text.policyEnforcementDisabled,
+                    if (text.appLanguage == AppLanguage.Korean) "규칙 적용" else "Rule enforcement",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    if (uiState.policyEnforcementEnabled) {
+                        if (text.appLanguage == AppLanguage.Korean) "적용 중" else "On"
+                    } else {
+                        if (text.appLanguage == AppLanguage.Korean) "꺼짐 · 저장된 규칙을 적용하지 않습니다" else "Off · saved rules are not enforced"
+                    },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -3296,6 +5173,7 @@ fun SettingsContent(
     onSettingsPinExpandedChange: (Boolean) -> Unit,
     onSettingsParentManagementExpandedChange: (Boolean) -> Unit,
     onSettingsEventLogExpandedChange: (Boolean) -> Unit,
+    showParentManagement: Boolean = true,
 ) {
     var currentAdminPin by remember { mutableStateOf("") }
     var newAdminPin by remember { mutableStateOf("") }
@@ -3390,58 +5268,60 @@ fun SettingsContent(
             )
         }
 
-        CollapsiblePolicyCard(
-            title = text.parentManagement,
-            icon = PolicySectionIcon.ParentManagement,
-            expanded = uiState.settingsParentManagementExpanded,
-            onExpandedChange = onSettingsParentManagementExpandedChange,
-            text = text,
-            headerTrailing = {
-                CompactStatusBadge(
-                    label = if (uiState.parentManagementState.paired) {
-                        text.parentLinked
-                    } else {
-                        text.parentNotLinked
-                    },
-                    status = if (uiState.parentManagementState.paired) {
-                        LimitStatus.Normal
-                    } else {
-                        LimitStatus.Warning
-                    },
-                )
-            },
-        ) {
-            ParentManagementSection(
-                parentState = uiState.parentManagementState,
-                parentAccountAuthState = parentAccountAuthState,
-                notificationState = uiState.parentNotificationState,
-                parentRequestNotificationReady = uiState.parentRequestNotificationReady,
-                parentRequestNotificationIssue = uiState.parentRequestNotificationIssue,
-                installedApps = uiState.installedApps,
-                policySummary = uiState.policySummary,
+        if (showParentManagement) {
+            CollapsiblePolicyCard(
+                title = text.parentManagement,
+                icon = PolicySectionIcon.ParentManagement,
+                expanded = uiState.settingsParentManagementExpanded,
+                onExpandedChange = onSettingsParentManagementExpandedChange,
                 text = text,
-                onPairParentAccount = onPairParentAccount,
-                onParentProfileNameChanged = onParentProfileNameChanged,
-                onParentDeviceRoleChanged = onParentDeviceRoleChanged,
-                onGenerateChildPairingCode = onGenerateChildPairingCode,
-                onRegisterChildPairingCode = onRegisterChildPairingCode,
-                onParentGoogleSignIn = onParentGoogleSignIn,
-                onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
-                onUnlinkParentAccount = onUnlinkParentAccount,
-                onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
-                onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
-                onSyncParentDevice = onSyncParentDevice,
-                pendingParentManagementAction = pendingParentManagementAction,
-                onPendingParentManagementActionChanged = onPendingParentManagementActionChanged,
-                onClearRemoteParentCommands = onClearRemoteParentCommands,
-                onRemoteAppExtraTime = onRemoteAppExtraTime,
-                onRemoteAppUnlockToday = onRemoteAppUnlockToday,
-                onRemoteTotalExtraTime = onRemoteTotalExtraTime,
-                onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
-                onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
-                onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
-                wrapInCard = false,
-            )
+                headerTrailing = {
+                    CompactStatusBadge(
+                        label = if (uiState.parentManagementState.paired) {
+                            text.parentLinked
+                        } else {
+                            text.parentNotLinked
+                        },
+                        status = if (uiState.parentManagementState.paired) {
+                            LimitStatus.Normal
+                        } else {
+                            LimitStatus.Warning
+                        },
+                    )
+                },
+            ) {
+                ParentManagementSection(
+                    parentState = uiState.parentManagementState,
+                    parentAccountAuthState = parentAccountAuthState,
+                    notificationState = uiState.parentNotificationState,
+                    parentRequestNotificationReady = uiState.parentRequestNotificationReady,
+                    parentRequestNotificationIssue = uiState.parentRequestNotificationIssue,
+                    installedApps = uiState.installedApps,
+                    policySummary = uiState.policySummary,
+                    text = text,
+                    onPairParentAccount = onPairParentAccount,
+                    onParentProfileNameChanged = onParentProfileNameChanged,
+                    onParentDeviceRoleChanged = onParentDeviceRoleChanged,
+                    onGenerateChildPairingCode = onGenerateChildPairingCode,
+                    onRegisterChildPairingCode = onRegisterChildPairingCode,
+                    onParentGoogleSignIn = onParentGoogleSignIn,
+                    onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
+                    onUnlinkParentAccount = onUnlinkParentAccount,
+                    onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
+                    onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
+                    onSyncParentDevice = onSyncParentDevice,
+                    pendingParentManagementAction = pendingParentManagementAction,
+                    onPendingParentManagementActionChanged = onPendingParentManagementActionChanged,
+                    onClearRemoteParentCommands = onClearRemoteParentCommands,
+                    onRemoteAppExtraTime = onRemoteAppExtraTime,
+                    onRemoteAppUnlockToday = onRemoteAppUnlockToday,
+                    onRemoteTotalExtraTime = onRemoteTotalExtraTime,
+                    onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
+                    onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
+                    onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
+                    wrapInCard = false,
+                )
+            }
         }
     }
 
@@ -3634,6 +5514,1380 @@ private fun PermissionActionRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+    }
+}
+
+@Composable
+private fun FamilyContent(
+    destination: FamilyDestination,
+    onDestinationChanged: (FamilyDestination) -> Unit,
+    parentState: ParentManagementState,
+    childTopAppsSharingEnabled: Boolean,
+    childUsageSnapshots: Map<String, ChildUsageSnapshot>,
+    childUsageRefreshRequests: Map<String, ChildUsageRefreshRequest>,
+    childImmediateBlocks: Map<String, ImmediateBlockReadState>,
+    localImmediateBlock: ImmediateBlockState,
+    parentAccountAuthState: ParentAccountAuthState,
+    notificationState: ParentNotificationState,
+    parentRequestNotificationReady: Boolean,
+    parentRequestNotificationIssue: String,
+    installedApps: List<InstalledAppInfo>,
+    policySummary: PolicySummary,
+    safeModeEnabled: Boolean,
+    policyEnforcementEnabled: Boolean,
+    text: AppStrings,
+    onPairParentAccount: (String, String, String) -> Unit,
+    onParentProfileNameChanged: (String) -> Unit,
+    onParentDeviceRoleChanged: (ParentDeviceRole, String) -> Unit,
+    onGenerateChildPairingCode: (String) -> Unit,
+    onRegisterChildPairingCode: (String, String, String) -> Unit,
+    onParentGoogleSignIn: () -> Unit,
+    onDeleteAccountAndCloudData: (String) -> Unit,
+    onUnlinkParentAccount: (String) -> Unit,
+    onUnlinkLinkedChildDevice: (String, String) -> Unit,
+    onUnlinkLinkedParentDevice: (String, String) -> Unit,
+    onSyncParentDevice: () -> Unit,
+    onCheckImmediateBlock: (String) -> Unit,
+    onChildTopAppsSharingChanged: (Boolean) -> Unit,
+    onStartImmediateBlock: (String, Int, String) -> Unit,
+    onStopImmediateBlock: (String, String, String) -> Unit,
+    pendingParentManagementAction: ParentManagementPendingAction?,
+    onPendingParentManagementActionChanged: (ParentManagementPendingAction?) -> Unit,
+    onClearRemoteParentCommands: (String) -> Unit,
+    onRemoteAppExtraTime: (String, String, Int) -> Unit,
+    onRemoteAppUnlockToday: (String, String) -> Unit,
+    onRemoteTotalExtraTime: (Int) -> Unit,
+    onRemoteTotalUnlockToday: () -> Unit,
+    onApproveRemoteUnlockRequest: (String, Int, Boolean) -> Unit,
+    onRejectRemoteUnlockRequest: (String) -> Unit,
+    onOpenLocalRules: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    when (destination) {
+        FamilyDestination.Home -> FamilyHomeContent(
+            parentState = parentState,
+            childTopAppsSharingEnabled = childTopAppsSharingEnabled,
+            childUsageSnapshots = childUsageSnapshots,
+            childUsageRefreshRequests = childUsageRefreshRequests,
+            childImmediateBlocks = childImmediateBlocks,
+            localImmediateBlock = localImmediateBlock,
+            policySummary = policySummary,
+            safeModeEnabled = safeModeEnabled,
+            policyEnforcementEnabled = policyEnforcementEnabled,
+            text = text,
+            onOpenManagement = { onDestinationChanged(FamilyDestination.Management) },
+            onSyncParentDevice = onSyncParentDevice,
+            onCheckImmediateBlock = onCheckImmediateBlock,
+            onChildTopAppsSharingChanged = onChildTopAppsSharingChanged,
+            onStartImmediateBlock = onStartImmediateBlock,
+            onStopImmediateBlock = onStopImmediateBlock,
+            onOpenLocalRules = onOpenLocalRules,
+            onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
+            onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
+        )
+
+        FamilyDestination.Management -> Column(
+            verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md),
+        ) {
+            MoreDetailHeader(
+                title = if (korean) "가족 및 기기 관리" else "Family and device management",
+                subtitle = if (korean) "역할, 프로필, 연결과 동기화를 관리합니다" else "Manage roles, profiles, pairing, and sync",
+                onBack = { onDestinationChanged(FamilyDestination.Home) },
+            )
+            ParentManagementSection(
+                parentState = parentState,
+                parentAccountAuthState = parentAccountAuthState,
+                notificationState = notificationState,
+                parentRequestNotificationReady = parentRequestNotificationReady,
+                parentRequestNotificationIssue = parentRequestNotificationIssue,
+                installedApps = installedApps,
+                policySummary = policySummary,
+                text = text,
+                onPairParentAccount = onPairParentAccount,
+                onParentProfileNameChanged = onParentProfileNameChanged,
+                onParentDeviceRoleChanged = onParentDeviceRoleChanged,
+                onGenerateChildPairingCode = onGenerateChildPairingCode,
+                onRegisterChildPairingCode = onRegisterChildPairingCode,
+                onParentGoogleSignIn = onParentGoogleSignIn,
+                onDeleteAccountAndCloudData = onDeleteAccountAndCloudData,
+                onUnlinkParentAccount = onUnlinkParentAccount,
+                onUnlinkLinkedChildDevice = onUnlinkLinkedChildDevice,
+                onUnlinkLinkedParentDevice = onUnlinkLinkedParentDevice,
+                onSyncParentDevice = onSyncParentDevice,
+                pendingParentManagementAction = pendingParentManagementAction,
+                onPendingParentManagementActionChanged = onPendingParentManagementActionChanged,
+                onClearRemoteParentCommands = onClearRemoteParentCommands,
+                onRemoteAppExtraTime = onRemoteAppExtraTime,
+                onRemoteAppUnlockToday = onRemoteAppUnlockToday,
+                onRemoteTotalExtraTime = onRemoteTotalExtraTime,
+                onRemoteTotalUnlockToday = onRemoteTotalUnlockToday,
+                onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
+                onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
+                wrapInCard = false,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FamilyHomeContent(
+    parentState: ParentManagementState,
+    childTopAppsSharingEnabled: Boolean,
+    childUsageSnapshots: Map<String, ChildUsageSnapshot>,
+    childUsageRefreshRequests: Map<String, ChildUsageRefreshRequest>,
+    childImmediateBlocks: Map<String, ImmediateBlockReadState>,
+    localImmediateBlock: ImmediateBlockState,
+    policySummary: PolicySummary,
+    safeModeEnabled: Boolean,
+    policyEnforcementEnabled: Boolean,
+    text: AppStrings,
+    onOpenManagement: () -> Unit,
+    onSyncParentDevice: () -> Unit,
+    onCheckImmediateBlock: (String) -> Unit,
+    onChildTopAppsSharingChanged: (Boolean) -> Unit,
+    onStartImmediateBlock: (String, Int, String) -> Unit,
+    onStopImmediateBlock: (String, String, String) -> Unit,
+    onOpenLocalRules: () -> Unit,
+    onApproveRemoteUnlockRequest: (String, Int, Boolean) -> Unit,
+    onRejectRemoteUnlockRequest: (String) -> Unit,
+) {
+    val childDevices = remember(
+        parentState.linkedChildDevices,
+        parentState.linkedChildPairingCodes,
+        parentState.remoteUnlockRequests,
+    ) {
+        parentState.linkedChildDevices.ifEmpty {
+            parentState.linkedChildPairingCodes.map { code ->
+                LinkedChildDevice(
+                    childDeviceId = code,
+                    childDeviceName = code,
+                    pairingCode = code,
+                )
+            }
+        }.ifEmpty {
+            parentState.remoteUnlockRequests
+                .distinctBy { request -> request.childDeviceId }
+                .map { request ->
+                    LinkedChildDevice(
+                        childDeviceId = request.childDeviceId,
+                        childDeviceName = request.childDeviceName,
+                    )
+                }
+        }
+    }
+    val connected = if (parentState.deviceRole == ParentDeviceRole.Parent) {
+        parentState.paired || childDevices.isNotEmpty()
+    } else {
+        parentState.paired || parentState.linkedParentDevices.isNotEmpty()
+    }
+    val korean = text.appLanguage == AppLanguage.Korean
+
+    Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.md)) {
+        ScreenRestPageHeader(
+            title = if (korean) "가족" else "Family",
+            subtitle = when (parentState.deviceRole) {
+                ParentDeviceRole.Parent -> if (korean) "자녀 기기와 승인 요청을 관리합니다" else "Manage child devices and approval requests"
+                ParentDeviceRole.Child -> if (korean) "내 기기와 부모 연결 상태를 확인합니다" else "Review this device and its parent connection"
+            },
+            trailing = {
+                ScreenRestStatusPill(
+                    label = if (connected) {
+                        if (korean) "정상 연결" else "Connected"
+                    } else {
+                        if (korean) "미연결" else "Not linked"
+                    },
+                    tone = if (connected) ScreenRestTone.Success else ScreenRestTone.Warning,
+                )
+            },
+        )
+
+        when {
+            !connected -> FamilyUnpairedContent(
+                parentState = parentState,
+                text = text,
+                onOpenManagement = onOpenManagement,
+            )
+
+            parentState.deviceRole == ParentDeviceRole.Parent -> FamilyParentDashboard(
+                parentState = parentState,
+                childDevices = childDevices,
+                childUsageSnapshots = childUsageSnapshots,
+                childUsageRefreshRequests = childUsageRefreshRequests,
+                childImmediateBlocks = childImmediateBlocks,
+                text = text,
+                onOpenManagement = onOpenManagement,
+                onSyncParentDevice = onSyncParentDevice,
+                onCheckImmediateBlock = onCheckImmediateBlock,
+                onStartImmediateBlock = onStartImmediateBlock,
+                onStopImmediateBlock = onStopImmediateBlock,
+                onApproveRemoteUnlockRequest = onApproveRemoteUnlockRequest,
+                onRejectRemoteUnlockRequest = onRejectRemoteUnlockRequest,
+            )
+
+            else -> FamilyChildDashboard(
+                parentState = parentState,
+                childTopAppsSharingEnabled = childTopAppsSharingEnabled,
+                immediateBlock = localImmediateBlock,
+                policySummary = policySummary,
+                safeModeEnabled = safeModeEnabled,
+                policyEnforcementEnabled = policyEnforcementEnabled,
+                text = text,
+                onOpenManagement = onOpenManagement,
+                onSyncParentDevice = onSyncParentDevice,
+                onChildTopAppsSharingChanged = onChildTopAppsSharingChanged,
+                onOpenLocalRules = onOpenLocalRules,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FamilyUnpairedContent(
+    parentState: ParentManagementState,
+    text: AppStrings,
+    onOpenManagement: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    ScreenRestCard(tone = ScreenRestTone.Warning) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+        ) {
+            MoreMenuIcon(R.drawable.ic_nav_family, ScreenRestTone.Warning)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (korean) "가족 연결이 필요합니다" else "Family connection required",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = if (korean) {
+                        if (parentState.deviceRole == ParentDeviceRole.Parent) {
+                            "부모 프로필을 저장하고 자녀의 연결 코드를 등록하세요"
+                        } else {
+                            "자녀 프로필을 저장하고 부모에게 보낼 연결 코드를 만드세요"
+                        }
+                    } else if (parentState.deviceRole == ParentDeviceRole.Parent) {
+                        "Save the parent profile and register the child's pairing code"
+                    } else {
+                        "Save the child profile and create a pairing code for a parent"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        ScreenRestPrimaryButton(
+            label = if (korean) "연결 설정" else "Set up connection",
+            onClick = onOpenManagement,
+        )
+    }
+}
+
+@Composable
+private fun FamilyParentDashboard(
+    parentState: ParentManagementState,
+    childDevices: List<LinkedChildDevice>,
+    childUsageSnapshots: Map<String, ChildUsageSnapshot>,
+    childUsageRefreshRequests: Map<String, ChildUsageRefreshRequest>,
+    childImmediateBlocks: Map<String, ImmediateBlockReadState>,
+    text: AppStrings,
+    onOpenManagement: () -> Unit,
+    onSyncParentDevice: () -> Unit,
+    onCheckImmediateBlock: (String) -> Unit,
+    onStartImmediateBlock: (String, Int, String) -> Unit,
+    onStopImmediateBlock: (String, String, String) -> Unit,
+    onApproveRemoteUnlockRequest: (String, Int, Boolean) -> Unit,
+    onRejectRemoteUnlockRequest: (String) -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var selectedChildId by rememberSaveable {
+        mutableStateOf(childDevices.firstOrNull()?.childDeviceId.orEmpty())
+    }
+    LaunchedEffect(childDevices, selectedChildId) {
+        if (childDevices.none { child -> child.childDeviceId == selectedChildId }) {
+            selectedChildId = childDevices.firstOrNull()?.childDeviceId.orEmpty()
+        }
+    }
+    val selectedChild = childDevices.firstOrNull { child -> child.childDeviceId == selectedChildId }
+        ?: childDevices.firstOrNull()
+    val selectedBlockRead = selectedChild?.childDeviceId?.let(childImmediateBlocks::get)
+    val selectedBlock = (selectedBlockRead as? ImmediateBlockReadState.Known)?.block
+    val selectedRefreshRequest = selectedChild?.childDeviceId?.let(childUsageRefreshRequests::get)
+    var blockClockMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(selectedBlock?.requestId) {
+        while (true) {
+            delay(30_000L)
+            blockClockMillis = System.currentTimeMillis()
+        }
+    }
+    val blockAvailability = immediateBlockAvailability(selectedBlockRead, blockClockMillis)
+    val blockActive = blockAvailability == ImmediateBlockAvailability.Active
+    var showDurationDialog by rememberSaveable { mutableStateOf(false) }
+    var showBlockPinDialog by rememberSaveable { mutableStateOf(false) }
+    var showStopPinDialog by rememberSaveable { mutableStateOf(false) }
+    var selectedBlockMinutes by rememberSaveable { mutableStateOf(60) }
+    val selectedRequests = parentState.remoteUnlockRequests.filter { request ->
+        selectedChild == null || request.childDeviceId == selectedChild.childDeviceId
+    }
+
+    FamilySectionTitle(if (korean) "연결된 자녀" else "Connected children")
+    if (childDevices.size > 1) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs),
+        ) {
+            childDevices.forEach { child ->
+                Surface(
+                    onClick = { selectedChildId = child.childDeviceId },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(ScreenRestTheme.radii.chip),
+                    color = if (child.childDeviceId == selectedChild?.childDeviceId) {
+                        MaterialTheme.colorScheme.primaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surface
+                    },
+                    border = BorderStroke(
+                        1.dp,
+                        if (child.childDeviceId == selectedChild?.childDeviceId) {
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)
+                        } else {
+                            MaterialTheme.colorScheme.outlineVariant
+                        },
+                    ),
+                ) {
+                    Box(
+                        modifier = Modifier.heightIn(min = 48.dp).padding(horizontal = 14.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = child.childDeviceName.ifBlank { child.childDeviceId },
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (child.childDeviceId == selectedChild?.childDeviceId) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+    selectedChild?.let { child ->
+        FamilyDeviceCard(
+            name = child.childDeviceName.ifBlank { child.childDeviceId },
+            deviceLabel = child.childDeviceId.take(12).ifBlank { child.pairingCode },
+            lastSyncMillis = childUsageSnapshots[child.childDeviceId]?.capturedAtMillis
+                ?: parentState.lastSyncMillis,
+            text = text,
+            onSync = onSyncParentDevice,
+            syncEnabled = selectedRefreshRequest?.canRequestAgain(blockClockMillis) != false,
+        )
+    }
+
+    FamilySectionTitle(if (korean) "자녀 사용 현황" else "Child usage status")
+    FamilyRemoteSnapshotCard(
+        snapshot = selectedChild?.childDeviceId?.let(childUsageSnapshots::get),
+        refreshRequest = selectedRefreshRequest,
+        text = text,
+    )
+
+    FamilySectionTitle(if (korean) "부모님이 할 수 있는 작업" else "Parent actions")
+    ScreenRestCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+        ) {
+            MoreMenuIcon(R.drawable.ic_family_block,
+                if (blockActive) ScreenRestTone.Warning else ScreenRestTone.Blocked)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (korean) "즉시 차단" else "Immediate block",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = if (blockActive) {
+                        if (korean) "자녀 기기에 적용 중" else "Active on child device"
+                    } else {
+                        if (korean) "필요할 때 사용을 잠시 멈춥니다" else "Pause use when needed"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Button(
+            onClick = {
+                when (blockAvailability) {
+                    ImmediateBlockAvailability.Active -> showStopPinDialog = true
+                    ImmediateBlockAvailability.Inactive -> showDurationDialog = true
+                    ImmediateBlockAvailability.Unverified, ImmediateBlockAvailability.Failed ->
+                        selectedChild?.childDeviceId?.let(onCheckImmediateBlock)
+                }
+            },
+            enabled = selectedChild != null,
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            shape = RoundedCornerShape(ScreenRestTheme.radii.button),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (blockAvailability == ImmediateBlockAvailability.Inactive)
+                    ScreenRestPalette.Coral else ScreenRestPalette.Cobalt,
+            ),
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_family_block),
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(ScreenRestTheme.spacing.xs))
+            Text(when (blockAvailability) {
+                ImmediateBlockAvailability.Active -> if (korean) "차단 종료" else "End block"
+                ImmediateBlockAvailability.Inactive -> if (korean) "지금 차단" else "Block now"
+                ImmediateBlockAvailability.Unverified -> if (korean) "차단 상태 확인" else "Check block status"
+                ImmediateBlockAvailability.Failed -> if (korean) "상태 다시 확인" else "Retry block status"
+            })
+        }
+        if (blockAvailability == ImmediateBlockAvailability.Unverified ||
+            blockAvailability == ImmediateBlockAvailability.Failed
+        ) {
+            Text(
+                text = if (blockAvailability == ImmediateBlockAvailability.Failed) {
+                    if (korean) "차단 상태를 읽지 못했습니다. 다시 확인해 주세요."
+                    else "Could not read block status. Tap to retry."
+                } else {
+                    if (korean) "차단 상태 확인 중 · 오래 걸리면 버튼을 눌러 주세요."
+                    else "Checking block status · tap if this takes too long."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (blockActive && selectedBlock != null) {
+            val remainingMinutes = (((selectedBlock.expiresAtMillis ?: blockClockMillis) -
+                blockClockMillis + 59_999L) / 60_000L).toInt().coerceAtLeast(0)
+            ScreenRestStatusPill(
+                label = if (selectedBlock.appliedAtMillis > 0L) {
+                    if (korean) "차단 적용됨 · ${formatLimitMinutesLabel(remainingMinutes)} 남음"
+                    else "Block applied · ${formatLimitMinutesLabel(remainingMinutes)} left"
+                } else {
+                    if (korean) "서버 등록됨 · 자녀 기기 적용 대기" else "Saved · waiting for child device"
+                },
+                tone = if (selectedBlock.appliedAtMillis > 0L) ScreenRestTone.Warning
+                    else ScreenRestTone.Neutral,
+            )
+            Text(
+                text = if (korean) "제한 없는 앱과 필수 시스템 앱은 계속 사용 가능 · 시간이 끝나면 자동 해제"
+                    else "Unrestricted and essential apps remain available · ends automatically",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (selectedBlock != null && selectedBlock.revokedAtMillis > 0L &&
+            (selectedBlock.expiresAtMillis ?: 0L) > blockClockMillis
+        ) {
+            ScreenRestStatusPill(
+                label = if (selectedBlock.releasedAtMillis > 0L) {
+                    if (korean) "차단 종료 확인됨" else "Block ended on child"
+                } else {
+                    if (korean) "종료 요청됨 · 자녀 기기 확인 대기" else "Stop sent · waiting for child device"
+                },
+                tone = ScreenRestTone.Neutral,
+            )
+        }
+        val childSnapshot = selectedChild?.childDeviceId?.let(childUsageSnapshots::get)
+        if (childSnapshot?.protectionPaused == true || childSnapshot?.usageAccessReady == false) {
+            Text(
+                text = if (korean) "자녀 기기의 보호가 중지되었거나 사용 기록 권한이 없습니다. 자녀 기기에서 확인해 주세요."
+                    else "Protection is paused or usage access is missing on the child device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Box(
+            modifier = Modifier.fillMaxWidth().height(1.dp)
+                .background(ScreenRestTheme.colors.divider),
+        )
+        ScreenRestListRow(
+            title = if (korean) "자녀 규칙" else "Child rules",
+            supportingText = if (korean) "원격 변경은 준비 중" else "Remote editing is not yet available",
+            enabled = false,
+            leading = { MoreMenuIcon(R.drawable.ic_nav_rules, ScreenRestTone.Neutral) },
+            trailing = {
+                ScreenRestStatusPill(
+                    label = if (korean) "준비 중" else "Coming soon",
+                    tone = ScreenRestTone.Neutral,
+                )
+            },
+        )
+    }
+
+    if (showDurationDialog && selectedChild != null) {
+        Dialog(onDismissRequest = { showDurationDialog = false }) {
+            Card(shape = RoundedCornerShape(24.dp)) {
+                Column(
+                    modifier = Modifier.padding(22.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    Text(
+                        if (korean) "지금 차단" else "Block now",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        if (korean) "일반 앱을 선택한 시간 동안 차단합니다. 제한 없는 앱과 필수 시스템 앱은 계속 사용됩니다."
+                        else "Blocks regular apps for the selected duration. Unrestricted and essential apps stay available.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        listOf(15, 30, 60, 120, 240, 480, 1440).forEach { minutes ->
+                            Surface(
+                                onClick = { selectedBlockMinutes = minutes },
+                                shape = RoundedCornerShape(12.dp),
+                                color = if (selectedBlockMinutes == minutes)
+                                    MaterialTheme.colorScheme.primaryContainer
+                                else MaterialTheme.colorScheme.surfaceVariant,
+                            ) {
+                                Text(
+                                    formatLimitMinutesLabel(minutes),
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                )
+                            }
+                        }
+                    }
+                    Text(
+                        if (korean) "오프라인이면 종료 전 재연결할 때만 적용됩니다. 기존 고행 차단은 유지됩니다."
+                        else "If offline, applies only when reconnected before expiry. Existing hardship blocks stay in place.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { showDurationDialog = false }, modifier = Modifier.weight(1f)) {
+                            Text(if (korean) "취소" else "Cancel")
+                        }
+                        Button(onClick = {
+                            showDurationDialog = false
+                            showBlockPinDialog = true
+                        }, modifier = Modifier.weight(1f)) {
+                            Text(if (korean) "다음" else "Next")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (showBlockPinDialog && selectedChild != null) {
+        AdminPinConfirmDialog(
+            title = if (korean) "차단 확인" else "Confirm block",
+            description = if (korean) "${selectedChild.childDeviceName} · ${formatLimitMinutesLabel(selectedBlockMinutes)} 동안 차단"
+                else "Block ${selectedChild.childDeviceName} for ${formatLimitMinutesLabel(selectedBlockMinutes)}",
+            confirmLabel = if (korean) "차단 요청" else "Send block",
+            text = text,
+            onDismiss = { showBlockPinDialog = false },
+            onConfirm = { pin ->
+                onStartImmediateBlock(selectedChild.childDeviceId, selectedBlockMinutes, pin)
+                showBlockPinDialog = false
+            },
+        )
+    }
+    if (showStopPinDialog && selectedChild != null && selectedBlock != null) {
+        AdminPinConfirmDialog(
+            title = if (korean) "차단 종료" else "End block",
+            description = if (korean) "이 즉시 차단만 종료합니다. 기존 규칙과 고행 차단은 유지됩니다."
+                else "Only this immediate block ends. Existing rules and hardship blocks remain.",
+            confirmLabel = if (korean) "종료 요청" else "Send stop",
+            text = text,
+            onDismiss = { showStopPinDialog = false },
+            onConfirm = { pin ->
+                onStopImmediateBlock(selectedChild.childDeviceId, selectedBlock.requestId, pin)
+                showStopPinDialog = false
+            },
+        )
+    }
+
+    FamilySectionTitle(if (korean) "승인 요청" else "Approval requests")
+    RemoteUnlockRequestList(
+        requests = selectedRequests,
+        text = text,
+        onApproveExtraTime = { request, minutes ->
+            onApproveRemoteUnlockRequest(request.id, minutes, false)
+        },
+        onApproveUnlockToday = { request ->
+            onApproveRemoteUnlockRequest(request.id, 0, true)
+        },
+        onReject = { request -> onRejectRemoteUnlockRequest(request.id) },
+    )
+
+    FamilyManagementEntry(text = text, onClick = onOpenManagement)
+}
+
+@Composable
+private fun FamilyChildDashboard(
+    parentState: ParentManagementState,
+    childTopAppsSharingEnabled: Boolean,
+    immediateBlock: ImmediateBlockState,
+    policySummary: PolicySummary,
+    safeModeEnabled: Boolean,
+    policyEnforcementEnabled: Boolean,
+    text: AppStrings,
+    onOpenManagement: () -> Unit,
+    onSyncParentDevice: () -> Unit,
+    onChildTopAppsSharingChanged: (Boolean) -> Unit,
+    onOpenLocalRules: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var blockClockMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(immediateBlock.requestId) {
+        while (true) {
+            delay(30_000L)
+            blockClockMillis = System.currentTimeMillis()
+        }
+    }
+    if (parentState.paired && immediateBlock.isActiveAt(blockClockMillis) &&
+        parentState.linkedParentDevices.any { it.parentUid == immediateBlock.parentUid }
+    ) {
+        ScreenRestCard(tone = ScreenRestTone.Warning) {
+            Text(
+                if (safeModeEnabled || !policyEnforcementEnabled) {
+                    if (korean) "부모 차단 요청 · 보호 중지 상태" else "Parent block requested · protection paused"
+                } else {
+                    if (korean) "부모가 지금 차단 중입니다" else "Parent block is active"
+                },
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                if (safeModeEnabled || !policyEnforcementEnabled) {
+                    if (korean) "차단을 적용하려면 자녀 기기의 보호 기능을 켜야 합니다."
+                    else "Turn on protection on the child device to apply the block."
+                } else {
+                    if (korean) "제한 없는 앱과 필수 시스템 앱은 사용 가능합니다. 지정된 시간이 끝나면 자동 해제됩니다."
+                    else "Unrestricted and essential apps remain available. The block ends automatically."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+    }
+    val profileName = parentState.localProfileName.ifBlank {
+        parentState.childDeviceName.ifBlank { if (korean) "내 기기" else "This device" }
+    }
+    FamilySectionTitle(if (korean) "내 기기" else "This device")
+    FamilyDeviceCard(
+        name = profileName,
+        deviceLabel = parentState.childDeviceName.ifBlank { parentState.childDeviceId.take(12) },
+        lastSyncMillis = parentState.lastSyncMillis,
+        text = text,
+        onSync = onSyncParentDevice,
+    )
+
+    FamilySectionTitle(if (korean) "오늘 사용 현황" else "Today's usage")
+    FamilyLocalUsageCard(
+        summary = policySummary,
+        safeModeEnabled = safeModeEnabled,
+        policyEnforcementEnabled = policyEnforcementEnabled,
+        text = text,
+        onOpenRules = onOpenLocalRules,
+    )
+
+    ChildTopAppsSharingCard(
+        enabled = childTopAppsSharingEnabled,
+        text = text,
+        onChanged = onChildTopAppsSharingChanged,
+    )
+
+    FamilySectionTitle(if (korean) "연결된 부모" else "Connected parents")
+    ScreenRestCard {
+        if (parentState.linkedParentDevices.isEmpty()) {
+            Text(
+                text = parentState.parentAccountId.ifBlank {
+                    if (korean) "연결된 부모 정보가 없습니다" else "No linked parent information"
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            parentState.linkedParentDevices.forEach { parent ->
+                ScreenRestListRow(
+                    title = parent.parentDisplayName.ifBlank { parent.parentUid },
+                    supportingText = if (korean) "연결된 부모 기기" else "Linked parent device",
+                    leading = { MoreMenuIcon(R.drawable.ic_nav_family, ScreenRestTone.Success) },
+                    trailing = {
+                        ScreenRestStatusPill(
+                            label = if (korean) "연결됨" else "Linked",
+                            tone = ScreenRestTone.Success,
+                        )
+                    },
+                )
+            }
+        }
+    }
+
+    FamilyChildRequestHistory(requests = parentState.remoteUnlockRequests, text = text)
+    FamilyManagementEntry(text = text, onClick = onOpenManagement)
+}
+
+@Composable
+private fun ChildTopAppsSharingCard(
+    enabled: Boolean,
+    text: AppStrings,
+    onChanged: (Boolean) -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var showConsent by rememberSaveable { mutableStateOf(false) }
+    ScreenRestCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (korean) "앱별 사용 현황 공유" else "Share app usage summary",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            ScreenRestStatusPill(
+                label = if (enabled) {
+                    if (korean) "공유 중" else "Sharing"
+                } else {
+                    if (korean) "꺼짐" else "Off"
+                },
+                tone = if (enabled) ScreenRestTone.Success else ScreenRestTone.Neutral,
+            )
+        }
+        Text(
+            if (korean) "오늘 많이 사용한 앱 최대 5개의 이름과 사용 시간을 연결된 부모에게 보여줍니다."
+            else "Share names and durations of up to five most-used apps with linked parents.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (enabled) {
+            TextButton(onClick = { onChanged(false) }) {
+                Text(if (korean) "공유 중지" else "Stop sharing")
+            }
+        } else {
+            Button(onClick = { showConsent = true }) {
+                Text(if (korean) "공유 내용 확인" else "Review sharing")
+            }
+        }
+    }
+    if (showConsent) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showConsent = false },
+            title = { Text(if (korean) "앱별 사용 현황 공유" else "Share app usage summary") },
+            text = {
+                Text(
+                    if (korean) {
+                        "자녀 기기에서 오늘 많이 사용한 앱 최대 5개의 이름과 사용 시간을 Firebase로 전송해 연결된 부모 기기에 표시합니다. 전체 설치 앱 목록과 앱을 사용한 정확한 시각은 보내지 않습니다. 공유를 중지해도 오프라인인 동안에는 이전 요약이 보일 수 있으며, 재연결 후 갱신됩니다."
+                    } else {
+                        "Up to five app names and today's usage durations are sent through Firebase to linked parents. The full installed-app list and exact usage times are not sent. If this device is offline when sharing is stopped, the previous summary may remain visible until it reconnects."
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showConsent = false
+                    onChanged(true)
+                }) { Text(if (korean) "동의하고 공유" else "Agree and share") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showConsent = false }) {
+                    Text(if (korean) "나중에" else "Not now")
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun FamilyDeviceCard(
+    name: String,
+    deviceLabel: String,
+    lastSyncMillis: Long,
+    text: AppStrings,
+    onSync: () -> Unit,
+    syncEnabled: Boolean = true,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    ScreenRestCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+        ) {
+            MoreMenuIcon(R.drawable.ic_family_device, ScreenRestTone.Primary)
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xxs),
+            ) {
+                Text(
+                    text = name,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = deviceLabel.ifBlank { if (korean) "기기 정보" else "Device" },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            IconButton(onClick = onSync, enabled = syncEnabled) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_family_sync),
+                    contentDescription = if (syncEnabled) {
+                        if (korean) "새 사용 현황 요청" else "Request fresh usage"
+                    } else {
+                        if (korean) "다시 요청은 1분 후 가능" else "Try again in one minute"
+                    },
+                    tint = if (syncEnabled) ScreenRestTheme.colors.success
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Box(
+            modifier = Modifier.fillMaxWidth().height(1.dp)
+                .background(ScreenRestTheme.colors.divider),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            MoreMenuIcon(R.drawable.ic_family_sync, ScreenRestTone.Success)
+            Text(
+                text = familySyncLabel(lastSyncMillis, korean),
+                modifier = Modifier.weight(1f).padding(start = ScreenRestTheme.spacing.sm),
+                style = MaterialTheme.typography.bodyMedium,
+                color = ScreenRestTheme.colors.success,
+            )
+            if (!syncEnabled) {
+                ScreenRestStatusPill(
+                    label = if (korean) "잠시 후" else "Wait",
+                    tone = ScreenRestTone.Neutral,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FamilyRemoteSnapshotCard(
+    snapshot: ChildUsageSnapshot?,
+    refreshRequest: ChildUsageRefreshRequest?,
+    text: AppStrings,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var clockMillis by remember(snapshot?.capturedAtMillis) {
+        mutableStateOf(System.currentTimeMillis())
+    }
+    LaunchedEffect(snapshot?.capturedAtMillis) {
+        while (true) {
+            delay(60_000L)
+            clockMillis = System.currentTimeMillis()
+        }
+    }
+    val limitMinutes = snapshot?.effectiveDailyLimitMinutes
+    val usedMinutes = snapshot?.todayUsedMillis?.let { millis -> (millis / 60_000L).toInt() } ?: 0
+    val countedMinutes = snapshot?.dailyCountedUsageMillis?.let { millis -> (millis / 60_000L).toInt() } ?: 0
+    val remainingMinutes = snapshot?.remainingDailyMinutes()
+    val stale = snapshot?.let { usage ->
+        usage.isDelayed(clockMillis) ||
+            usage.dateKey != java.time.Instant.ofEpochMilli(clockMillis)
+                .atZone(java.time.ZoneId.systemDefault()).toLocalDate().toString()
+    } == true
+    val refreshPending = refreshRequest?.isPending(clockMillis) == true
+    val refreshDelayed = refreshRequest?.isDelayed(clockMillis) == true
+    val refreshExpired = refreshRequest != null && refreshRequest.completedAtMillis == 0L &&
+        refreshRequest.expiresAtMillis <= clockMillis &&
+        clockMillis - refreshRequest.expiresAtMillis < 60 * 60_000L &&
+        (snapshot == null || snapshot.capturedAtMillis < refreshRequest.requestedAtMillis - 2 * 60_000L)
+    val progress = if (limitMinutes == 0) {
+        1f
+    } else if (limitMinutes != null && limitMinutes > 0) {
+        countedMinutes.toFloat().div(limitMinutes.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    ScreenRestCard(tone = if (snapshot == null || stale || !snapshot.usageAccessReady || refreshPending) {
+        ScreenRestTone.Warning
+    } else {
+        ScreenRestTone.Success
+    }) {
+        if (snapshot == null) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+            ) {
+                MoreMenuIcon(R.drawable.ic_family_clock, ScreenRestTone.Neutral)
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (korean) "자녀 사용량 대기 중" else "Waiting for child usage",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = if (refreshExpired) {
+                            if (korean) "새 기록 요청이 만료됐습니다. 다시 동기화해 주세요."
+                            else "The refresh request expired. Try syncing again."
+                        } else if (refreshPending) {
+                            if (korean) "새 사용 현황을 요청했습니다. 자녀 기기 응답을 기다리는 중입니다."
+                            else "Fresh usage requested. Waiting for the child device."
+                        } else if (korean) {
+                            "동기화를 누르거나 자녀 기기의 정기 동기화를 기다려 주세요."
+                        } else {
+                            "Tap sync or wait for the child's scheduled update."
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        } else {
+            ScreenRestSectionHeader(
+                title = if (stale) {
+                    if (korean) "마지막 사용 기록" else "Last usage snapshot"
+                } else {
+                    if (korean) "오늘 사용" else "Today's usage"
+                },
+                supportingText = snapshot.dateKey,
+                action = {
+                    ScreenRestStatusPill(
+                        label = if (refreshDelayed) {
+                            if (korean) "연결 대기" else "Waiting for device"
+                        } else if (refreshPending) {
+                            if (korean) "새 기록 요청 중" else "Refreshing"
+                        } else if (stale) {
+                            if (korean) "업데이트 지연" else "Update delayed"
+                        } else {
+                            if (korean) "동기화됨" else "Synced"
+                        },
+                        tone = if (stale || refreshPending) ScreenRestTone.Warning else ScreenRestTone.Success,
+                    )
+                },
+            )
+            if (!snapshot.usageAccessReady) {
+                Text(
+                    text = if (korean) "자녀 기기의 사용 기록 권한을 확인해 주세요" else "Check usage access on the child device",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            } else {
+                Text(
+                    text = if (remainingMinutes != null) {
+                        if (korean) "전체 ${formatLimitMinutesLabel(usedMinutes)} · 제한 ${formatLimitMinutesLabel(remainingMinutes)} 남음" else "${formatLimitMinutesLabel(usedMinutes)} total · ${formatLimitMinutesLabel(remainingMinutes)} limit left"
+                    } else {
+                        if (korean) "${formatLimitMinutesLabel(usedMinutes)} 사용" else "${formatLimitMinutesLabel(usedMinutes)} used"
+                    },
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                if (remainingMinutes != null) {
+                    FamilyUsageProgress(progress = progress, tone = ScreenRestTone.Warning)
+                }
+                if (snapshot.appUsageSharingEnabled) {
+                    Text(
+                        if (korean) "많이 사용한 앱" else "Most-used apps",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    if (snapshot.topApps.isEmpty()) {
+                        Text(
+                            if (korean) "아직 기록된 앱이 없습니다" else "No app usage recorded yet",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Surface(
+                            shape = RoundedCornerShape(ScreenRestTheme.radii.row),
+                            color = MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, ScreenRestTheme.colors.divider),
+                        ) {
+                            Column(modifier = Modifier.padding(horizontal = ScreenRestTheme.spacing.xs)) {
+                                val visibleApps = snapshot.topApps.take(5)
+                                visibleApps.forEachIndexed { index, app ->
+                                    ScreenRestListRow(
+                                        title = app.appName,
+                                        leading = {
+                                            FamilyTopAppBadge(app.appName)
+                                        },
+                                        trailing = {
+                                            Text(
+                                                formatDuration(app.usedMillis),
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                            )
+                                        },
+                                    )
+                                    if (index != visibleApps.lastIndex) {
+                                        Box(
+                                            modifier = Modifier.fillMaxWidth().padding(start = 54.dp)
+                                                .height(1.dp).background(ScreenRestTheme.colors.divider),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Text(
+                        if (korean) "앱별 현황은 자녀 기기에서 공유에 동의하면 표시됩니다"
+                        else "App usage appears after sharing is enabled on the child device",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Text(
+                text = when {
+                    snapshot.protectionPaused -> if (korean) "자녀 기기에서 보호가 일시 중지되었습니다" else "Protection is paused on the child device"
+                    snapshot.dailyUnlockedForToday -> if (korean) "오늘의 전체 시간 제한이 해제되었습니다" else "The daily limit is unlocked for today"
+                    limitMinutes == null -> if (korean) "오늘의 전체 시간 제한이 없습니다" else "No overall daily limit is set"
+                    else -> if (korean) "자녀 기기에서 측정한 값입니다" else "Measured on the child device"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = familySyncLabel(snapshot.capturedAtMillis, korean),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (refreshPending || refreshExpired) {
+                Text(
+                    text = if (refreshExpired) {
+                        if (korean) "새 기록 요청이 만료됐습니다. 마지막 측정값을 표시합니다."
+                        else "Refresh request expired. Showing the last measurement."
+                    } else if (refreshDelayed) {
+                        if (korean) "자녀 기기가 오프라인이거나 절전 중일 수 있습니다."
+                        else "The child device may be offline or sleeping."
+                    } else {
+                        if (korean) "자녀 기기에서 새 사용량을 측정하고 있습니다."
+                        else "Waiting for a new measurement from the child device."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FamilyTopAppBadge(appName: String) {
+    val paletteIndex = Math.floorMod(appName.trim().lowercase().hashCode(), 5)
+    val (background, foreground) = when (paletteIndex) {
+        0 -> MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.primary
+        1 -> MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.secondary
+        2 -> MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.tertiary
+        3 -> ScreenRestTheme.colors.scheduleContainer to ScreenRestTheme.colors.schedule
+        else -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.error
+    }
+    val initial = appName.trim().takeIf { it.isNotEmpty() }
+        ?.let { name -> String(Character.toChars(name.codePointAt(0))).uppercase() }
+        ?: "·"
+    Surface(
+        modifier = Modifier.size(34.dp),
+        shape = RoundedCornerShape(11.dp),
+        color = background,
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = initial,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                color = foreground,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FamilyLocalUsageCard(
+    summary: PolicySummary,
+    safeModeEnabled: Boolean,
+    policyEnforcementEnabled: Boolean,
+    text: AppStrings,
+    onOpenRules: () -> Unit,
+) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val availableMinutes = (summary.totalLimitMinutes + summary.totalExtraMinutes).coerceAtLeast(0)
+    val remainingMinutes = (availableMinutes - summary.totalUsedMinutes).coerceAtLeast(0)
+    val progress = if (summary.totalLimitEnabled && availableMinutes > 0) {
+        summary.totalUsedMinutes.toFloat().div(availableMinutes.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    val statusTitle = when {
+        safeModeEnabled -> if (korean) "보호 일시 중지" else "Protection paused"
+        !policyEnforcementEnabled -> if (korean) "규칙 적용 꺼짐" else "Rules are off"
+        summary.totalUnlockedForToday -> if (korean) "오늘만 허용" else "Allowed for today"
+        summary.totalStatus == LimitStatus.Exceeded -> if (korean) "사용 시간 종료" else "Time is up"
+        summary.activeScheduleSummary != null -> summary.activeScheduleSummary.name
+        summary.allowOnlyModeEnabled -> if (korean) "허용앱만 사용" else "Allow-only mode"
+        else -> if (korean) "자유 시간" else "Free time"
+    }
+    ScreenRestCard(tone = when {
+        summary.totalStatus == LimitStatus.Exceeded -> ScreenRestTone.Blocked
+        summary.totalStatus == LimitStatus.Warning -> ScreenRestTone.Warning
+        else -> ScreenRestTone.Success
+    }) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+        ) {
+            MoreMenuIcon(R.drawable.ic_family_clock, ScreenRestTone.Success)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(statusTitle, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(
+                    text = if (summary.totalLimitEnabled) {
+                        if (korean) "${formatLimitMinutesLabel(summary.totalUsedMinutes)} 사용 · ${formatLimitMinutesLabel(remainingMinutes)} 남음" else "${formatLimitMinutesLabel(summary.totalUsedMinutes)} used · ${formatLimitMinutesLabel(remainingMinutes)} left"
+                    } else {
+                        if (korean) "${formatLimitMinutesLabel(summary.actualTotalUsedMinutes)} 사용 · 제한 없음" else "${formatLimitMinutesLabel(summary.actualTotalUsedMinutes)} used · no daily limit"
+                    },
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+        if (summary.totalLimitEnabled) {
+            FamilyUsageProgress(
+                progress = progress,
+                tone = when (summary.totalStatus) {
+                    LimitStatus.Normal -> ScreenRestTone.Success
+                    LimitStatus.Warning -> ScreenRestTone.Warning
+                    LimitStatus.Exceeded -> ScreenRestTone.Blocked
+                },
+            )
+            Text(
+                text = if (korean) "오늘 ${formatLimitMinutesLabel(availableMinutes)}" else "Today ${formatLimitMinutesLabel(availableMinutes)}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(ScreenRestTheme.colors.divider),
+        )
+        Surface(
+            shape = RoundedCornerShape(ScreenRestTheme.radii.row),
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, ScreenRestTheme.colors.divider),
+        ) {
+            Column(modifier = Modifier.padding(horizontal = ScreenRestTheme.spacing.xs)) {
+                FamilyRuleSummaryRow(
+                    title = if (korean) "요일별 제한" else "Daily limit",
+                    value = if (summary.totalLimitEnabled) formatLimitMinutesLabel(availableMinutes) else text.noLimit,
+                    iconRes = R.drawable.ic_nav_today,
+                )
+                Box(modifier = Modifier.fillMaxWidth().padding(start = 62.dp)
+                    .height(1.dp).background(ScreenRestTheme.colors.divider))
+                FamilyRuleSummaryRow(
+                    title = if (korean) "앱별 제한" else "App limits",
+                    value = if (korean) "${summary.appLimitSummaries.count { it.activeToday }}개 적용" else "${summary.appLimitSummaries.count { it.activeToday }} active",
+                    iconRes = R.drawable.ic_nav_rules,
+                )
+                Box(modifier = Modifier.fillMaxWidth().padding(start = 62.dp)
+                    .height(1.dp).background(ScreenRestTheme.colors.divider))
+                FamilyRuleSummaryRow(
+                    title = if (korean) "실행 범위" else "App availability",
+                    value = when {
+                        summary.activeScheduleSummary != null -> if (korean) "스케줄 적용 중" else "Schedule active"
+                        summary.allowOnlyModeEnabled -> if (korean) "허용앱만 적용 중" else "Allow-only active"
+                        else -> if (korean) "일반" else "Normal"
+                    },
+                    iconRes = R.drawable.ic_more_protection,
+                )
+            }
+        }
+        OutlinedButton(
+            onClick = onOpenRules,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(ScreenRestTheme.radii.button),
+        ) {
+            Text(if (korean) "내 규칙 보기" else "View my rules")
+        }
+    }
+}
+
+@Composable
+private fun FamilyUsageProgress(progress: Float, tone: ScreenRestTone) {
+    val color = when (tone) {
+        ScreenRestTone.Success -> ScreenRestTheme.colors.success
+        ScreenRestTone.Warning -> ScreenRestTheme.colors.warning
+        ScreenRestTone.Blocked -> ScreenRestTheme.colors.blocked
+        else -> MaterialTheme.colorScheme.primary
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(10.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(ScreenRestTheme.colors.progressTrack),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(progress.coerceIn(0f, 1f))
+                .background(color),
+        )
+    }
+}
+
+@Composable
+private fun FamilyRuleSummaryRow(title: String, value: String, iconRes: Int) {
+    ScreenRestListRow(
+        title = title,
+        leading = { MoreMenuIcon(iconRes, ScreenRestTone.Primary) },
+        trailing = {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        },
+    )
+}
+
+@Composable
+private fun FamilyChildRequestHistory(requests: List<RemoteUnlockRequest>, text: AppStrings) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000L)
+            now = System.currentTimeMillis()
+        }
+    }
+    var showAllToday by rememberSaveable { mutableStateOf(false) }
+    var showRecentHistory by rememberSaveable { mutableStateOf(false) }
+    val grouped = groupRemoteRequestsForDisplay(requests, now)
+    val visibleRequests = grouped.pending + (if (showAllToday) grouped.today else grouped.today.take(3)) +
+        (if (showRecentHistory) grouped.recentHistory else emptyList())
+    FamilySectionTitle(if (korean) "보낸 요청" else "Sent requests")
+    ScreenRestCard(tone = if (grouped.pending.isNotEmpty()) ScreenRestTone.Warning else ScreenRestTone.Neutral) {
+        if (grouped.pending.isEmpty() && grouped.today.isEmpty() && grouped.recentHistory.isEmpty()) {
+            Text(
+                text = if (korean) "보낸 요청이 없습니다" else "No sent requests",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            visibleRequests.forEachIndexed { index, request ->
+                val displayStatus = if (request.status == RemoteUnlockRequestStatus.Pending &&
+                    request.expiresAtMillis < now
+                ) RemoteUnlockRequestStatus.Expired else request.status
+                ScreenRestListRow(
+                    title = request.remoteRequestTitle(text),
+                    supportingText = if (korean) {
+                        "${formatClockTime(request.createdAtMillis)} · ${formatLimitMinutesLabel(request.requestedMinutes)} 요청"
+                    } else {
+                        "${formatClockTime(request.createdAtMillis)} · requested ${formatLimitMinutesLabel(request.requestedMinutes)}"
+                    },
+                    leading = {
+                        MoreMenuIcon(
+                            R.drawable.ic_family_clock,
+                            if (displayStatus == RemoteUnlockRequestStatus.Pending) ScreenRestTone.Warning else ScreenRestTone.Neutral,
+                        )
+                    },
+                    trailing = {
+                        ScreenRestStatusPill(
+                            label = familyRequestStatusLabel(displayStatus, korean),
+                            tone = when (displayStatus) {
+                                RemoteUnlockRequestStatus.Pending -> ScreenRestTone.Warning
+                                RemoteUnlockRequestStatus.Approved -> ScreenRestTone.Success
+                                else -> ScreenRestTone.Neutral
+                            },
+                        )
+                    },
+                )
+                if (index != visibleRequests.lastIndex) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .background(ScreenRestTheme.colors.divider),
+                    )
+                }
+            }
+            if (grouped.today.size > 3) {
+                TextButton(onClick = { showAllToday = !showAllToday }) {
+                    Text(if (showAllToday) {
+                        if (korean) "오늘 이력 접기" else "Show less"
+                    } else {
+                        if (korean) "오늘 이력 ${grouped.today.size}건 보기" else "View all ${grouped.today.size} today"
+                    })
+                }
+            }
+            if (grouped.recentHistory.isNotEmpty()) {
+                TextButton(onClick = { showRecentHistory = !showRecentHistory }) {
+                    Text(if (showRecentHistory) {
+                        if (korean) "지난 이력 접기" else "Hide recent history"
+                    } else {
+                        if (korean) "지난 7일 이력 ${grouped.recentHistory.size}건" else "Last 7 days · ${grouped.recentHistory.size}"
+                    })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FamilyManagementEntry(text: AppStrings, onClick: () -> Unit) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    FamilySectionTitle(if (korean) "가족 관리" else "Family management")
+    ScreenRestCard(contentPadding = PaddingValues(vertical = ScreenRestTheme.spacing.xxs)) {
+        ScreenRestListRow(
+            title = if (korean) "가족 및 기기 관리" else "Family and device management",
+            supportingText = if (korean) "연결 · 역할 · 프로필 · 동기화" else "Pairing · roles · profiles · sync",
+            onClick = onClick,
+            leading = { MoreMenuIcon(R.drawable.ic_family_manage, ScreenRestTone.Primary) },
+            trailing = { MoreChevron() },
+        )
+    }
+}
+
+@Composable
+private fun FamilySectionTitle(title: String) {
+    Text(
+        text = title,
+        modifier = Modifier.padding(horizontal = ScreenRestTheme.spacing.xs),
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.onBackground,
+    )
+}
+
+private fun familySyncLabel(lastSyncMillis: Long, korean: Boolean): String {
+    if (lastSyncMillis <= 0L) {
+        return if (korean) "아직 동기화되지 않음" else "Not synced yet"
+    }
+    val elapsedMinutes = ((System.currentTimeMillis() - lastSyncMillis).coerceAtLeast(0L) / 60_000L).toInt()
+    return when {
+        elapsedMinutes < 1 -> if (korean) "방금 동기화" else "Synced just now"
+        elapsedMinutes < 60 -> if (korean) "${elapsedMinutes}분 전 동기화" else "Synced ${elapsedMinutes}m ago"
+        elapsedMinutes < 1_440 -> {
+            val hours = elapsedMinutes / 60
+            if (korean) "${hours}시간 전 동기화" else "Synced ${hours}h ago"
+        }
+        else -> if (korean) "마지막 동기화 ${formatDateTime(lastSyncMillis)}" else "Last sync ${formatDateTime(lastSyncMillis)}"
+    }
+}
+
+private fun familyRequestStatusLabel(status: RemoteUnlockRequestStatus, korean: Boolean): String {
+    return when (status) {
+        RemoteUnlockRequestStatus.Pending -> if (korean) "대기" else "Pending"
+        RemoteUnlockRequestStatus.Approved -> if (korean) "승인" else "Approved"
+        RemoteUnlockRequestStatus.Rejected -> if (korean) "거절" else "Rejected"
+        RemoteUnlockRequestStatus.Expired -> if (korean) "만료" else "Expired"
+        RemoteUnlockRequestStatus.Failed -> if (korean) "실패" else "Failed"
     }
 }
 
@@ -4235,10 +7489,17 @@ private fun RemoteUnlockRequestList(
     onApproveUnlockToday: (RemoteUnlockRequest) -> Unit,
     onReject: (RemoteUnlockRequest) -> Unit,
 ) {
-    val now = System.currentTimeMillis()
-    val activeRequestCount = requests.count { request ->
-        request.status == RemoteUnlockRequestStatus.Pending && request.expiresAtMillis >= now
+    val korean = text.appLanguage == AppLanguage.Korean
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    var showAllToday by rememberSaveable { mutableStateOf(false) }
+    var showRecentHistory by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000L)
+            now = System.currentTimeMillis()
+        }
     }
+    val grouped = groupRemoteRequestsForDisplay(requests, now)
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.30f),
@@ -4255,38 +7516,64 @@ private fun RemoteUnlockRequestList(
                     fontWeight = FontWeight.Bold,
                 )
                 StatusBadge(
-                    label = activeRequestCount.toString(),
-                    status = if (activeRequestCount > 0) {
+                    label = grouped.pending.size.toString(),
+                    status = if (grouped.pending.isNotEmpty()) {
                         LimitStatus.Warning
                     } else {
                         LimitStatus.Normal
                     },
                 )
             }
-            if (requests.isEmpty()) {
+            if (grouped.pending.isEmpty() && grouped.today.isEmpty() && grouped.recentHistory.isEmpty()) {
                 Text(
                     text.noRemoteRequests,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
-                requests
-                    .sortedWith(
-                        compareByDescending<RemoteUnlockRequest> { request ->
-                            request.status == RemoteUnlockRequestStatus.Pending && request.expiresAtMillis >= now
-                        }.thenByDescending { request -> request.createdAtMillis },
+                if (grouped.pending.isNotEmpty()) {
+                    Text(
+                        if (korean) "처리 대기" else "Pending",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
                     )
-                    .take(5)
-                    .forEach { request ->
-                        RemoteUnlockRequestRow(
-                            request = request,
-                            now = now,
-                            text = text,
-                            onApproveExtraTime = onApproveExtraTime,
-                            onApproveUnlockToday = onApproveUnlockToday,
-                            onReject = onReject,
-                        )
+                    grouped.pending.forEach { request ->
+                        RemoteUnlockRequestRow(request, now, text, onApproveExtraTime, onApproveUnlockToday, onReject)
                     }
+                }
+                if (grouped.today.isNotEmpty()) {
+                    Text(
+                        if (korean) "오늘 요청·처리" else "Today's requests",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    (if (showAllToday) grouped.today else grouped.today.take(3)).forEach { request ->
+                        RemoteUnlockRequestRow(request, now, text, onApproveExtraTime, onApproveUnlockToday, onReject)
+                    }
+                    if (grouped.today.size > 3) {
+                        TextButton(onClick = { showAllToday = !showAllToday }) {
+                            Text(if (showAllToday) {
+                                if (korean) "오늘 이력 접기" else "Show less"
+                            } else {
+                                if (korean) "오늘 이력 ${grouped.today.size}건 보기" else "View all ${grouped.today.size} today"
+                            })
+                        }
+                    }
+                }
+                if (grouped.recentHistory.isNotEmpty()) {
+                    TextButton(onClick = { showRecentHistory = !showRecentHistory }) {
+                        Text(if (showRecentHistory) {
+                            if (korean) "지난 이력 접기" else "Hide recent history"
+                        } else {
+                            if (korean) "지난 7일 이력 ${grouped.recentHistory.size}건" else "Last 7 days · ${grouped.recentHistory.size}"
+                        })
+                    }
+                    if (showRecentHistory) {
+                        grouped.recentHistory.forEach { request ->
+                            RemoteUnlockRequestRow(request, now, text, onApproveExtraTime, onApproveUnlockToday, onReject)
+                        }
+                    }
+                }
             }
         }
     }
@@ -4845,16 +8132,18 @@ private fun PolicyExceptionAppsCard(
         expandedExemptPackages intersect (limitedByApp + limitedByGroup)
     }
 
-    SimpleCard {
+    ScreenRestCard(
+        contentPadding = PaddingValues(horizontal = ScreenRestTheme.spacing.sm, vertical = ScreenRestTheme.spacing.xs),
+    ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().heightIn(min = ScreenRestTheme.sizes.minimumTouchTarget),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs),
         ) {
             Text(
                 if (text.appLanguage == AppLanguage.Korean) "제한 없는 앱" else "Unrestricted apps",
                 modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.titleLarge,
+                style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
             StatusBadge(
@@ -4865,9 +8154,11 @@ private fun PolicyExceptionAppsCard(
                 },
                 LimitStatus.Normal,
             )
-            OutlinedButton(onClick = { expanded = !expanded }) {
-                Text(if (expanded) text.collapseSection else text.expandSection)
-            }
+            SectionExpandButton(
+                expanded = expanded,
+                text = text,
+                onClick = { expanded = !expanded },
+            )
         }
 
         if (expanded) {
@@ -6026,6 +9317,7 @@ private fun BlockDecision.isWouldBlockDecision(): Boolean {
     return this == BlockDecision.WouldBlockTotalLimit ||
         this == BlockDecision.WouldBlockSchedule ||
         this == BlockDecision.WouldBlockAllowOnly ||
+        this == BlockDecision.WouldBlockImmediate ||
         this == BlockDecision.WouldBlockGroupLimit ||
         this == BlockDecision.WouldBlockAppLimit
 }
@@ -6436,7 +9728,8 @@ private fun EffectiveAppResultsSection(
     fun EffectiveAppPolicySummary.isBlocked(): Boolean {
         return status == LimitStatus.Exceeded ||
             access == EffectiveAppAccess.BlockedBySchedule ||
-            access == EffectiveAppAccess.BlockedByAllowOnly
+            access == EffectiveAppAccess.BlockedByAllowOnly ||
+            access == EffectiveAppAccess.BlockedByParent
     }
     fun EffectiveAppPolicySummary.isExempt(): Boolean {
         return access == EffectiveAppAccess.AllRestrictionsExempt
@@ -6773,6 +10066,8 @@ private fun EffectiveAppPolicyRow(
             if (text.appLanguage == AppLanguage.Korean) "스케줄 차단" else "Blocked by schedule"
         EffectiveAppAccess.BlockedByAllowOnly ->
             if (text.appLanguage == AppLanguage.Korean) "허용앱만 차단" else "Blocked by allow-only"
+        EffectiveAppAccess.BlockedByParent ->
+            if (text.appLanguage == AppLanguage.Korean) "부모 차단" else "Blocked by parent"
     }
     val limitingLabel = when (summary.limitingPolicy) {
         EffectiveTimeLimiter.None -> null
@@ -6887,6 +10182,12 @@ private fun effectiveAppPolicyExplanation(
                 "허용앱만 모드의 허용 목록에 포함되지 않아 차단됩니다."
             } else {
                 "Blocked because it is not in the allow-only list."
+            }
+        EffectiveAppAccess.BlockedByParent ->
+            if (text.appLanguage == AppLanguage.Korean) {
+                "부모의 즉시 차단이 적용 중입니다. 지정한 종료 시각이 되면 자동으로 해제됩니다."
+            } else {
+                "The parent's immediate block is active. It ends at the selected time."
             }
         else -> when (summary.limitingPolicy) {
             EffectiveTimeLimiter.Daily ->
@@ -7880,15 +11181,16 @@ fun MinuteControlPanel(
     pickerSaveLabel: String? = null,
 ) {
     Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.66f),
+        shape = RoundedCornerShape(ScreenRestTheme.radii.row),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, ScreenRestTheme.colors.divider),
     ) {
-        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     title,
                     modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleMedium,
+                    style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -7917,6 +11219,7 @@ private enum class AppLimitFilter {
 private enum class PolicyContentMode {
     TimeControls,
     BlockingControls,
+    AllControls,
 }
 
 private enum class PolicySectionIcon {
@@ -7940,55 +11243,138 @@ private fun CollapsiblePolicyCard(
     onExpandedChange: (Boolean) -> Unit,
     text: AppStrings,
     helpText: String? = null,
+    supportingText: String? = null,
+    collapsedStatusText: String? = null,
+    collapsedStatusColor: Color? = null,
     hardshipLevel: HardshipLevel = HardshipLevel.Off,
     reserveHeaderTrailingSpace: Boolean = false,
+    showHeaderTrailingOnlyWhenExpanded: Boolean = false,
     headerTrailing: @Composable () -> Unit = {},
     content: @Composable ColumnScope.() -> Unit,
 ) {
     var helpVisible by rememberSaveable(title) { mutableStateOf(false) }
-    SimpleCard {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            PolicySectionHeader(
-                title = title,
-                icon = icon,
-                modifier = Modifier.weight(1f),
-                hardshipLevel = hardshipLevel,
-                text = text,
-            )
-            if (!helpText.isNullOrBlank()) {
-                PolicyHelpButton(onClick = { helpVisible = true })
-            }
-            if (reserveHeaderTrailingSpace) {
-                Box(
-                    modifier = Modifier.width(92.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
+    val korean = text.appLanguage == AppLanguage.Korean
+    val tone = when (icon) {
+        PolicySectionIcon.DailyLimit, PolicySectionIcon.AppLimits -> ScreenRestTone.Primary
+        PolicySectionIcon.AppGroups -> ScreenRestTone.Success
+        PolicySectionIcon.Schedule -> ScreenRestTone.Schedule
+        PolicySectionIcon.AllowOnly -> ScreenRestTone.Warning
+        else -> ScreenRestTone.Neutral
+    }
+    ScreenRestCard(
+        contentPadding = PaddingValues(ScreenRestTheme.spacing.md),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = ScreenRestTheme.sizes.minimumTouchTarget)
+                    .clickable { onExpandedChange(!expanded) },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs),
+            ) {
+                PolicySectionHeader(
+                    title = title,
+                    icon = icon,
+                    modifier = Modifier.weight(1f),
+                    hardshipLevel = hardshipLevel,
+                    text = text,
+                )
+                if (!showHeaderTrailingOnlyWhenExpanded && !reserveHeaderTrailingSpace) {
                     headerTrailing()
                 }
-            } else {
-                headerTrailing()
+                SectionExpandButton(
+                    expanded = expanded,
+                    text = text,
+                    onClick = { onExpandedChange(!expanded) },
+                )
             }
-            SectionExpandButton(
-                expanded = expanded,
-                text = text,
-                onClick = { onExpandedChange(!expanded) },
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xs),
+            ) {
+                if (!supportingText.isNullOrBlank()) {
+                    Text(
+                        text = supportingText,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                } else {
+                    Spacer(Modifier.weight(1f))
+                }
+                if (!collapsedStatusText.isNullOrBlank()) {
+                    ScreenRestStatusPill(
+                        label = collapsedStatusText,
+                        tone = if (collapsedStatusColor != null) tone else ScreenRestTone.Neutral,
+                    )
+                }
+            }
         }
         if (expanded) {
-            content()
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(ScreenRestTheme.colors.divider),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+            ) {
+                Text(
+                    text = if (korean) "사용 설정" else "Controls",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = tone.contentColor(),
+                )
+                if (showHeaderTrailingOnlyWhenExpanded || reserveHeaderTrailingSpace) {
+                    headerTrailing()
+                }
+            }
+            if (!helpText.isNullOrBlank()) {
+                TextButton(onClick = { helpVisible = !helpVisible }) {
+                    Text(
+                        text = if (helpVisible) {
+                            if (korean) "설명 접기" else "Hide explanation"
+                        } else {
+                            if (korean) "자세한 설명" else "How this works"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
+                if (helpVisible) {
+                    Surface(
+                        shape = RoundedCornerShape(ScreenRestTheme.radii.row),
+                        color = tone.contentColor().copy(alpha = 0.08f),
+                    ) {
+                        Text(
+                            text = helpText,
+                            modifier = Modifier.padding(ScreenRestTheme.spacing.sm),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            Surface(
+                shape = RoundedCornerShape(ScreenRestTheme.radii.row),
+                color = tone.contentColor().copy(alpha = 0.045f),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(ScreenRestTheme.spacing.sm),
+                    verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
+                    content = content,
+                )
+            }
         }
-    }
-    if (helpVisible && !helpText.isNullOrBlank()) {
-        PolicyHelpDialog(
-            title = title,
-            description = helpText,
-            text = text,
-            onDismiss = { helpVisible = false },
-        )
     }
 }
 
@@ -8055,17 +11441,33 @@ private fun PolicySectionHeader(
     hardshipLevel: HardshipLevel = HardshipLevel.Off,
     text: AppStrings,
 ) {
+    val (iconRes, tone) = when (icon) {
+        PolicySectionIcon.DailyLimit -> R.drawable.ic_nav_today to ScreenRestTone.Primary
+        PolicySectionIcon.AppGroups -> R.drawable.ic_nav_rules to ScreenRestTone.Success
+        PolicySectionIcon.AppLimits -> R.drawable.ic_family_device to ScreenRestTone.Primary
+        PolicySectionIcon.Schedule -> R.drawable.ic_family_clock to ScreenRestTone.Schedule
+        PolicySectionIcon.AllowOnly -> R.drawable.ic_more_protection to ScreenRestTone.Warning
+        else -> R.drawable.ic_more_protection to ScreenRestTone.Neutral
+    }
     Row(
         modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.sm),
     ) {
-        PolicySectionIconBadge(icon = icon)
+        MoreMenuIcon(iconRes, tone)
         Row(
+            modifier = Modifier.weight(1f),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.xxs),
         ) {
-            SectionTitle(title)
+            Text(
+                text = title,
+                modifier = Modifier.weight(1f, fill = false),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (hardshipLevel != HardshipLevel.Off) {
                 HardshipStageIndicator(level = hardshipLevel, text = text)
             }
@@ -8086,10 +11488,10 @@ private fun HardshipStageIndicator(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        HardshipMeditationIcon(level = level, modifier = Modifier.size(28.dp))
+        HardshipMeditationIcon(level = level, modifier = Modifier.size(22.dp))
         Text(
             text = text.hardshipLevelLabel(level),
-            style = MaterialTheme.typography.titleMedium,
+            style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Bold,
             color = color,
             maxLines = 1,
@@ -8132,6 +11534,36 @@ private fun hardshipAwareSwitchColors(level: HardshipLevel): SwitchColors {
 }
 
 @Composable
+private fun CompactPolicySwitch(
+    checked: Boolean,
+    enabled: Boolean,
+    hardshipLevel: HardshipLevel,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(width = 56.dp, height = ScreenRestTheme.sizes.minimumTouchTarget)
+            .toggleable(
+                value = checked,
+                enabled = enabled,
+                role = Role.Switch,
+                onValueChange = onCheckedChange,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Switch(
+            checked = checked,
+            onCheckedChange = null,
+            enabled = enabled,
+            colors = hardshipAwareSwitchColors(hardshipLevel),
+            modifier = Modifier
+                .graphicsLayer(scaleX = 0.82f, scaleY = 0.82f)
+                .clearAndSetSemantics {},
+        )
+    }
+}
+
+@Composable
 private fun SectionExpandButton(
     expanded: Boolean,
     text: AppStrings,
@@ -8139,18 +11571,21 @@ private fun SectionExpandButton(
 ) {
     Surface(
         onClick = onClick,
+        modifier = Modifier.size(width = 60.dp, height = 40.dp),
         shape = RoundedCornerShape(999.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        color = if (expanded) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.75f)
+            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f)),
     ) {
-        Text(
-            text = if (expanded) text.collapseSection else text.expandSection,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary,
-            maxLines = 1,
-        )
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = if (expanded) text.collapseSection else text.expandSection,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+            )
+        }
     }
 }
 
@@ -8169,7 +11604,7 @@ private fun HardshipModeFooter(
             .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f)),
     )
     Surface(
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(ScreenRestTheme.radii.row),
         color = if (level == HardshipLevel.Off) {
             MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f)
         } else {
@@ -8187,14 +11622,14 @@ private fun HardshipModeFooter(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(9.dp),
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                HardshipMeditationIcon(level = level, modifier = Modifier.size(36.dp))
+                HardshipMeditationIcon(level = level, modifier = Modifier.size(28.dp))
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     Text(
                         text = text.hardshipModeTitle(),
@@ -8207,7 +11642,7 @@ private fun HardshipModeFooter(
                         } else {
                             text.hardshipConfiguredDescription(level)
                         },
-                        style = MaterialTheme.typography.bodyMedium,
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -8215,7 +11650,7 @@ private fun HardshipModeFooter(
             Button(
                 onClick = onClick,
                 enabled = enabled,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().height(44.dp),
                 shape = RoundedCornerShape(14.dp),
                 colors = if (level == HardshipLevel.Off) {
                     ButtonDefaults.buttonColors()
@@ -8233,7 +11668,7 @@ private fun HardshipModeFooter(
                     } else {
                         text.hardshipLevelLabel(level) + " · " + text.hardshipChangeLabel()
                     },
-                    style = MaterialTheme.typography.titleMedium,
+                    style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
                 )
             }
@@ -8892,14 +12327,14 @@ private fun PolicySectionIconBadge(
     val primary = MaterialTheme.colorScheme.primary
     val onPrimaryContainer = MaterialTheme.colorScheme.onPrimaryContainer
     Surface(
-        modifier = modifier.size(42.dp),
+        modifier = modifier.size(36.dp),
         shape = CircleShape,
         color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.60f),
     ) {
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(10.dp),
+                .padding(8.dp),
         ) {
             val strokeWidth = size.minDimension * 0.11f
             val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round)
@@ -9213,16 +12648,29 @@ fun ScheduleBlockingCard(
     activeHardshipPolicyKeys: Set<HardshipPolicyKey>,
     onHardshipConfigure: (HardshipPolicyKey) -> Unit,
 ) {
+    val schedules = settings.normalizedScheduleTemplates()
+    val enabledScheduleCount = schedules.count { schedule -> schedule.enabled }
     val scheduleActiveNow = settings.isScheduleBlockingNow()
     val statusTemplate = settings.activeScheduleTemplate()
         ?: settings.selectedScheduleTemplate()
-    val hasConfiguredScheduleHardship = settings.normalizedScheduleTemplates().any { schedule ->
+    val hasConfiguredScheduleHardship = schedules.any { schedule ->
         schedule.hardshipLevel != HardshipLevel.Off
     }
     val scheduleHardshipLevel = settings.hardshipLevelFor(HardshipPolicyType.Schedule)
     CollapsiblePolicyCard(
         title = text.scheduleBlocking,
         icon = PolicySectionIcon.Schedule,
+        supportingText = if (text.appLanguage == AppLanguage.Korean) {
+            "정해진 시간에는 선택한 앱만 허용합니다"
+        } else {
+            "Allow only selected apps at scheduled times"
+        },
+        collapsedStatusText = if (text.appLanguage == AppLanguage.Korean) {
+            "활성 $enabledScheduleCount/${schedules.size}"
+        } else {
+            "$enabledScheduleCount/${schedules.size} active"
+        },
+        collapsedStatusColor = if (enabledScheduleCount > 0) ScreenRestPalette.Teal else null,
         helpText = if (text.appLanguage == AppLanguage.Korean) {
             "지정한 시간에는 선택한 앱만 실행됩니다. 요일별·그룹·앱별 시간 제한은 계속 적용되며, 여러 스케줄은 겹치게 저장할 수 없습니다."
         } else {
@@ -9232,67 +12680,59 @@ fun ScheduleBlockingCard(
         onExpandedChange = onExpandedChange,
         text = text,
         hardshipLevel = scheduleHardshipLevel,
-        headerTrailing = {
-            Switch(
-                checked = settings.scheduleBlockingEnabled,
-                enabled = !settings.scheduleBlockingEnabled || !hasConfiguredScheduleHardship,
-                onCheckedChange = { enabled ->
-                    onUpdateSettings(settings.copy(scheduleBlockingEnabled = enabled))
-                },
-                colors = hardshipAwareSwitchColors(scheduleHardshipLevel),
-            )
-        },
     ) {
-        Surface(
-            shape = RoundedCornerShape(18.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.62f),
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+        if (schedules.isNotEmpty()) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.62f),
             ) {
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text(
-                        text.scheduleStatus,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    if (statusTemplate != null) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                         Text(
-                            "${formatScheduleWindow(statusTemplate.startMinutes, statusTemplate.endMinutes, text)} · ${scheduleDaysSummary(statusTemplate.days, text)}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    } else {
-                        Text(
-                            text.noSchedules,
-                            style = MaterialTheme.typography.bodyMedium,
+                            text.scheduleStatus,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        if (statusTemplate != null) {
+                            Text(
+                                "${formatScheduleWindow(statusTemplate.startMinutes, statusTemplate.endMinutes, text)} · ${scheduleDaysSummary(statusTemplate.days, text)}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        } else {
+                            Text(
+                                text.noSchedules,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
+                    StatusBadge(
+                        if (scheduleActiveNow) text.scheduleActiveNow else text.scheduleInactiveNow,
+                        if (scheduleActiveNow) LimitStatus.Exceeded else LimitStatus.Normal,
+                    )
                 }
-                StatusBadge(
-                    if (scheduleActiveNow) text.scheduleActiveNow else text.scheduleInactiveNow,
-                    if (scheduleActiveNow) LimitStatus.Exceeded else LimitStatus.Normal,
-                )
             }
+            Text(
+                text.scheduleAllowedTemplateHint,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
-        Text(
-            text.scheduleAllowedTemplateHint,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.primary,
-            fontWeight = FontWeight.SemiBold,
-        )
         if (hasConfiguredScheduleHardship) {
             Text(
                 text = if (text.appLanguage == AppLanguage.Korean) {
-                    "스케줄을 끄려면 각 스케줄의 고행 모드를 먼저 해제하세요. 3단계는 다음 날부터 변경할 수 있습니다."
+                    "고행 모드가 설정된 스케줄은 고행 종료 또는 해제 후 끌 수 있습니다."
                 } else {
-                    "Disable hardship on each schedule before turning schedules off. Level 3 can be changed the next day."
+                    "A schedule with hardship can be turned off after hardship ends or is removed."
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = AppOver,
@@ -9330,6 +12770,17 @@ fun AllowOnlyModeCard(
     CollapsiblePolicyCard(
         title = text.allowOnlyMode,
         icon = PolicySectionIcon.AllowOnly,
+        supportingText = if (text.appLanguage == AppLanguage.Korean) {
+            "선택한 앱만 실행할 수 있습니다"
+        } else {
+            "Allow only the apps you select"
+        },
+        collapsedStatusText = if (settings.allowOnlyModeEnabled) {
+            if (text.appLanguage == AppLanguage.Korean) "사용 중" else "Active"
+        } else {
+            if (text.appLanguage == AppLanguage.Korean) "꺼짐" else "Off"
+        },
+        collapsedStatusColor = if (settings.allowOnlyModeEnabled) ScreenRestPalette.Teal else null,
         helpText = if (text.appLanguage == AppLanguage.Korean) {
             "선택한 앱과 제한 없는 앱만 실행됩니다. 실행이 허용된 앱에도 요일별·그룹·앱별 시간 제한은 계속 적용됩니다."
         } else {
@@ -9339,15 +12790,17 @@ fun AllowOnlyModeCard(
         onExpandedChange = onExpandedChange,
         text = text,
         hardshipLevel = settings.allowOnlyHardshipLevel,
+        reserveHeaderTrailingSpace = true,
+        showHeaderTrailingOnlyWhenExpanded = true,
         headerTrailing = {
-            Switch(
+            CompactPolicySwitch(
                 checked = settings.allowOnlyModeEnabled,
                 enabled = !settings.allowOnlyModeEnabled ||
                     settings.allowOnlyHardshipLevel == HardshipLevel.Off,
                 onCheckedChange = { enabled ->
                     onUpdateSettings(settings.copy(allowOnlyModeEnabled = enabled))
                 },
-                colors = hardshipAwareSwitchColors(settings.allowOnlyHardshipLevel),
+                hardshipLevel = settings.allowOnlyHardshipLevel,
             )
         },
     ) {
@@ -10109,7 +13562,7 @@ private fun ScheduleTemplateSection(
         }
         onUpdateSettings(
             settings.copy(
-                scheduleBlockingEnabled = settings.scheduleBlockingEnabled,
+                scheduleBlockingEnabled = cleanedTemplates.any { template -> template.enabled },
                 scheduleStartMinutes = cleanedActiveTemplate?.startMinutes ?: settings.scheduleStartMinutes,
                 scheduleEndMinutes = cleanedActiveTemplate?.endMinutes ?: settings.scheduleEndMinutes,
                 scheduleDays = cleanedActiveTemplate?.days?.toScheduleDaysEncoded() ?: settings.scheduleDays,
@@ -10165,6 +13618,7 @@ private fun ScheduleTemplateSection(
                             endMinutes = settings.scheduleEndMinutes,
                             days = settings.scheduleDaySet(),
                             allowedPackageNames = emptySet(),
+                            enabled = false,
                         )
                         val nextTemplates = (templates + nextTemplate).takeLast(12)
                         selectedTemplateId = nextTemplate.id
@@ -10236,9 +13690,9 @@ private fun ScheduleTemplateSection(
             if (templates.isEmpty()) {
                 Text(text.noSchedules, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
-                Row(
-                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     templates.forEach { template ->
                         val scheduleOnlyPackages = template.allowedPackageNames -
@@ -10251,10 +13705,20 @@ private fun ScheduleTemplateSection(
                                 ).count { packageName -> packageName in visibleInstalledPackages },
                             selected = selectedTemplateId == template.id,
                             hardshipLevel = template.hardshipLevel,
+                            enabled = template.enabled,
+                            toggleEnabled = template.hardshipLevel == HardshipLevel.Off,
                             text = text,
                             onClick = {
                                 selectedTemplateId = template.id
                                 applyTemplates(templates, template)
+                            },
+                            onEnabledChange = { enabled ->
+                                val nextTemplates = templates.map { current ->
+                                    if (current.id == template.id) current.copy(enabled = enabled) else current
+                                }
+                                val nextSelected = nextTemplates.firstOrNull { current -> current.id == template.id }
+                                selectedTemplateId = template.id
+                                applyTemplates(nextTemplates, nextSelected)
                             },
                         )
                     }
@@ -10328,6 +13792,16 @@ private fun ScheduleTemplateSection(
                         fontWeight = FontWeight.SemiBold,
                         color = AppOver,
                     )
+                } else if (selectedTemplate.hardshipLevel != HardshipLevel.Off) {
+                    Text(
+                        text = if (text.appLanguage == AppLanguage.Korean) {
+                            "고행 모드를 해제한 뒤 이 스케줄을 끌 수 있습니다."
+                        } else {
+                            "Remove hardship before turning this schedule off."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }
@@ -10340,44 +13814,64 @@ private fun ScheduleTemplateChip(
     allowedAppCount: Int,
     selected: Boolean,
     hardshipLevel: HardshipLevel,
+    enabled: Boolean,
+    toggleEnabled: Boolean,
     text: AppStrings,
     onClick: () -> Unit,
+    onEnabledChange: (Boolean) -> Unit,
 ) {
     Surface(
         onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
-        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+        color = if (selected) {
+            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.62f)
+        } else {
+            MaterialTheme.colorScheme.surface
+        },
         border = BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
     ) {
-        Column(
+        Row(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             if (hardshipLevel != HardshipLevel.Off) {
                 HardshipMeditationIcon(level = hardshipLevel, modifier = Modifier.size(28.dp))
             }
-            Text(
-                template.name,
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.Bold,
-                color = if (selected) Color.White else MaterialTheme.colorScheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                "${formatScheduleWindow(template.startMinutes, template.endMinutes, text)} · ${scheduleDaysSummary(template.days, text)}",
-                style = MaterialTheme.typography.labelMedium,
-                color = if (selected) Color.White.copy(alpha = 0.86f) else MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                "${text.scheduleAllowedApps} $allowedAppCount",
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = if (selected) Color.White.copy(alpha = 0.92f) else MaterialTheme.colorScheme.primary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    template.name,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "${formatScheduleWindow(template.startMinutes, template.endMinutes, text)} · ${scheduleDaysSummary(template.days, text)}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "${text.scheduleAllowedApps} $allowedAppCount",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            CompactPolicySwitch(
+                checked = enabled,
+                enabled = toggleEnabled,
+                onCheckedChange = onEnabledChange,
+                hardshipLevel = hardshipLevel,
             )
         }
     }
@@ -10731,13 +14225,21 @@ fun AppGroupChip(
     text: AppStrings,
     activeDays: Set<Int>,
     hardshipLevel: HardshipLevel = HardshipLevel.Off,
+    enabled: Boolean,
+    toggleEnabled: Boolean,
     onClick: () -> Unit,
+    onEnabledChange: (Boolean) -> Unit,
 ) {
-    val dotColor = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+    val dotColor = if (enabled) ScreenRestPalette.Teal else MaterialTheme.colorScheme.outline
     Surface(
         onClick = onClick,
-        shape = RoundedCornerShape(28.dp),
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
         color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f) else MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(
+            1.dp,
+            if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+        ),
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
@@ -10748,22 +14250,34 @@ fun AppGroupChip(
                 HardshipMeditationIcon(level = hardshipLevel, modifier = Modifier.size(28.dp))
             }
             Surface(modifier = Modifier.size(10.dp), shape = CircleShape, color = dotColor) {}
-            Text(
-                name,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                "${when (budgetMinutes) {
-                    null -> text.noLimit
-                    0 -> text.zeroMinuteBlockLabel()
-                    else -> formatLimitMinutesLabel(budgetMinutes)
-                }} \u00B7 $appCount \u00B7 ${scheduleDaysSummary(activeDays, text)}",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    name,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "${when (budgetMinutes) {
+                        null -> text.noLimit
+                        0 -> text.zeroMinuteBlockLabel()
+                        else -> formatLimitMinutesLabel(budgetMinutes)
+                    }} \u00B7 $appCount \u00B7 ${scheduleDaysSummary(activeDays, text)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            CompactPolicySwitch(
+                checked = enabled,
+                enabled = toggleEnabled,
+                onCheckedChange = onEnabledChange,
+                hardshipLevel = hardshipLevel,
             )
         }
     }
@@ -11283,6 +14797,7 @@ private fun UsagePolicySection(
         dailyHardshipKey() in activeHardshipPolicyKeys
     var selectedDayIndex by remember { mutableStateOf(Calendar.getInstance().get(Calendar.DAY_OF_WEEK).toDayIndex()) }
     val appGroups = settings.normalizedAppGroups().normalizedForEditing()
+    val enabledAppGroupCount = appGroups.count { group -> group.enabled }
     val groupBudgetTotal = appGroups.mapNotNull { group -> group.limitMinutesOrNull() }.sum()
     var activeGroupId by remember { mutableStateOf(appGroups.firstOrNull()?.id.orEmpty()) }
     LaunchedEffect(appGroups.map { group -> group.id }) {
@@ -11379,6 +14894,17 @@ private fun UsagePolicySection(
         CollapsiblePolicyCard(
             title = text.dailyPolicy,
             icon = PolicySectionIcon.DailyLimit,
+            supportingText = if (text.appLanguage == AppLanguage.Korean) {
+                "요일마다 전체 사용 시간을 정합니다"
+            } else {
+                "Set total use time for each day"
+            },
+            collapsedStatusText = if (settings.dailyPolicyEnabled) {
+                if (text.appLanguage == AppLanguage.Korean) "사용 중" else "Active"
+            } else {
+                if (text.appLanguage == AppLanguage.Korean) "꺼짐" else "Off"
+            },
+            collapsedStatusColor = if (settings.dailyPolicyEnabled) ScreenRestPalette.Teal else null,
             helpText = if (text.appLanguage == AppLanguage.Korean) {
                 "요일마다 기기 전체 사용시간을 정합니다. 앱별·그룹 제한과 함께 사용하면 가장 먼저 끝나는 시간 제한으로 차단됩니다."
             } else {
@@ -11389,15 +14915,16 @@ private fun UsagePolicySection(
             text = text,
             hardshipLevel = settings.dailyHardshipLevel,
             reserveHeaderTrailingSpace = true,
+            showHeaderTrailingOnlyWhenExpanded = true,
             headerTrailing = {
-                Switch(
+                CompactPolicySwitch(
                     checked = settings.dailyPolicyEnabled,
                     enabled = !settings.dailyPolicyEnabled ||
                         settings.dailyHardshipLevel == HardshipLevel.Off,
                     onCheckedChange = { enabled ->
                         onPolicyDraftChanged(settings.copy(dailyPolicyEnabled = enabled))
                     },
-                    colors = hardshipAwareSwitchColors(settings.dailyHardshipLevel),
+                    hardshipLevel = settings.dailyHardshipLevel,
                 )
             },
         ) {
@@ -11489,6 +15016,17 @@ private fun UsagePolicySection(
         CollapsiblePolicyCard(
             title = text.appGroups,
             icon = PolicySectionIcon.AppGroups,
+            supportingText = if (text.appLanguage == AppLanguage.Korean) {
+                "여러 앱이 하나의 시간을 함께 사용합니다"
+            } else {
+                "Let multiple apps share one time budget"
+            },
+            collapsedStatusText = if (text.appLanguage == AppLanguage.Korean) {
+                "활성 $enabledAppGroupCount/${appGroups.size}"
+            } else {
+                "$enabledAppGroupCount/${appGroups.size} active"
+            },
+            collapsedStatusColor = if (enabledAppGroupCount > 0) ScreenRestPalette.Teal else null,
             helpText = if (text.appLanguage == AppLanguage.Korean) {
                 "여러 앱이 하나의 시간을 함께 사용합니다. 앱은 한 그룹에만 포함되며, 앱별 제한이 있으면 먼저 끝나는 제한이 적용됩니다."
             } else {
@@ -11498,20 +15036,6 @@ private fun UsagePolicySection(
             onExpandedChange = onAppGroupsExpandedChange,
             text = text,
             hardshipLevel = settings.hardshipLevelFor(HardshipPolicyType.AppGroups),
-            reserveHeaderTrailingSpace = true,
-            headerTrailing = {
-                Text(
-                    text = if (text.appLanguage == AppLanguage.Korean) {
-                        "그룹 ${appGroups.size}개"
-                    } else {
-                        "${appGroups.size} groups"
-                    },
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            },
         ) {
             val activeGroup = appGroups.firstOrNull { group -> group.id == activeGroupId }
                 ?: appGroups.firstOrNull()
@@ -11544,6 +15068,7 @@ private fun UsagePolicySection(
                             packageNames = emptySet(),
                             budgetMinutes = 60,
                             id = newAppGroupId(),
+                            enabled = false,
                         )
                         activeGroupId = nextGroups.last().id
                         updateDraft(nextAppGroups = nextGroups)
@@ -11593,11 +15118,9 @@ private fun UsagePolicySection(
                 totalMinutes = groupBudgetTotal,
                 text = text,
             )
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 appGroups.forEach { group ->
                     AppGroupChip(
@@ -11608,9 +15131,19 @@ private fun UsagePolicySection(
                         text = text,
                         activeDays = group.activeDays,
                         hardshipLevel = group.hardshipLevel,
-                    ) {
-                        activeGroupId = group.id
-                    }
+                        enabled = group.enabled,
+                        toggleEnabled = group.hardshipLevel == HardshipLevel.Off,
+                        onClick = { activeGroupId = group.id },
+                        onEnabledChange = { enabled ->
+                            activeGroupId = group.id
+                            updateDraft(
+                                nextAppGroups = appGroups.replaceGroupById(
+                                    group.id,
+                                    group.copy(enabled = enabled),
+                                ),
+                            )
+                        },
+                    )
                 }
             }
             if (activeGroup != null) {
@@ -11755,6 +15288,16 @@ private fun UsagePolicySection(
                     fontWeight = FontWeight.SemiBold,
                     color = AppOver,
                 )
+            } else if (activeGroup?.hardshipLevel != null && activeGroup.hardshipLevel != HardshipLevel.Off) {
+                Text(
+                    text = if (text.appLanguage == AppLanguage.Korean) {
+                        "고행 모드를 해제한 뒤 이 그룹을 끌 수 있습니다."
+                    } else {
+                        "Remove hardship before turning this group off."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -11763,6 +15306,17 @@ private fun UsagePolicySection(
         CollapsiblePolicyCard(
             title = text.appLimits,
             icon = PolicySectionIcon.AppLimits,
+            supportingText = if (text.appLanguage == AppLanguage.Korean) {
+                "앱마다 사용할 시간을 정합니다"
+            } else {
+                "Set a use time for each app"
+            },
+            collapsedStatusText = if (text.appLanguage == AppLanguage.Korean) {
+                "제한 ${appLimits.size}개"
+            } else {
+                "${appLimits.size} limits"
+            },
+            collapsedStatusColor = if (appLimits.isNotEmpty()) ScreenRestPalette.Cobalt else null,
             helpText = if (text.appLanguage == AppLanguage.Korean) {
                 "앱마다 사용할 시간을 정합니다. 허용앱만 또는 스케줄에서 실행이 허용된 앱에만 실제로 사용할 수 있습니다."
             } else {
@@ -11772,10 +15326,6 @@ private fun UsagePolicySection(
             onExpandedChange = onAppLimitsExpandedChange,
             text = text,
             hardshipLevel = settings.hardshipLevelFor(HardshipPolicyType.AppLimits),
-            reserveHeaderTrailingSpace = true,
-            headerTrailing = {
-                Text(text.activeAppLimits(appLimits.size), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            },
         ) {
             val visibleApps = installedApps
                 .filterNot { app -> app.packageName in SafetyGate.neverBlockPackages }
@@ -11972,6 +15522,62 @@ private fun UsagePolicySection(
                 )
             }
         }
+
+        PolicyContentMode.AllControls -> {
+            Column(verticalArrangement = Arrangement.spacedBy(ScreenRestTheme.spacing.lg)) {
+                FamilySectionTitle(
+                    if (text.appLanguage == AppLanguage.Korean) "시간 제한" else "Time limits",
+                )
+                AdaptiveTwoPane(
+                    isExpanded = isExpanded,
+                    leftContent = {
+                        limitPolicy()
+                        groupPolicy()
+                    },
+                    rightContent = {
+                        appLimitsSection()
+                    },
+                )
+                FamilySectionTitle(
+                    if (text.appLanguage == AppLanguage.Korean) "실행 범위" else "App availability",
+                )
+                ScheduleBlockingCard(
+                    settings = settings,
+                    installedApps = installedApps,
+                    allRestrictionsExemptPackages = allRestrictionsExemptPackages,
+                    temporaryAllowedApps = temporaryAllowedApps,
+                    text = text,
+                    expanded = scheduleBlockingExpanded,
+                    onExpandedChange = onScheduleBlockingExpandedChange,
+                    onUpdateSettings = onPolicyDraftChanged,
+                    activeHardshipPolicyKeys = activeHardshipPolicyKeys,
+                    onHardshipConfigure = { key -> hardshipDialogPolicyKey = key },
+                )
+                AllowOnlyModeCard(
+                    settings = settings,
+                    installedApps = installedApps,
+                    allowedAppPackages = allowedAppPackages,
+                    allRestrictionsExemptPackages = allRestrictionsExemptPackages,
+                    temporaryAllowedApps = temporaryAllowedApps,
+                    text = text,
+                    expanded = allowOnlyModeExpanded,
+                    onExpandedChange = onAllowOnlyModeExpandedChange,
+                    onUpdateSettings = onPolicyDraftChanged,
+                    onAllowedAppsChanged = onAllowedAppsChanged,
+                    hardshipActive = allowOnlyHardshipKey() in activeHardshipPolicyKeys &&
+                        settings.allowOnlyHardshipLevel == HardshipLevel.Level3,
+                    onHardshipConfigure = { hardshipDialogPolicyKey = allowOnlyHardshipKey() },
+                )
+                PolicyExceptionAppsCard(
+                    settings = settings,
+                    installedApps = installedApps,
+                    exemptPackages = allRestrictionsExemptPackages,
+                    activeHardshipPolicyKeys = activeHardshipPolicyKeys,
+                    text = text,
+                    onExemptPackagesChanged = onAllRestrictionsExemptAppsChanged,
+                )
+            }
+        }
     }
 
     hardshipDialogPolicyKey?.let { policyKey ->
@@ -12088,6 +15694,7 @@ private fun ContainedLazyColumn(
                 )
             }
         }
+
     }
 }
 
@@ -12898,15 +16505,15 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         collapseSection = "Close"
         language = "Language"
         todayStatus = "Today Status"
-        developerSafeMode = "Developer Safe Mode"
-        safeModeOn = "Safe Mode On"
-        safeModeOff = "Safe Mode Off"
+        developerSafeMode = "Protection controls"
+        safeModeOn = "Protection paused"
+        safeModeOff = "Protection active"
         status = "Status"
         blockingDisabled = "Blocking Disabled"
         safetyChecksRequired = "Safety Checks Required"
-        policyEnforcement = "Policy Enforcement"
-        policyEnforcementEnabled = "Policy Enforcement Enabled"
-        policyEnforcementDisabled = "Policy Enforcement Disabled"
+        policyEnforcement = "Rule enforcement"
+        policyEnforcementEnabled = "Rules on"
+        policyEnforcementDisabled = "Rules off"
         autoRecoveryReady = "Auto Recovery Ready"
         autoRecoveryEnabledSafeMode = "Auto Recovery Enabled Safe Mode"
         emergencyUnlock = "Safe Recovery"
@@ -12992,19 +16599,19 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         allowOnlyMode = "Allow Only Mode"
         allowOnlyModeDescription = "Allow only selected apps while this mode is active."
         allowOnlyModeSummary = "Only selected apps can open; daily, group, and app limits still apply."
-        policyEnforcementStillDisabled = "Policy Enforcement Still Disabled"
+        policyEnforcementStillDisabled = "Rule enforcement is still off"
         policySaved = "Policy Saved"
         invalidAdminPin = "Invalid Admin Pin"
         adminPin = "Admin Pin"
         cancel = "Cancel"
-        safeModePinRequiredTitle = "Safe Mode Pin Required Title"
-        safeModePinRequiredDescription = "Safe Mode Pin Required Description"
-        safeModePinAccepted = "Safe Mode Pin Accepted"
-        enableSafeMode = "Enable Safe Mode"
-        policyOffPinRequiredTitle = "Policy Off Pin Required Title"
-        policyOffPinRequiredDescription = "Policy Off Pin Required Description"
-        policyOffPinAccepted = "Policy Off Pin Accepted"
-        disablePolicyEnforcement = "Disable Policy Enforcement"
+        safeModePinRequiredTitle = "Pause protection"
+        safeModePinRequiredDescription = "Enter the Admin PIN to pause blocking while keeping the saved rules."
+        safeModePinAccepted = "Protection paused"
+        enableSafeMode = "Pause protection"
+        policyOffPinRequiredTitle = "Turn off rule enforcement"
+        policyOffPinRequiredDescription = "Monitoring and blocking will stop. Enter the Admin PIN to continue."
+        policyOffPinAccepted = "Rule enforcement turned off"
+        disablePolicyEnforcement = "Turn rules off"
         permissionSetupTitle = "Permission Setup Title"
         permissionSetupDescription = "Permission Setup Description"
         allowPermission = "Allow Permission"
@@ -13047,7 +16654,7 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         ready = "Ready"
         notReady = "Not Ready"
         safeModeAllowsBlocking = "Safe Mode Allows Blocking"
-        policyEnforcementReady = "Policy Enforcement Ready"
+        policyEnforcementReady = "Rule enforcement ready"
         usageAccessReady = "Usage Access Ready"
         whitelistReady = "Whitelist Ready"
         emergencyUnlockReady = "Safe Recovery"
@@ -13172,8 +16779,8 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
         settings = "Settings"
         expandSection = "Open"
         collapseSection = "Close"
-        safeModeOn = "Safe Mode ON"
-        safeModeOff = "Safe Mode OFF"
+        safeModeOn = "Protection paused"
+        safeModeOff = "Protection active"
         todayUsage = "Today Usage"
         policySummary = "Policy Summary"
         dailyPolicyDescription = "Set the total screen time budget for each day."
@@ -13224,6 +16831,7 @@ fun appStrings(appLanguage: AppLanguage): AppStrings {
                 BlockDecision.WouldBlockAllowOnly -> "Allow only"
                 BlockDecision.WouldBlockGroupLimit -> "Group"
                 BlockDecision.WouldBlockAppLimit -> "App"
+                BlockDecision.WouldBlockImmediate -> "Parent block"
             }
         }
         if (appLanguage == AppLanguage.Korean) {
@@ -13248,15 +16856,15 @@ private fun AppStrings.applyKoreanStrings() {
     collapseSection = "접기"
     language = "언어"
     todayStatus = "오늘 상태"
-    developerSafeMode = "안전 모드"
-    safeModeOn = "안전 모드 ON"
-    safeModeOff = "안전 모드 OFF"
+    developerSafeMode = "보호 제어"
+    safeModeOn = "보호 일시 중지"
+    safeModeOff = "보호 작동 중"
     status = "상태"
     blockingDisabled = "차단 비활성화"
     safetyChecksRequired = "차단 전 안전 확인 필요"
-    policyEnforcement = "정책 적용"
-    policyEnforcementEnabled = "정책 적용 ON"
-    policyEnforcementDisabled = "정책 적용 OFF"
+    policyEnforcement = "규칙 적용"
+    policyEnforcementEnabled = "규칙 적용 중"
+    policyEnforcementDisabled = "규칙 적용 꺼짐"
     autoRecoveryReady = "자동 복구 준비됨"
     autoRecoveryEnabledSafeMode = "자동 복구로 안전 모드 전환됨"
     emergencyUnlock = "안전 복구"
@@ -13343,19 +16951,19 @@ private fun AppStrings.applyKoreanStrings() {
     allowOnlyMode = "허용 앱만"
     allowOnlyModeDescription = "필수 앱과 허용한 앱만 실행할 수 있습니다"
     allowOnlyModeSummary = "선택한 앱만 실행할 수 있으며 요일별·그룹·앱별 시간 제한은 계속 적용됩니다"
-    policyEnforcementStillDisabled = "정책 적용은 아직 꺼져 있습니다"
+    policyEnforcementStillDisabled = "규칙 적용은 아직 꺼져 있습니다"
     policySaved = "저장됨"
     invalidAdminPin = "관리 PIN이 올바르지 않습니다"
     adminPin = "관리 PIN"
     cancel = "취소"
-    safeModePinRequiredTitle = "안전 모드 확인"
-    safeModePinRequiredDescription = "정책 적용 중에는 관리 PIN을 입력해야 안전 모드로 전환할 수 있습니다"
-    safeModePinAccepted = "안전 모드로 전환됨"
-    enableSafeMode = "안전 모드 켜기"
-    policyOffPinRequiredTitle = "정책 적용 해제"
-    policyOffPinRequiredDescription = "정책 적용을 끄면 감시와 차단이 중지됩니다. 관리 PIN을 입력하세요"
-    policyOffPinAccepted = "정책 적용 해제됨"
-    disablePolicyEnforcement = "정책 끄기"
+    safeModePinRequiredTitle = "보호 일시 중지"
+    safeModePinRequiredDescription = "저장된 규칙은 유지하고 차단만 중지합니다. 계속하려면 관리 PIN을 입력하세요."
+    safeModePinAccepted = "보호가 일시 중지되었습니다"
+    enableSafeMode = "보호 중지"
+    policyOffPinRequiredTitle = "규칙 적용 끄기"
+    policyOffPinRequiredDescription = "감시와 차단이 중지됩니다. 계속하려면 관리 PIN을 입력하세요."
+    policyOffPinAccepted = "규칙 적용이 꺼졌습니다"
+    disablePolicyEnforcement = "규칙 끄기"
     permissionSetupTitle = "권한 설정"
     permissionSetupDescription = "사용 시간 집계와 강한 차단에 필요한 권한을 확인합니다"
     allowPermission = "권한 허용"
@@ -13398,7 +17006,7 @@ private fun AppStrings.applyKoreanStrings() {
     ready = "준비됨"
     notReady = "대기"
     safeModeAllowsBlocking = "Safe Mode OFF"
-    policyEnforcementReady = "정책 적용 ON"
+    policyEnforcementReady = "규칙 적용 중"
     usageAccessReady = "사용정보 권한"
     whitelistReady = "필수 예외 목록"
     emergencyUnlockReady = "안전 복구"
@@ -13550,6 +17158,7 @@ private fun AppStrings.applyKoreanStrings() {
             "allow-only mode active" -> "허용 앱만"
             "group limit exceeded" -> "그룹 초과"
             "app limit exceeded" -> "앱 초과"
+            "parent immediate block active" -> "부모 차단"
             else -> decision
         }
     }
@@ -13565,6 +17174,7 @@ private fun AppStrings.applyKoreanStrings() {
             BlockDecision.WouldBlockAllowOnly -> "허용 앱만"
             BlockDecision.WouldBlockGroupLimit -> "그룹"
             BlockDecision.WouldBlockAppLimit -> "앱"
+            BlockDecision.WouldBlockImmediate -> "부모 차단"
         }
     }
 }
@@ -13583,7 +17193,7 @@ fun ScreenTimeManagerTabletPreview() {
 
 @Composable
 private fun ScreenTimeManagerPreviewContent() {
-    ScreenTimeManagerTheme {
+    ScreenRestDesignTheme {
         ScreenTimeManagerScreen(
             uiState = SafeModeUiState(safeModeEnabled = true),
             parentAccountAuthState = ParentAccountAuthState(),
@@ -13624,6 +17234,10 @@ private fun ScreenTimeManagerPreviewContent() {
             onUnlinkLinkedChildDevice = { _, _ -> },
             onUnlinkLinkedParentDevice = { _, _ -> },
             onSyncParentDevice = {},
+            onCheckImmediateBlock = {},
+            onChildTopAppsSharingChanged = {},
+            onStartImmediateBlock = { _, _, _ -> },
+            onStopImmediateBlock = { _, _, _ -> },
             onClearRemoteParentCommands = {},
             onRemoteAppExtraTime = { _, _, _ -> },
             onRemoteAppUnlockToday = { _, _ -> },

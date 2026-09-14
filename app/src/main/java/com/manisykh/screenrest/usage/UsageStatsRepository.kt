@@ -28,6 +28,8 @@ data class DailyUsageInfo(
     val dayLabel: String,
     val totalTimeMillis: Long,
     val hasRecordedData: Boolean,
+    val dailyGoalMinutes: Int? = null,
+    val hasRecordedGoal: Boolean = false,
 )
 
 private val PHONE_USAGE_COMPONENT_PACKAGES = SafetyGate.phoneAppPackages + setOf(
@@ -43,6 +45,7 @@ class UsageStatsRepository(
     private val packageManager = context.packageManager
     private val continuityStore = UsageContinuityStore(context.applicationContext)
     private val historyStore = UsageHistoryStore(context.applicationContext)
+    private val dailyGoalHistoryStore = DailyGoalHistoryStore(context.applicationContext)
     private val monotonicUsageMillisByPackage = mutableMapOf<String, Long>()
     private var monotonicUsageDayStartMillis: Long = 0L
     private val appNameCache = mutableMapOf<String, String>()
@@ -269,6 +272,19 @@ class UsageStatsRepository(
         }
     }
 
+    /** Formats an already measured snapshot without querying usage events a second time. */
+    fun topAppsFromUsageSnapshot(usageByPackage: Map<String, Long>, maxItems: Int = 5): List<AppUsageInfo> =
+        usageByPackage.asSequence()
+            .filter { (packageName, usedMillis) ->
+                usedMillis >= MIN_VISIBLE_USAGE_MILLIS && isVisibleUsageApp(packageName)
+            }
+            .sortedByDescending { (_, usedMillis) -> usedMillis }
+            .take(maxItems.coerceIn(0, 5))
+            .map { (packageName, usedMillis) ->
+                AppUsageInfo(getAppName(packageName), packageName, usedMillis)
+            }
+            .toList()
+
     fun rememberTodayUsageMillis(
         packageName: String,
         usageMillis: Long,
@@ -297,6 +313,15 @@ class UsageStatsRepository(
     fun flushUsageContinuity() {
         continuityStore.flush()
         historyStore.flush()
+        dailyGoalHistoryStore.flush()
+    }
+
+    fun rememberTodayDailyGoal(goalMinutes: Int?, forceWrite: Boolean = false) {
+        dailyGoalHistoryStore.rememberGoal(
+            dayStartMillis = localDayStartMillis(),
+            goalMinutes = goalMinutes,
+            forceWrite = forceWrite,
+        )
     }
 
     fun getDailyUsage(days: Int = 7, skipAccessCheck: Boolean = false): List<DailyUsageInfo> {
@@ -320,6 +345,7 @@ class UsageStatsRepository(
                 dayStarts = dayStarts,
                 launchablePackages = launchablePackages,
             )
+            val dailyGoals = dailyGoalHistoryStore.snapshot(dayStarts)
 
             dayStarts.map { dayStartMillis ->
                 val usageByPackage = usageHistory[dayStartMillis]
@@ -328,6 +354,8 @@ class UsageStatsRepository(
                     dayLabel = dayLabel(dayStartMillis),
                     totalTimeMillis = usageByPackage.orEmpty().values.sum(),
                     hasRecordedData = usageByPackage != null,
+                    dailyGoalMinutes = dailyGoals[dayStartMillis],
+                    hasRecordedGoal = dailyGoals.containsKey(dayStartMillis),
                 )
             }
         } catch (_: RuntimeException) {

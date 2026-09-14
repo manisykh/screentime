@@ -87,6 +87,23 @@ class HardshipMigrationTest {
     }
 
     @Test
+    fun groupEnabledState_roundTripsAndDisabledGroupDoesNotApply() {
+        val group = AppGroupPolicy(
+            id = "games",
+            name = "Games",
+            packageNames = setOf("com.example.game"),
+            budgetMinutes = 30,
+            enabled = false,
+        )
+
+        val restored = listOf(group).toAppGroupsEncoded().toAppGroupPolicies().single()
+
+        assertFalse(restored.enabled)
+        assertFalse(restored.appliesOn(1))
+        assertTrue(group.copy(enabled = true).appliesOn(1))
+    }
+
+    @Test
     fun appLimitActiveDays_defaultToEveryDayAndRoundTrip() {
         val legacy = UsagePolicySettings(appLimitRules = "com.example.video=20")
         assertEquals((1..7).toSet(), legacy.appLimitActiveDayMap().getValue("com.example.video"))
@@ -126,6 +143,27 @@ class HardshipMigrationTest {
         assertEquals(HardshipLevel.Level1, schedule.hardshipLevel)
         assertEquals(HardshipLevel.Level1, settings.hardshipLevelFor(scheduleHardshipKey("schedule-id")))
     }
+
+    @Test
+    fun legacyScheduleSectionSwitch_migratesToEachItemWithoutLosingItsState() {
+        val legacy = "schedule-id^Bedtime^1320^420^1%2C2%2C3%2C4%2C5^com.example.allowed"
+        val disabled = UsagePolicySettings(
+            scheduleBlockingEnabled = false,
+            scheduleTemplates = legacy,
+        ).normalizedScheduleTemplates().single()
+        val enabled = UsagePolicySettings(
+            scheduleBlockingEnabled = true,
+            scheduleTemplates = legacy,
+        ).normalizedScheduleTemplates().single()
+
+        assertFalse(disabled.enabled)
+        assertTrue(enabled.enabled)
+        assertFalse(disabled.toListEncodedAndRestore().enabled)
+        assertTrue(enabled.toListEncodedAndRestore().enabled)
+    }
+
+    private fun ScheduleTemplatePolicy.toListEncodedAndRestore(): ScheduleTemplatePolicy =
+        listOf(this).toScheduleTemplatesEncoded().toScheduleTemplatePolicies().single()
 
     @Test
     fun applyingHardship_enablesTheRequiredBasePolicy() {
@@ -230,6 +268,24 @@ class HardshipMigrationTest {
 
         assertEquals(HardshipLevel.Level3, restored.hardshipLevel)
         assertEquals(expectedEnd, restored.hardshipEndAtMillis)
+    }
+
+    @Test
+    fun configuringHardshipOnDisabledSchedule_enablesItAndRecordsOccurrenceEnd() {
+        val monday = LocalDateTime.of(2026, 8, 3, 20, 0)
+        val schedule = ScheduleTemplatePolicy(
+            id = "study",
+            name = "Study",
+            startMinutes = 22 * 60,
+            endMinutes = 23 * 60,
+            days = setOf(1),
+            enabled = false,
+        )
+
+        val hardened = schedule.withHardshipLevelForNextOccurrence(HardshipLevel.Level2, monday)
+
+        assertTrue(hardened.enabled)
+        assertEquals(schedule.copy(enabled = true).nextOccurrenceEndMillis(monday), hardened.hardshipEndAtMillis)
     }
 
     @Test

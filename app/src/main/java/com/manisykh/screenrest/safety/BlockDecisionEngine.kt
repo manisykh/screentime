@@ -17,6 +17,7 @@ import com.manisykh.screenrest.data.normalizedAppGroups
 import com.manisykh.screenrest.data.isScheduleBlockingNow
 import com.manisykh.screenrest.data.limitMinutesOrNull
 import com.manisykh.screenrest.data.currentPolicyDayOfWeek
+import com.manisykh.screenrest.data.ImmediateBlockState
 import com.manisykh.screenrest.data.scheduleHardshipKey
 import com.manisykh.screenrest.ui.safety.activeAppLimitMap
 import com.manisykh.screenrest.ui.safety.todayLimitMinutesOrNull
@@ -56,6 +57,7 @@ enum class BlockDecision {
     WouldBlockAllowOnly,
     WouldBlockGroupLimit,
     WouldBlockAppLimit,
+    WouldBlockImmediate,
 }
 
 private data class HardshipBlockCandidate(
@@ -81,6 +83,7 @@ object BlockDecisionEngine {
         scheduleAllowedPackages: Set<String> = emptySet(),
         hardshipBypassedPolicies: Set<HardshipPolicyType> = emptySet(),
         hardshipBypassedPolicyKeys: Set<HardshipPolicyKey> = emptySet(),
+        immediateBlockState: ImmediateBlockState = ImmediateBlockState(),
     ): BlockDecisionResult {
         return evaluateDetailed(
             packageName = packageName,
@@ -99,6 +102,7 @@ object BlockDecisionEngine {
             scheduleAllowedPackages = scheduleAllowedPackages,
             hardshipBypassedPolicies = hardshipBypassedPolicies,
             hardshipBypassedPolicyKeys = hardshipBypassedPolicyKeys,
+            immediateBlockState = immediateBlockState,
         ).result
     }
 
@@ -119,6 +123,7 @@ object BlockDecisionEngine {
         scheduleAllowedPackages: Set<String> = emptySet(),
         hardshipBypassedPolicies: Set<HardshipPolicyType> = emptySet(),
         hardshipBypassedPolicyKeys: Set<HardshipPolicyKey> = emptySet(),
+        immediateBlockState: ImmediateBlockState = ImmediateBlockState(),
     ): BlockDecisionEvaluation {
         val safetyGateResult = SafetyGate.evaluateBlocking(
             safeModeEnabled = safeModeEnabled,
@@ -239,17 +244,25 @@ object BlockDecisionEngine {
                 candidate.decision.defaultBlockPriority()
         }
         val strongestBlockDecision = strongestBlockCandidate?.decision
+        val immediateBlockApplies = safetyGateResult.canEvaluateBlocking &&
+            immediateBlockState.appliesTo(packageName, System.currentTimeMillis())
         // Fail-safe exits remain absolute. Otherwise the strongest hardship level wins;
         // ties preserve the existing policy priority.
         val decision = when {
             safetyGateResult.reason == SafetyGateReason.SafeModeEnabled -> BlockDecision.AllowedSafeMode
             safetyGateResult.reason == SafetyGateReason.PolicyEnforcementDisabled -> BlockDecision.AllowedPolicyDisabled
             safetyGateResult.reason == SafetyGateReason.WhitelistedPackage -> BlockDecision.AllowedWhitelist
+            strongestBlockCandidate != null &&
+                settings.hardshipLevelFor(strongestBlockCandidate.policyKey) != HardshipLevel.Off ->
+                strongestBlockDecision!!
+            immediateBlockApplies -> BlockDecision.WouldBlockImmediate
             strongestBlockDecision != null -> strongestBlockDecision
             hasAnyLimit(packageName, settings) -> BlockDecision.AllowedUnderLimit
             else -> BlockDecision.AllowedNoLimit
         }
-        val hardshipPolicyKey = strongestBlockCandidate?.policyKey
+        val hardshipPolicyKey = strongestBlockCandidate?.takeUnless {
+            decision == BlockDecision.WouldBlockImmediate
+        }?.policyKey
         val hardshipPolicyType = hardshipPolicyKey?.policyType
         val hardshipLevel = hardshipPolicyKey?.let(settings::hardshipLevelFor) ?: HardshipLevel.Off
 
@@ -257,6 +270,7 @@ object BlockDecisionEngine {
             BlockDecision.WouldBlockTotalLimit -> totalUsedMillis
             BlockDecision.WouldBlockSchedule -> appUsedMillis
             BlockDecision.WouldBlockAllowOnly -> appUsedMillis
+            BlockDecision.WouldBlockImmediate -> appUsedMillis
             BlockDecision.WouldBlockGroupLimit -> targetGroupUsedMillis ?: appUsedMillis
             else -> appUsedMillis
         }
@@ -316,11 +330,12 @@ object BlockDecisionEngine {
             directlyManaged = appLimitMinutes != null ||
                 targetGroup != null ||
                 settings.isScheduleBlockingNow() ||
-                settings.allowOnlyModeEnabled,
+                settings.allowOnlyModeEnabled || immediateBlockApplies,
             hardshipPolicyType = hardshipPolicyType,
             hardshipPolicyKey = hardshipPolicyKey,
             hardshipLevel = hardshipLevel,
-            activeBlockDecisions = activeBlockCandidates.map { candidate -> candidate.decision }.toSet(),
+            activeBlockDecisions = activeBlockCandidates.map { candidate -> candidate.decision }.toSet() +
+                (if (immediateBlockApplies) setOf(BlockDecision.WouldBlockImmediate) else emptySet()),
             activeHardshipPolicyKeys = activeBlockCandidates.map { candidate -> candidate.policyKey }.toSet(),
         )
     }

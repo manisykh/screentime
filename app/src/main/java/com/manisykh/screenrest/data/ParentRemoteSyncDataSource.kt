@@ -84,8 +84,62 @@ data class ParentRemoteUnlockDecision(
 
 enum class ParentRemoteChangeType {
     ChildProfile,
+    ChildUsageSnapshot,
+    ChildUsageRefresh,
+    ImmediateBlock,
     UnlockRequests,
     RemoteCommands,
+}
+
+/** A replaceable daily snapshot; detailed app activity stays on the child device. */
+data class ChildTopAppUsage(
+    val appName: String,
+    val usedMillis: Long,
+)
+
+data class ChildUsageSnapshot(
+    val childDeviceId: String,
+    val dateKey: String,
+    val capturedAtMillis: Long,
+    val todayUsedMillis: Long,
+    val dailyCountedUsageMillis: Long,
+    val effectiveDailyLimitMinutes: Int?,
+    val dailyUnlockedForToday: Boolean,
+    val usageAccessReady: Boolean,
+    val protectionPaused: Boolean,
+    val appUsageSharingEnabled: Boolean = false,
+    val topApps: List<ChildTopAppUsage> = emptyList(),
+) {
+    fun isDelayed(nowMillis: Long, maxAgeMillis: Long = 75 * 60_000L): Boolean =
+        capturedAtMillis <= 0L ||
+            capturedAtMillis > nowMillis + 5 * 60_000L ||
+            nowMillis - capturedAtMillis > maxAgeMillis
+
+    fun remainingDailyMinutes(): Int? {
+        if (!usageAccessReady || protectionPaused || dailyUnlockedForToday) return null
+        val limit = effectiveDailyLimitMinutes ?: return null
+        val countedMinutes = (dailyCountedUsageMillis / 60_000L).toInt()
+        return (limit - countedMinutes).coerceAtLeast(0)
+    }
+}
+
+/** One replaceable request per child; completion is acknowledged only after a new snapshot is saved. */
+data class ChildUsageRefreshRequest(
+    val requestId: String,
+    val childDeviceId: String,
+    val parentUid: String,
+    val requestedAtMillis: Long,
+    val expiresAtMillis: Long,
+    val completedAtMillis: Long = 0L,
+) {
+    fun isPending(nowMillis: Long): Boolean =
+        completedAtMillis == 0L && expiresAtMillis > nowMillis
+
+    fun isDelayed(nowMillis: Long, thresholdMillis: Long = 2 * 60_000L): Boolean =
+        isPending(nowMillis) && nowMillis - requestedAtMillis >= thresholdMillis
+
+    fun canRequestAgain(nowMillis: Long): Boolean =
+        nowMillis < requestedAtMillis || nowMillis - requestedAtMillis >= 60_000L
 }
 
 data class ParentRemoteChange(
@@ -93,6 +147,10 @@ data class ParentRemoteChange(
     val type: ParentRemoteChangeType,
     val fromCache: Boolean,
     val hasPendingWrites: Boolean,
+    val usageSnapshot: ChildUsageSnapshot? = null,
+    val usageRefreshRequest: ChildUsageRefreshRequest? = null,
+    val immediateBlockState: ImmediateBlockState? = null,
+    val immediateBlockDocumentExists: Boolean = false,
 )
 
 enum class RemotePushTokenRole(val storageValue: String) {
@@ -142,6 +200,26 @@ interface ParentRemoteSyncDataSource {
     }
 
     suspend fun publishUnlockRequest(request: RemoteUnlockRequest): ParentRemoteSyncResult
+
+    suspend fun publishChildUsageSnapshot(snapshot: ChildUsageSnapshot): ParentRemoteSyncResult
+
+    suspend fun fetchChildUsageSnapshot(childDeviceId: String): ChildUsageSnapshot?
+
+    suspend fun requestChildUsageRefresh(childDeviceId: String): Result<ChildUsageRefreshRequest>
+
+    suspend fun fetchChildUsageRefresh(childDeviceId: String): Result<ChildUsageRefreshRequest?>
+
+    suspend fun acknowledgeChildUsageRefresh(childDeviceId: String, requestId: String): ParentRemoteSyncResult
+
+    suspend fun issueImmediateBlock(childDeviceId: String, durationMinutes: Int): ParentRemoteSyncResult
+
+    suspend fun revokeImmediateBlock(childDeviceId: String, requestId: String): ParentRemoteSyncResult
+
+    suspend fun fetchImmediateBlock(childDeviceId: String): Result<ImmediateBlockState?>
+
+    suspend fun acknowledgeImmediateBlock(childDeviceId: String, requestId: String): ParentRemoteSyncResult
+
+    suspend fun acknowledgeImmediateBlockRelease(childDeviceId: String, requestId: String): ParentRemoteSyncResult
 
     suspend fun publishUnlockDecision(
         request: RemoteUnlockRequest,
@@ -245,6 +323,35 @@ object LocalOnlyParentRemoteSyncDataSource : ParentRemoteSyncDataSource {
     override suspend fun publishUnlockRequest(request: RemoteUnlockRequest): ParentRemoteSyncResult {
         return ParentRemoteSyncResult.LocalOnly
     }
+
+    override suspend fun publishChildUsageSnapshot(snapshot: ChildUsageSnapshot): ParentRemoteSyncResult =
+        ParentRemoteSyncResult.LocalOnly
+
+    override suspend fun fetchChildUsageSnapshot(childDeviceId: String): ChildUsageSnapshot? = null
+
+    override suspend fun requestChildUsageRefresh(childDeviceId: String): Result<ChildUsageRefreshRequest> =
+        Result.failure(IllegalStateException("Cloud configuration missing"))
+
+    override suspend fun fetchChildUsageRefresh(childDeviceId: String): Result<ChildUsageRefreshRequest?> =
+        Result.failure(IllegalStateException("Cloud configuration missing"))
+
+    override suspend fun acknowledgeChildUsageRefresh(childDeviceId: String, requestId: String) =
+        ParentRemoteSyncResult.LocalOnly
+
+    override suspend fun issueImmediateBlock(childDeviceId: String, durationMinutes: Int) =
+        ParentRemoteSyncResult.LocalOnly
+
+    override suspend fun revokeImmediateBlock(childDeviceId: String, requestId: String) =
+        ParentRemoteSyncResult.LocalOnly
+
+    override suspend fun fetchImmediateBlock(childDeviceId: String): Result<ImmediateBlockState?> =
+        Result.failure(IllegalStateException("Cloud configuration missing"))
+
+    override suspend fun acknowledgeImmediateBlock(childDeviceId: String, requestId: String) =
+        ParentRemoteSyncResult.LocalOnly
+
+    override suspend fun acknowledgeImmediateBlockRelease(childDeviceId: String, requestId: String) =
+        ParentRemoteSyncResult.LocalOnly
 
     override suspend fun publishUnlockDecision(
         request: RemoteUnlockRequest,

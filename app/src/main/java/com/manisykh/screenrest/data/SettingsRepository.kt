@@ -28,6 +28,28 @@ import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
 
 const val MAX_TEMPORARY_EXTRA_MINUTES = 12 * 60
+
+private fun ImmediateBlockState.toStorageValue(): String = listOf(
+    requestId, childDeviceId, requestedAtMillis.toString(),
+    (expiresAtMillis ?: 0L).toString(), revokedAtMillis.toString(),
+    parentUid, appliedAtMillis.toString(), releasedAtMillis.toString(),
+).joinToString("|")
+
+private fun String.toImmediateBlockState(): ImmediateBlockState {
+    val parts = split('|')
+    if (parts.size != 8) return ImmediateBlockState()
+    val requested = parts[2].toLongOrNull() ?: return ImmediateBlockState()
+    val expires = parts[3].toLongOrNull() ?: return ImmediateBlockState()
+    if (parts[0].isBlank() || parts[1].isBlank() || parts[5].isBlank() ||
+        requested <= 0L || expires <= requested || expires - requested > 86_400_000L
+    ) return ImmediateBlockState()
+    return ImmediateBlockState(
+        requestId = parts[0], childDeviceId = parts[1], requestedAtMillis = requested,
+        expiresAtMillis = expires, revokedAtMillis = parts[4].toLongOrNull() ?: 0L,
+        parentUid = parts[5], appliedAtMillis = parts[6].toLongOrNull() ?: 0L,
+        releasedAtMillis = parts[7].toLongOrNull() ?: 0L,
+    )
+}
 private const val MAX_PARENT_NOTIFICATION_EVENT_TOKENS = 240
 private const val MAX_PARENT_NOTIFICATION_ERROR_LENGTH = 180
 private const val HARDSHIP_CONFIGURATION_REFLECTION_PREFIX = "Config:"
@@ -278,7 +300,14 @@ fun UsagePolicySettings.withHardshipLevel(
         )
         HardshipPolicyType.AppGroups -> copy(
             appGroups = normalizedAppGroups().map { group ->
-                if (group.id == policyKey.targetId) group.copy(hardshipLevel = level) else group
+                if (group.id == policyKey.targetId) {
+                    group.copy(
+                        hardshipLevel = level,
+                        enabled = group.enabled || level != HardshipLevel.Off,
+                    )
+                } else {
+                    group
+                }
             }.toAppGroupsEncoded(),
         )
         HardshipPolicyType.AppLimits -> copy(
@@ -289,7 +318,9 @@ fun UsagePolicySettings.withHardshipLevel(
             scheduleBlockingEnabled = scheduleBlockingEnabled || level != HardshipLevel.Off,
             scheduleTemplates = normalizedScheduleTemplates().map { schedule ->
                 if (schedule.id == policyKey.targetId) {
-                    schedule.withHardshipLevelForNextOccurrence(level)
+                    schedule.withHardshipLevelForNextOccurrence(level).copy(
+                        enabled = schedule.enabled || level != HardshipLevel.Off,
+                    )
                 } else {
                     schedule
                 }
@@ -339,9 +370,15 @@ fun UsagePolicySettings.configuredHardshipPolicyKeys(): Set<HardshipPolicyKey> =
 
 fun UsagePolicySettings.hasDisabledPolicyWithHardship(): Boolean {
     return (!dailyPolicyEnabled && dailyHardshipLevel != HardshipLevel.Off) ||
+        normalizedAppGroups().any { group ->
+            !group.enabled && group.hardshipLevel != HardshipLevel.Off
+        } ||
         (!scheduleBlockingEnabled && normalizedScheduleTemplates().any { schedule ->
             schedule.hardshipLevel != HardshipLevel.Off
         }) ||
+        normalizedScheduleTemplates().any { schedule ->
+            !schedule.enabled && schedule.hardshipLevel != HardshipLevel.Off
+        } ||
         (!allowOnlyModeEnabled && allowOnlyHardshipLevel != HardshipLevel.Off)
 }
 
@@ -389,6 +426,7 @@ private fun hardshipWeakeningKeys(
                 val after = requested.normalizedAppGroups().firstOrNull { group -> group.id == policyKey.targetId }
                 before != null && (
                     after == null ||
+                        (before.enabled && !after.enabled) ||
                         optionalLimitIsWeaker(before.limitMinutesOrNull(), after.limitMinutesOrNull()) ||
                         (before.packageNames - after.packageNames).isNotEmpty() ||
                         (before.activeDays.normalizedPolicyDays() - after.activeDays.normalizedPolicyDays()).isNotEmpty()
@@ -408,6 +446,7 @@ private fun hardshipWeakeningKeys(
                 val after = requested.normalizedScheduleTemplates().firstOrNull { schedule -> schedule.id == policyKey.targetId }
                 before != null && (
                     after == null ||
+                        (before.enabled && !after.enabled) ||
                         (current.scheduleBlockingEnabled && !requested.scheduleBlockingEnabled) ||
                         (after.allowedPackageNames - before.allowedPackageNames).isNotEmpty() ||
                         (before.days.normalizedPolicyDays() - after.days.normalizedPolicyDays()).isNotEmpty() ||
@@ -835,13 +874,14 @@ data class AppGroupPolicy(
     val id: String = "",
     val hardshipLevel: HardshipLevel = HardshipLevel.Off,
     val activeDays: Set<Int> = (1..7).toSet(),
+    val enabled: Boolean = true,
 )
 
 fun Set<Int>.normalizedPolicyDays(): Set<Int> =
     filter { day -> day in 1..7 }.toSet().ifEmpty { (1..7).toSet() }
 
 fun AppGroupPolicy.appliesOn(dayOfWeek: Int): Boolean =
-    dayOfWeek in activeDays.normalizedPolicyDays()
+    enabled && dayOfWeek in activeDays.normalizedPolicyDays()
 
 fun currentPolicyDayOfWeek(): Int = LocalDate.now().dayOfWeek.value
 
@@ -875,6 +915,7 @@ data class ScheduleTemplatePolicy(
     val allowedPackageNames: Set<String> = emptySet(),
     val hardshipLevel: HardshipLevel = HardshipLevel.Off,
     val hardshipEndAtMillis: Long = 0L,
+    val enabled: Boolean = true,
 )
 
 data class ScheduleHardshipStarted(
@@ -899,11 +940,11 @@ private const val APP_LANGUAGE_KOREAN = "Korean"
 private const val APP_LANGUAGE_ENGLISH = "English"
 
 data class PolicySectionExpansionSettings(
-    val dailyPolicyExpanded: Boolean = true,
-    val appGroupsExpanded: Boolean = true,
-    val appLimitsExpanded: Boolean = true,
-    val scheduleBlockingExpanded: Boolean = true,
-    val allowOnlyModeExpanded: Boolean = true,
+    val dailyPolicyExpanded: Boolean = false,
+    val appGroupsExpanded: Boolean = false,
+    val appLimitsExpanded: Boolean = false,
+    val scheduleBlockingExpanded: Boolean = false,
+    val allowOnlyModeExpanded: Boolean = false,
     val settingsLanguageExpanded: Boolean = true,
     val settingsNotificationExpanded: Boolean = true,
     val settingsPinExpanded: Boolean = true,
@@ -920,6 +961,80 @@ class SettingsRepository(
         deviceRole: ParentDeviceRole,
     ) = parentRemoteSyncDataSource.observeChanges(childDeviceIds, deviceRole)
 
+    suspend fun publishChildUsageSnapshot(snapshot: ChildUsageSnapshot): ParentRemoteSyncResult =
+        parentRemoteSyncDataSource.publishChildUsageSnapshot(snapshot)
+
+    suspend fun fetchChildUsageSnapshot(childDeviceId: String): ChildUsageSnapshot? =
+        parentRemoteSyncDataSource.fetchChildUsageSnapshot(childDeviceId)
+
+    suspend fun requestChildUsageRefresh(childDeviceId: String): Result<ChildUsageRefreshRequest> =
+        parentRemoteSyncDataSource.requestChildUsageRefresh(childDeviceId)
+
+    suspend fun fetchChildUsageRefresh(childDeviceId: String): Result<ChildUsageRefreshRequest?> =
+        parentRemoteSyncDataSource.fetchChildUsageRefresh(childDeviceId)
+
+    suspend fun acknowledgeChildUsageRefresh(
+        childDeviceId: String,
+        requestId: String,
+    ): ParentRemoteSyncResult =
+        parentRemoteSyncDataSource.acknowledgeChildUsageRefresh(childDeviceId, requestId)
+
+    suspend fun issueImmediateBlock(childDeviceId: String, durationMinutes: Int): ParentRemoteSyncResult {
+        val result = parentRemoteSyncDataSource.issueImmediateBlock(childDeviceId, durationMinutes)
+        if (result == ParentRemoteSyncResult.Success) {
+            addEvent(EventLogType.Safety, "Parent immediate block requested: child=$childDeviceId duration=${durationMinutes}m")
+        }
+        return result
+    }
+
+    suspend fun revokeImmediateBlock(childDeviceId: String, requestId: String): ParentRemoteSyncResult {
+        val result = parentRemoteSyncDataSource.revokeImmediateBlock(childDeviceId, requestId)
+        if (result == ParentRemoteSyncResult.Success) {
+            addEvent(EventLogType.Safety, "Parent immediate block stop requested: child=$childDeviceId")
+        }
+        return result
+    }
+
+    suspend fun fetchImmediateBlock(childDeviceId: String): Result<ImmediateBlockState?> =
+        parentRemoteSyncDataSource.fetchImmediateBlock(childDeviceId)
+
+    /** Server-only fetch: an offline child keeps its last verified order until its local expiry. */
+    suspend fun syncImmediateBlock(canAcknowledge: Boolean = false): Boolean {
+        val parentState = parentManagementState.first()
+        if (!parentState.paired || parentState.deviceRole != ParentDeviceRole.Child ||
+            parentState.childDeviceId.isBlank()
+        ) {
+            dataStore.edit { stored -> stored.remove(IMMEDIATE_BLOCK_STATE) }
+            return true
+        }
+        val fetched = parentRemoteSyncDataSource.fetchImmediateBlock(parentState.childDeviceId)
+        if (fetched.isFailure) return false
+        val remote = fetched.getOrNull()
+        val linkedParentIds = parentState.linkedParentDevices.map { it.parentUid }.toSet()
+        val valid = remote?.takeIf { order ->
+            order.parentUid in linkedParentIds && order.isActiveAt(System.currentTimeMillis())
+        }
+        dataStore.edit { stored ->
+            if (valid == null) stored.remove(IMMEDIATE_BLOCK_STATE)
+            else stored[IMMEDIATE_BLOCK_STATE] = valid.toStorageValue()
+        }
+        if (remote != null && remote.revokedAtMillis > 0L &&
+            remote.releasedAtMillis == 0L && remote.parentUid in linkedParentIds
+        ) {
+            parentRemoteSyncDataSource.acknowledgeImmediateBlockRelease(
+                parentState.childDeviceId, remote.requestId,
+            )
+        }
+        if (valid != null && canAcknowledge && valid.appliedAtMillis == 0L &&
+            !safeModeEnabled.first() && policyEnforcementEnabled.first()
+        ) {
+            parentRemoteSyncDataSource.acknowledgeImmediateBlock(
+                parentState.childDeviceId, valid.requestId,
+            )
+        }
+        return true
+    }
+
     private val preferences: Flow<Preferences> = dataStore.data
         .catch { exception ->
             if (exception is IOException) {
@@ -928,6 +1043,10 @@ class SettingsRepository(
                 throw exception
             }
         }
+
+    val immediateBlockState: Flow<ImmediateBlockState> = preferences.map { stored ->
+        stored[IMMEDIATE_BLOCK_STATE].orEmpty().toImmediateBlockState()
+    }
 
     val safeModeEnabled: Flow<Boolean> = preferences
         .map { preferences ->
@@ -965,6 +1084,10 @@ class SettingsRepository(
                 MONITORING_DISCLOSURE_CURRENT_VERSION
         }
 
+    /** Separate opt-in for sending app names and per-app durations to linked parents. */
+    val childTopAppsSharingEnabled: Flow<Boolean> = preferences
+        .map { preferences -> preferences[CHILD_TOP_APPS_SHARING_ENABLED] ?: false }
+
     val securityPinsConfigured: Flow<Boolean> = preferences
         .map { preferences ->
             preferences.hasConfiguredPin(ADMIN_PIN_CREDENTIAL, ADMIN_PIN)
@@ -973,11 +1096,11 @@ class SettingsRepository(
     val policySectionExpansionSettings: Flow<PolicySectionExpansionSettings> = preferences
         .map { preferences ->
             PolicySectionExpansionSettings(
-                dailyPolicyExpanded = preferences[DAILY_POLICY_EXPANDED] ?: true,
-                appGroupsExpanded = preferences[APP_GROUPS_EXPANDED] ?: true,
-                appLimitsExpanded = preferences[APP_LIMITS_EXPANDED] ?: true,
-                scheduleBlockingExpanded = preferences[SCHEDULE_BLOCKING_EXPANDED] ?: true,
-                allowOnlyModeExpanded = preferences[ALLOW_ONLY_MODE_EXPANDED] ?: true,
+                dailyPolicyExpanded = preferences[DAILY_POLICY_EXPANDED] ?: false,
+                appGroupsExpanded = preferences[APP_GROUPS_EXPANDED] ?: false,
+                appLimitsExpanded = preferences[APP_LIMITS_EXPANDED] ?: false,
+                scheduleBlockingExpanded = preferences[SCHEDULE_BLOCKING_EXPANDED] ?: false,
+                allowOnlyModeExpanded = preferences[ALLOW_ONLY_MODE_EXPANDED] ?: false,
                 settingsLanguageExpanded = preferences[SETTINGS_LANGUAGE_EXPANDED] ?: true,
                 settingsNotificationExpanded = preferences[SETTINGS_NOTIFICATION_EXPANDED] ?: true,
                 settingsPinExpanded = preferences[SETTINGS_PIN_EXPANDED] ?: true,
@@ -1169,6 +1292,12 @@ class SettingsRepository(
                 type = EventLogType.Safety,
                 message = "Monitoring disclosure accepted",
             )
+        }
+    }
+
+    suspend fun setChildTopAppsSharingEnabled(enabled: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[CHILD_TOP_APPS_SHARING_ENABLED] = enabled
         }
     }
 
@@ -2925,6 +3054,7 @@ class SettingsRepository(
                         effectiveExemptPackages,
                 )
             }
+            val hasEnabledSchedules = cleanScheduleTemplates.any { schedule -> schedule.enabled }
             if (
                 allowOnlyHardshipKey() in protectedHardshipKeys &&
                 (cleanAllowOnlyPackages - currentAllowOnlyPackages).isNotEmpty()
@@ -2969,7 +3099,9 @@ class SettingsRepository(
                 .toAppLimitActiveDaysEncoded()
             preferences[APP_LIMIT_HARDSHIP_LEVELS] = settings.appLimitHardshipLevelMap()
                 .toAppLimitHardshipLevelsEncoded()
-            preferences[SCHEDULE_BLOCKING_ENABLED] = settings.scheduleBlockingEnabled
+            // Keep the legacy section flag synchronized for older app versions,
+            // while the current policy is controlled by each schedule item.
+            preferences[SCHEDULE_BLOCKING_ENABLED] = hasEnabledSchedules
             preferences[SCHEDULE_START_MINUTES] = settings.scheduleStartMinutes.coerceIn(0, MINUTES_PER_DAY - 1)
             preferences[SCHEDULE_END_MINUTES] = settings.scheduleEndMinutes.coerceIn(0, MINUTES_PER_DAY - 1)
             preferences[SCHEDULE_DAYS] = settings.scheduleDaySet().toScheduleDaysEncoded()
@@ -3416,12 +3548,36 @@ class SettingsRepository(
                 ZoneId.systemDefault(),
             )
             var settings = storedUsagePolicySettings(preferences)
-            val restoredDisabledSchedule =
-                !settings.scheduleBlockingEnabled &&
-                    settings.normalizedScheduleTemplates().any { schedule ->
-                        schedule.hardshipLevel != HardshipLevel.Off
+            val disabledHardshipGroups = settings.normalizedAppGroups().filter { group ->
+                !group.enabled && group.hardshipLevel != HardshipLevel.Off
+            }
+            if (disabledHardshipGroups.isNotEmpty()) {
+                preferences[APP_GROUPS] = settings.normalizedAppGroups()
+                    .map { group ->
+                        if (group in disabledHardshipGroups) group.copy(enabled = true) else group
                     }
-            if (restoredDisabledSchedule) {
+                    .toAppGroupsEncoded()
+                settings = storedUsagePolicySettings(preferences)
+                appendEvent(
+                    preferences,
+                    EventLogType.Safety,
+                    "App group restored because configured hardship is still active",
+                )
+            }
+            val disabledHardshipSchedules = settings.normalizedScheduleTemplates().filter { schedule ->
+                !schedule.enabled && schedule.hardshipLevel != HardshipLevel.Off
+            }
+            val restoredDisabledSchedule = !settings.scheduleBlockingEnabled || disabledHardshipSchedules.isNotEmpty()
+            if (
+                restoredDisabledSchedule &&
+                settings.normalizedScheduleTemplates().any { schedule ->
+                    schedule.hardshipLevel != HardshipLevel.Off
+                }
+            ) {
+                val repairedSchedules = settings.normalizedScheduleTemplates().map { schedule ->
+                    if (schedule.hardshipLevel != HardshipLevel.Off) schedule.copy(enabled = true) else schedule
+                }
+                preferences[SCHEDULE_TEMPLATES] = repairedSchedules.toScheduleTemplatesEncoded()
                 preferences[SCHEDULE_BLOCKING_ENABLED] = true
                 settings = storedUsagePolicySettings(preferences)
                 appendEvent(
@@ -3790,11 +3946,13 @@ class SettingsRepository(
         return when (key.policyType) {
             HardshipPolicyType.DailyLimit -> dailyPolicyEnabled
             HardshipPolicyType.AppGroups -> normalizedAppGroups().any { group ->
-                group.id == key.targetId
+                group.id == key.targetId && group.enabled
             }
             HardshipPolicyType.AppLimits -> appLimitMinutesFor(key.targetId) != null
             HardshipPolicyType.Schedule -> scheduleBlockingEnabled &&
-                normalizedScheduleTemplates().any { schedule -> schedule.id == key.targetId }
+                normalizedScheduleTemplates().any { schedule ->
+                    schedule.id == key.targetId && schedule.enabled
+                }
             HardshipPolicyType.AllowOnly -> allowOnlyModeEnabled
         }
     }
@@ -4593,6 +4751,7 @@ class SettingsRepository(
         private val PERMISSION_SETUP_COMPLETED_ONCE = booleanPreferencesKey("permission_setup_completed_once")
         private val MONITORING_DISCLOSURE_ACCEPTED_VERSION =
             intPreferencesKey("monitoring_disclosure_accepted_version")
+        private val CHILD_TOP_APPS_SHARING_ENABLED = booleanPreferencesKey("child_top_apps_sharing_enabled")
         private val DAILY_POLICY_EXPANDED = booleanPreferencesKey("daily_policy_expanded")
         private val APP_GROUPS_EXPANDED = booleanPreferencesKey("app_groups_expanded")
         private val APP_LIMITS_EXPANDED = booleanPreferencesKey("app_limits_expanded")
@@ -4627,6 +4786,7 @@ class SettingsRepository(
         private val POLICY_APP_LISTS_VERSION = intPreferencesKey("policy_app_lists_version")
         private val HARDSHIP_LEVEL3_LOCK_VERSION = intPreferencesKey("hardship_level3_lock_version")
         private val PARENT_MANAGEMENT_STATE = stringPreferencesKey("parent_management_state")
+        private val IMMEDIATE_BLOCK_STATE = stringPreferencesKey("immediate_block_state")
         private val PARENT_NOTIFICATION_STATE = stringPreferencesKey("parent_notification_state")
         private val PARENT_AUTH_UID = stringPreferencesKey("parent_auth_uid")
         private val LAST_REMOTE_CLEANUP_MILLIS = longPreferencesKey("last_remote_cleanup_millis")
@@ -4878,9 +5038,18 @@ fun UsagePolicySettings.normalizedScheduleTemplates(): List<ScheduleTemplatePoli
         .split(GROUP_SEPARATOR)
         .filter { encoded -> encoded.isNotBlank() }
         .all { encoded -> encoded.split(GROUP_FIELD_SEPARATOR).size >= 7 }
+    val hasItemEnabledState = scheduleTemplates
+        .split(GROUP_SEPARATOR)
+        .filter { encoded -> encoded.isNotBlank() }
+        .all { encoded -> encoded.split(GROUP_FIELD_SEPARATOR).size >= 9 }
     return scheduleTemplates.toScheduleTemplatePolicies()
         .map { template ->
-            if (hasItemLevels) template else template.copy(hardshipLevel = scheduleHardshipLevel)
+            template.copy(
+                hardshipLevel = if (hasItemLevels) template.hardshipLevel else scheduleHardshipLevel,
+                // Legacy schedules were controlled by one section switch. Carry
+                // that effective state into every item exactly once when decoded.
+                enabled = if (hasItemEnabledState) template.enabled else scheduleBlockingEnabled,
+            )
         }
         .distinctBy { template -> template.id.ifBlank { template.name } }
         .take(MAX_SCHEDULE_TEMPLATES)
@@ -4890,7 +5059,7 @@ fun String.toScheduleTemplatePolicies(): List<ScheduleTemplatePolicy> {
     return split(GROUP_SEPARATOR)
         .mapNotNull { encodedTemplate ->
             val parts = encodedTemplate.split(GROUP_FIELD_SEPARATOR)
-            if (parts.size !in 5..8) {
+            if (parts.size !in 5..9) {
                 null
             } else {
                 val id = parts[0].decodePolicyField()
@@ -4913,6 +5082,7 @@ fun String.toScheduleTemplatePolicies(): List<ScheduleTemplatePolicy> {
                     ?.toLongOrNull()
                     ?.coerceAtLeast(0L)
                     ?: 0L
+                val enabled = parts.getOrNull(8)?.toBooleanStrictOrNull() ?: true
                 ScheduleTemplatePolicy(
                     id = id,
                     name = name.ifBlank { "Schedule" },
@@ -4922,6 +5092,7 @@ fun String.toScheduleTemplatePolicies(): List<ScheduleTemplatePolicy> {
                     allowedPackageNames = allowedPackageNames,
                     hardshipLevel = hardshipLevel,
                     hardshipEndAtMillis = hardshipEndAtMillis,
+                    enabled = enabled,
                 )
             }
         }
@@ -4943,6 +5114,7 @@ fun List<ScheduleTemplatePolicy>.toScheduleTemplatesEncoded(): String {
                     .encodePolicyField(),
                 template.hardshipLevel.storageValue.toString(),
                 template.hardshipEndAtMillis.coerceAtLeast(0L).toString(),
+                template.enabled.toString(),
             ).joinToString(GROUP_FIELD_SEPARATOR)
         }
         .joinToString(GROUP_SEPARATOR)
@@ -4966,12 +5138,12 @@ fun UsagePolicySettings.selectedScheduleTemplate(): ScheduleTemplatePolicy? {
 
 fun UsagePolicySettings.activeScheduleTemplate(now: LocalDateTime = LocalDateTime.now()): ScheduleTemplatePolicy? {
     if (!scheduleBlockingEnabled) return null
-    return normalizedScheduleTemplates().firstOrNull { template -> template.isActiveAt(now) }
+    return normalizedScheduleTemplates().firstOrNull { template -> template.enabled && template.isActiveAt(now) }
 }
 
 fun UsagePolicySettings.activeScheduleTemplates(now: LocalDateTime = LocalDateTime.now()): List<ScheduleTemplatePolicy> {
     if (!scheduleBlockingEnabled) return emptyList()
-    return normalizedScheduleTemplates().filter { template -> template.isActiveAt(now) }
+    return normalizedScheduleTemplates().filter { template -> template.enabled && template.isActiveAt(now) }
 }
 
 fun UsagePolicySettings.activeScheduleAllowedPackages(): Set<String> {
@@ -4989,16 +5161,17 @@ fun UsagePolicySettings.isScheduleBlockingNow(now: LocalDateTime = LocalDateTime
     if (!scheduleBlockingEnabled) {
         return false
     }
-    return normalizedScheduleTemplates().any { template -> template.isActiveAt(now) }
+    return normalizedScheduleTemplates().any { template -> template.enabled && template.isActiveAt(now) }
 }
 
 fun List<ScheduleTemplatePolicy>.overlappingSchedulePairs(): List<Pair<String, String>> {
-    if (size < 2) return emptyList()
-    val occupiedMinutesBySchedule = associateWith { schedule -> schedule.occupiedWeekMinutes() }
-    return indices.flatMap { firstIndex ->
-        ((firstIndex + 1) until size).mapNotNull { secondIndex ->
-            val first = this[firstIndex]
-            val second = this[secondIndex]
+    val enabledSchedules = filter { schedule -> schedule.enabled }
+    if (enabledSchedules.size < 2) return emptyList()
+    val occupiedMinutesBySchedule = enabledSchedules.associateWith { schedule -> schedule.occupiedWeekMinutes() }
+    return enabledSchedules.indices.flatMap { firstIndex ->
+        ((firstIndex + 1) until enabledSchedules.size).mapNotNull { secondIndex ->
+            val first = enabledSchedules[firstIndex]
+            val second = enabledSchedules[secondIndex]
             if (occupiedMinutesBySchedule.getValue(first)
                     .any(occupiedMinutesBySchedule.getValue(second)::contains)
             ) {
@@ -5046,6 +5219,7 @@ private fun ScheduleTemplatePolicy.occupiedWeekMinutes(): Set<Int> {
 }
 
 fun ScheduleTemplatePolicy.isActiveAt(now: LocalDateTime): Boolean {
+    if (!enabled) return false
     val startMinutes = startMinutes.coerceIn(0, 24 * 60 - 1)
     val endMinutes = endMinutes.coerceIn(0, 24 * 60 - 1)
     if (startMinutes == endMinutes) {
@@ -5128,12 +5302,15 @@ fun ScheduleTemplatePolicy.withHardshipLevelForNextOccurrence(
     level: HardshipLevel,
     now: LocalDateTime = LocalDateTime.now(),
 ): ScheduleTemplatePolicy {
-    return copy(
+    val next = copy(
         hardshipLevel = level,
+        enabled = enabled || level != HardshipLevel.Off,
+    )
+    return next.copy(
         hardshipEndAtMillis = if (level == HardshipLevel.Off) {
             0L
         } else {
-            nextOccurrenceEndMillis(now)
+            next.nextOccurrenceEndMillis(now)
         },
     )
 }
@@ -5232,6 +5409,29 @@ fun String.toAppGroupPolicies(): List<AppGroupPolicy> {
                     AppGroupPolicy(name, packageNames, budgetMinutes, id, hardshipLevel, activeDays)
                 }
 
+                7 -> {
+                    val id = parts[0].decodePolicyField()
+                    val name = parts[1].decodePolicyField()
+                    val budgetMinutes = parts[2].toIntOrNull()
+                        ?.coerceAtLeast(EXPLICIT_ZERO_LIMIT_STORAGE_MINUTES)
+                        ?: 0
+                    val packageNames = parts[3].decodePolicyField().toPackageSet()
+                    val hardshipLevel = HardshipLevel.fromStorageValue(parts[4].toIntOrNull())
+                    val activeDays = parts[5]
+                        .decodePolicyField()
+                        .toPolicyDaySet()
+                    val enabled = parts[6].toBooleanStrictOrNull() ?: true
+                    AppGroupPolicy(
+                        name = name,
+                        packageNames = packageNames,
+                        budgetMinutes = budgetMinutes,
+                        id = id,
+                        hardshipLevel = hardshipLevel,
+                        activeDays = activeDays,
+                        enabled = enabled,
+                    )
+                }
+
                 else -> null
             }
         }
@@ -5249,6 +5449,7 @@ fun List<AppGroupPolicy>.toAppGroupsEncoded(): String {
                 group.packageNames.sorted().joinToString(",").encodePolicyField(),
                 group.hardshipLevel.storageValue.toString(),
                 group.activeDays.normalizedPolicyDays().toScheduleDaysEncoded().encodePolicyField(),
+                group.enabled.toString(),
             ).joinToString(GROUP_FIELD_SEPARATOR)
         }.joinToString(GROUP_SEPARATOR)
 }

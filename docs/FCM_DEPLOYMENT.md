@@ -11,6 +11,8 @@ FCM은 Firestore 데이터를 대신 전달하지 않고 **동기화를 즉시 �
 - 기존 Firestore listener와 15분 WorkManager → FCM 누락·지연 시 예비 경로로 유지
 - 같은 요청 알림 → 앱의 기존 이벤트 토큰으로 중복 표시 방지
 - 무효 토큰 또는 연결이 끊긴 UID의 토큰 → 함수 실행 중 자동 삭제
+- 부모가 사용 현황 동기화 요청 → 자녀 기기에 보통 우선순위 데이터 신호를 보내 새 측정을 예약
+- 자녀가 새 사용량 문서를 저장한 다음 요청 문서에 완료를 기록; 오프라인이면 정기 작업으로 복구
 
 ## Firebase에서 한 번 해야 할 일
 
@@ -49,13 +51,25 @@ set FUNCTIONS_DISCOVERY_TIMEOUT=30
 firebase deploy --only functions
 ```
 
-배포되는 함수는 세 개입니다.
+현재 배포 대상 함수는 다음과 같습니다.
 
 - `processCreatedUnlockRequestPush`: 새 요청
 - `processUpdatedUnlockRequestPush`: 같은 요청의 재전송과 승인·거절
 - `deleteCurrentUserData`: 인증된 현재 사용자의 계정·연결·하위 클라우드 데이터 삭제
+- `processCreatedImmediateBlockPush` / `processUpdatedImmediateBlockPush`: 즉시 차단 변경
+- `processCreatedChildUsageRefreshPush` / `processUpdatedChildUsageRefreshPush`: 자녀 사용 현황 새로고침 요청
 
-생성과 갱신을 분리해 7일 후 문서 삭제에는 함수가 호출되지 않으며, 요청 한 번 또는 결정 한 번당 실제 트리거 호출은 한 번입니다.
+사용 현황 새로고침만 추가 배포할 때는 **먼저 Firestore 규칙을 게시**한 뒤 다음 명령을 사용합니다.
+
+```cmd
+firebase.cmd deploy --only firestore:rules --project screenrest
+set FUNCTIONS_DISCOVERY_TIMEOUT=30
+firebase.cmd deploy --only "functions:processCreatedChildUsageRefreshPush,functions:processUpdatedChildUsageRefreshPush" --project screenrest
+```
+
+새 앱은 부모·자녀 기기 양쪽에 설치해야 합니다. 요청은 자녀별 `usage_refresh/current` 문서 하나를 덮어쓰며, 1분 안의 재요청은 기존 요청을 재사용합니다. 자녀가 응답하지 않으면 2분 후 부모 화면에 연결 대기, 30분 후 요청 만료가 표시됩니다. 사용량 본문은 기존 `usage_snapshots/current` 문서 하나만 유지합니다.
+
+승인 요청 함수는 생성과 갱신을 분리해 7일 후 문서 삭제에 호출되지 않으며, 요청 한 번 또는 결정 한 번당 실제 트리거 호출은 한 번입니다.
 
 함수 리전은 Firestore 지연을 줄이기 위해 `asia-northeast3`로 설정했습니다. 실제 Firestore 데이터베이스 리전이 다른 경우 [`functions/index.js`](../functions/index.js)의 `region`을 같은 권역으로 바꾸는 것이 좋습니다.
 

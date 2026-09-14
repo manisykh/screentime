@@ -12,6 +12,12 @@ import androidx.lifecycle.viewModelScope
 import com.manisykh.screenrest.blocking.UsageMonitorForegroundService
 import com.manisykh.screenrest.data.AppLanguage
 import com.manisykh.screenrest.data.CachedTodayUsageEntry
+import com.manisykh.screenrest.data.ChildUsageSnapshot
+import com.manisykh.screenrest.data.ChildUsageRefreshRequest
+import com.manisykh.screenrest.data.ImmediateBlockState
+import com.manisykh.screenrest.data.ImmediateBlockReadState
+import com.manisykh.screenrest.data.mergeImmediateBlockReadState
+import com.manisykh.screenrest.data.ParentRemoteSyncResult
 import com.manisykh.screenrest.data.EventLogEntry
 import com.manisykh.screenrest.data.EventLogType
 import com.manisykh.screenrest.data.EXPLICIT_ZERO_LIMIT_STORAGE_MINUTES
@@ -29,6 +35,7 @@ import com.manisykh.screenrest.data.ParentNotificationState
 import com.manisykh.screenrest.data.PairingOperationFailure
 import com.manisykh.screenrest.data.PairingOperationResult
 import com.manisykh.screenrest.data.ParentRemoteSyncDataSourceFactory
+import com.manisykh.screenrest.data.ParentRemoteChangeType
 import com.manisykh.screenrest.data.PolicySectionExpansionSettings
 import com.manisykh.screenrest.data.PolicyConfigurationSaveResult
 import com.manisykh.screenrest.data.SettingsRepository
@@ -83,9 +90,11 @@ import com.manisykh.screenrest.usage.DailyUsageInfo
 import com.manisykh.screenrest.usage.InstalledAppInfo
 import com.manisykh.screenrest.usage.UsageStatsRepository
 import com.manisykh.screenrest.worker.UsagePolicyAlertRunner
+import com.manisykh.screenrest.worker.ChildUsageSnapshotPublisher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
@@ -103,6 +112,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.util.Calendar
@@ -112,6 +122,7 @@ data class SafeModeUiState(
     val appLanguage: AppLanguage = AppLanguage.Korean,
     val monitoringDisclosureLoaded: Boolean = false,
     val monitoringDisclosureAccepted: Boolean = false,
+    val childTopAppsSharingEnabled: Boolean = false,
     val securityPinsConfigured: Boolean = false,
     val policyEnforcementEnabled: Boolean = false,
     val warningNotificationsEnabled: Boolean = true,
@@ -131,6 +142,11 @@ data class SafeModeUiState(
     /** User-selected apps that bypass all enforcement policies. */
     val allRestrictionsExemptPackages: Set<String> = emptySet(),
     val parentManagementState: ParentManagementState = ParentManagementState(),
+    val childUsageSnapshots: Map<String, ChildUsageSnapshot> = emptyMap(),
+    val childUsageRefreshRequests: Map<String, ChildUsageRefreshRequest> = emptyMap(),
+    /** Missing key = still loading, Failed = unreadable, Known = server-confirmed. */
+    val childImmediateBlocks: Map<String, ImmediateBlockReadState> = emptyMap(),
+    val localImmediateBlock: ImmediateBlockState = ImmediateBlockState(),
     val parentNotificationState: ParentNotificationState = ParentNotificationState(),
     val parentRequestNotificationReady: Boolean = false,
     val parentRequestNotificationIssue: String = "",
@@ -153,11 +169,11 @@ data class SafeModeUiState(
     val permissionSetupCompletedOnce: Boolean = false,
     val blockingReadiness: BlockingReadiness = BlockingReadiness(),
     val blockDecisionResults: List<BlockDecisionResult> = emptyList(),
-    val dailyPolicyExpanded: Boolean = true,
-    val appGroupsExpanded: Boolean = true,
-    val appLimitsExpanded: Boolean = true,
-    val scheduleBlockingExpanded: Boolean = true,
-    val allowOnlyModeExpanded: Boolean = true,
+    val dailyPolicyExpanded: Boolean = false,
+    val appGroupsExpanded: Boolean = false,
+    val appLimitsExpanded: Boolean = false,
+    val scheduleBlockingExpanded: Boolean = false,
+    val allowOnlyModeExpanded: Boolean = false,
     val settingsLanguageExpanded: Boolean = true,
     val settingsNotificationExpanded: Boolean = true,
     val settingsPinExpanded: Boolean = true,
@@ -221,6 +237,7 @@ enum class EffectiveAppAccess {
     NormallyAllowed,
     BlockedBySchedule,
     BlockedByAllowOnly,
+    BlockedByParent,
 }
 
 enum class EffectiveTimeLimiter {
@@ -502,6 +519,14 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
     private val policyDraftAllRestrictionsExemptPackages = MutableStateFlow<Set<String>?>(null)
     private val pinChangeStatus = MutableStateFlow(PinChangeStatus.Idle)
     private val safeModePinStatus = MutableStateFlow(SafeModePinStatus.Idle)
+    private val childUsageSnapshots = MutableStateFlow<Map<String, ChildUsageSnapshot>>(emptyMap())
+    private val childUsageRefreshRequests = MutableStateFlow<Map<String, ChildUsageRefreshRequest>>(emptyMap())
+    private val childImmediateBlocks = MutableStateFlow<Map<String, ImmediateBlockReadState>>(emptyMap())
+    private val remoteFamilyState = combine(
+        childUsageSnapshots, childImmediateBlocks, repository.immediateBlockState,
+    ) { usage, blocks, localBlock ->
+        Triple(usage, blocks, localBlock)
+    }
     private var refreshUsageJob: Job? = null
     private var alertEvaluationJob: Job? = null
     private var refreshInstalledAppsJob: Job? = null
@@ -598,11 +623,13 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         repository.permissionSetupCompletedOnce,
         repository.monitoringDisclosureAccepted,
         repository.securityPinsConfigured,
-    ) { permissionSetupCompletedOnce, monitoringDisclosureAccepted, securityPinsConfigured ->
+        repository.childTopAppsSharingEnabled,
+    ) { permissionSetupCompletedOnce, monitoringDisclosureAccepted, securityPinsConfigured, childTopAppsSharingEnabled ->
         ReleaseComplianceState(
             permissionSetupCompletedOnce = permissionSetupCompletedOnce,
             monitoringDisclosureAccepted = monitoringDisclosureAccepted,
             securityPinsConfigured = securityPinsConfigured,
+            childTopAppsSharingEnabled = childTopAppsSharingEnabled,
         )
     }
 
@@ -624,6 +651,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             permissionSetupCompletedOnce = releaseCompliance.permissionSetupCompletedOnce,
             monitoringDisclosureAccepted = releaseCompliance.monitoringDisclosureAccepted,
             securityPinsConfigured = releaseCompliance.securityPinsConfigured,
+            childTopAppsSharingEnabled = releaseCompliance.childTopAppsSharingEnabled,
         )
     }
 
@@ -666,7 +694,9 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
     val uiState: StateFlow<SafeModeUiState> = combine(
         persistedState,
         transientState,
-    ) { persistedState, transientState ->
+        remoteFamilyState,
+        childUsageRefreshRequests,
+    ) { persistedState, transientState, familyState, refreshRequests ->
         val savedSettings = persistedState.usagePolicySettings.normalizedForDraft()
         val draftSettings = (transientState.policyDraftSettings ?: persistedState.usagePolicySettings)
             .normalizedForDraft()
@@ -694,12 +724,20 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             todayUsage = todayUsage,
             installedApps = transientState.usageState.installedApps,
             hardshipRuntimeState = persistedState.hardshipRuntimeState,
+            immediateBlock = familyState.third.takeIf { block ->
+                persistedState.parentManagementState.paired &&
+                    !persistedState.safeModeEnabled &&
+                    persistedState.policyEnforcementEnabled &&
+                    persistedState.parentManagementState.deviceRole == ParentDeviceRole.Child &&
+                    persistedState.parentManagementState.linkedParentDevices.any { it.parentUid == block.parentUid }
+            } ?: ImmediateBlockState(),
         )
         SafeModeUiState(
             safeModeEnabled = persistedState.safeModeEnabled,
             appLanguage = persistedState.appLanguage,
             monitoringDisclosureLoaded = true,
             monitoringDisclosureAccepted = persistedState.monitoringDisclosureAccepted,
+            childTopAppsSharingEnabled = persistedState.childTopAppsSharingEnabled,
             securityPinsConfigured = persistedState.securityPinsConfigured,
             policyEnforcementEnabled = persistedState.policyEnforcementEnabled,
             warningNotificationsEnabled = persistedState.warningNotificationsEnabled,
@@ -724,6 +762,10 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             allowedAppPackages = draftAllowedPackages,
             allRestrictionsExemptPackages = draftExemptPackages,
             parentManagementState = persistedState.parentManagementState,
+            childUsageSnapshots = familyState.first,
+            childUsageRefreshRequests = refreshRequests,
+            childImmediateBlocks = familyState.second,
+            localImmediateBlock = familyState.third,
             parentNotificationState = persistedState.parentNotificationState,
             parentRequestNotificationReady = transientState.usageState.parentRequestNotificationReady,
             parentRequestNotificationIssue = transientState.usageState.parentRequestNotificationIssue,
@@ -846,6 +888,17 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                 }
                 .distinctUntilChanged()
                 .collect { target ->
+                    childUsageSnapshots.value = childUsageSnapshots.value.filterKeys { id ->
+                        target.deviceRole == ParentDeviceRole.Parent && id in target.childDeviceIds
+                    }
+                    childUsageRefreshRequests.value = childUsageRefreshRequests.value.filterKeys { id ->
+                        target.deviceRole == ParentDeviceRole.Parent && id in target.childDeviceIds
+                    }
+                    childImmediateBlocks.update { current ->
+                        current.filterKeys { id ->
+                            target.deviceRole == ParentDeviceRole.Parent && id in target.childDeviceIds
+                        }
+                    }
                     restartParentRemoteListener(
                         childDeviceIds = target.childDeviceIds,
                         deviceRole = target.deviceRole,
@@ -864,6 +917,13 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             return
         }
         parentRemoteListenerJob = viewModelScope.launch(Dispatchers.IO) {
+            if (deviceRole == ParentDeviceRole.Parent) {
+                launch {
+                    childDeviceIds.forEach { childDeviceId ->
+                        refreshChildImmediateBlock(childDeviceId)
+                    }
+                }
+            }
             repository.observeParentRemoteChanges(childDeviceIds, deviceRole)
                 .filter { change -> !change.fromCache && !change.hasPendingWrites }
                 .conflate()
@@ -880,8 +940,48 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                     delay(parentListenerRetryDelayMillis(attempt))
                     true
                 }
-                .collect {
-                    synchronizeParentStateFromListener()
+                .collect { change ->
+                    if (change.type == ParentRemoteChangeType.ChildUsageSnapshot &&
+                        deviceRole == ParentDeviceRole.Parent
+                    ) {
+                        childUsageSnapshots.value = if (change.usageSnapshot == null) {
+                            childUsageSnapshots.value - change.childDeviceId
+                        } else {
+                            childUsageSnapshots.value +
+                                (change.childDeviceId to change.usageSnapshot)
+                        }
+                    } else if (change.type == ParentRemoteChangeType.ChildUsageRefresh) {
+                        if (deviceRole == ParentDeviceRole.Parent) {
+                            childUsageRefreshRequests.value = if (change.usageRefreshRequest == null) {
+                                childUsageRefreshRequests.value - change.childDeviceId
+                            } else {
+                                childUsageRefreshRequests.value +
+                                    (change.childDeviceId to change.usageRefreshRequest)
+                            }
+                        } else if (change.usageRefreshRequest?.isPending(System.currentTimeMillis()) == true) {
+                            viewModelScope.launch(Dispatchers.IO) {
+                                ChildUsageSnapshotPublisher.respondToRefreshIfPending(getApplication<Application>())
+                            }
+                        }
+                    } else if (change.type == ParentRemoteChangeType.ImmediateBlock) {
+                        if (deviceRole == ParentDeviceRole.Parent) {
+                            val state = if (change.immediateBlockDocumentExists &&
+                                change.immediateBlockState == null
+                            ) ImmediateBlockReadState.Failed
+                            else ImmediateBlockReadState.Known(change.immediateBlockState)
+                            childImmediateBlocks.update { current ->
+                                val merged = if (state == ImmediateBlockReadState.Failed) state
+                                else {
+                                    mergeImmediateBlockReadState(current[change.childDeviceId], state)
+                                }
+                                current + (change.childDeviceId to merged)
+                            }
+                        } else {
+                            repository.syncImmediateBlock()
+                        }
+                    } else {
+                        synchronizeParentStateFromListener()
+                    }
                 }
         }
     }
@@ -1242,6 +1342,13 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                         return@launch
                     }
                 }
+
+                val appliedUiState = uiState.value
+                usageStatsRepository.rememberTodayDailyGoal(
+                    goalMinutes = appliedUiState.usagePolicySettings.todayLimitMinutesOrNull().takeIf {
+                        !appliedUiState.safeModeEnabled && appliedUiState.policyEnforcementEnabled
+                    },
+                )
 
                 val todayUsage = queryUsageWithRetry {
                     usageStatsRepository.getTodayUsage(maxItems = 500, skipAccessCheck = true)
@@ -1760,7 +1867,130 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
 
     fun syncParentDevice() {
         viewModelScope.launch {
+            val parentState = repository.parentManagementState.first()
+            if (parentState.deviceRole == ParentDeviceRole.Child) {
+                repository.syncImmediateBlock()
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        val response = ChildUsageSnapshotPublisher.respondToRefreshIfPending(
+                            getApplication<Application>(),
+                        )
+                        if (response != ParentRemoteSyncResult.Success) {
+                            ChildUsageSnapshotPublisher.publishIfDue(getApplication<Application>(), force = true)
+                        }
+                    }
+                }.onFailure { error ->
+                    Log.w("STM-ParentSync", "Child usage snapshot publish failed", error)
+                }
+            }
             parentNotificationCoordinator.synchronizeAndNotify()
+            if (parentState.deviceRole == ParentDeviceRole.Parent) {
+                var refreshFailed = false
+                parentListenerChildIds(parentState).forEach { childDeviceId ->
+                    repository.requestChildUsageRefresh(childDeviceId)
+                        .onSuccess { request ->
+                            childUsageRefreshRequests.value = childUsageRefreshRequests.value +
+                                (childDeviceId to request)
+                        }
+                        .onFailure { error ->
+                            refreshFailed = true
+                            Log.w("STM-ParentSync", "Child usage refresh request failed", error)
+                        }
+                    repository.fetchChildUsageSnapshot(childDeviceId)?.let { snapshot ->
+                        childUsageSnapshots.value = childUsageSnapshots.value +
+                            (childDeviceId to snapshot)
+                    }
+                    refreshChildImmediateBlock(childDeviceId)
+                }
+                if (refreshFailed) {
+                    Toast.makeText(
+                        getApplication<Application>(),
+                        if (repository.appLanguage.first() == AppLanguage.Korean) {
+                            "자녀 사용 현황 새로고침 요청에 실패했습니다"
+                        } else {
+                            "Could not request fresh child usage"
+                        },
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private suspend fun refreshChildImmediateBlock(childDeviceId: String): Boolean {
+        var success = false
+        repository.fetchImmediateBlock(childDeviceId)
+            .onSuccess { block ->
+                success = true
+                childImmediateBlocks.update { current ->
+                    current + (childDeviceId to mergeImmediateBlockReadState(
+                        current[childDeviceId], ImmediateBlockReadState.Known(block),
+                    ))
+                }
+            }
+            .onFailure { error ->
+                // Do not turn an unreadable active order into a false "Block now" action.
+                if (childImmediateBlocks.value[childDeviceId] !is ImmediateBlockReadState.Known) {
+                    childImmediateBlocks.update { current ->
+                        if (current[childDeviceId] is ImmediateBlockReadState.Known) current
+                        else current + (childDeviceId to ImmediateBlockReadState.Failed)
+                    }
+                }
+                Log.w("STM-ParentSync", "Immediate block state unavailable for $childDeviceId", error)
+            }
+        return success
+    }
+
+    fun checkImmediateBlock(childDeviceId: String) {
+        viewModelScope.launch {
+            childImmediateBlocks.update { current -> current - childDeviceId }
+            if (!refreshChildImmediateBlock(childDeviceId)) {
+                Toast.makeText(
+                    getApplication<Application>(),
+                    if (repository.appLanguage.first() == AppLanguage.Korean) {
+                        "차단 상태를 확인하지 못했습니다. 연결과 가족 계정을 확인해 주세요"
+                    } else {
+                        "Could not check block status. Check connection and family account"
+                    },
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    fun startImmediateBlock(childDeviceId: String, durationMinutes: Int, adminPin: String) {
+        viewModelScope.launch {
+            val verified = repository.verifyAdminPin(adminPin)
+            val result = if (verified) repository.issueImmediateBlock(childDeviceId, durationMinutes)
+                else ParentRemoteSyncResult.Failed("Invalid Admin PIN")
+            if (result == ParentRemoteSyncResult.Success) {
+                refreshChildImmediateBlock(childDeviceId)
+            }
+            showParentOperationResult(
+                success = result == ParentRemoteSyncResult.Success,
+                successKorean = "차단 요청을 보냈습니다. 자녀 기기 적용을 확인 중입니다",
+                failureKorean = if (!verified) "관리 PIN이 올바르지 않습니다" else "차단 요청 실패: 연결과 권한을 확인해 주세요",
+                successEnglish = "Block request sent. Waiting for the child device",
+                failureEnglish = if (!verified) "Incorrect Admin PIN" else "Could not send block request. Check connection and permissions",
+            )
+        }
+    }
+
+    fun stopImmediateBlock(childDeviceId: String, requestId: String, adminPin: String) {
+        viewModelScope.launch {
+            val verified = repository.verifyAdminPin(adminPin)
+            val result = if (verified) repository.revokeImmediateBlock(childDeviceId, requestId)
+                else ParentRemoteSyncResult.Failed("Invalid Admin PIN")
+            if (result == ParentRemoteSyncResult.Success) {
+                refreshChildImmediateBlock(childDeviceId)
+            }
+            showParentOperationResult(
+                success = result == ParentRemoteSyncResult.Success,
+                successKorean = "차단 종료 요청을 보냈습니다",
+                failureKorean = if (!verified) "관리 PIN이 올바르지 않습니다" else "차단 종료 실패: 연결과 권한을 확인해 주세요",
+                successEnglish = "Block stop request sent",
+                failureEnglish = if (!verified) "Incorrect Admin PIN" else "Could not stop block. Check connection and permissions",
+            )
         }
     }
 
@@ -2013,6 +2243,16 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun setChildTopAppsSharingEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            if (repository.parentManagementState.first().deviceRole != ParentDeviceRole.Child) return@launch
+            repository.setChildTopAppsSharingEnabled(enabled)
+            runCatching {
+                ChildUsageSnapshotPublisher.publishIfDue(getApplication<Application>(), force = true)
+            }
+        }
+    }
+
     fun configureInitialAdminPin(adminPin: String) {
         viewModelScope.launch {
             repository.configureInitialAdminPin(adminPin)
@@ -2162,6 +2402,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         todayUsage: List<AppUsageInfo>,
         installedApps: List<InstalledAppInfo>,
         hardshipRuntimeState: HardshipRuntimeState,
+        immediateBlock: ImmediateBlockState,
     ): PolicySummary {
         val todayTemporaryUnlockState = temporaryUnlockState.forToday()
         val nowMillis = System.currentTimeMillis()
@@ -2232,7 +2473,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         val totalLimitMinutesOrNull = settings.todayLimitMinutesOrNull()
         val totalLimitMinutes = totalLimitMinutesOrNull ?: 0
         val totalExtraMinutes = todayTemporaryUnlockState.totalExtraMinutes
-        val primaryGroup = groupSummaries.firstOrNull()
+        val primaryGroup = groupSummaries.firstOrNull { summary -> summary.activeToday }
         val groupUsedMinutes = primaryGroup?.usedMinutes ?: 0
         val groupLimitMinutes = primaryGroup?.limitMinutes ?: 0
         val totalStatus = if (todayTemporaryUnlockState.totalUnlockedForToday || totalLimitMinutesOrNull == null) {
@@ -2337,6 +2578,8 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             val access = when {
                 SafetyGate.isUserAllowedPackage(packageName, allRestrictionsExemptPackages) ->
                     EffectiveAppAccess.AllRestrictionsExempt
+                immediateBlock.appliesTo(packageName, nowMillis) ->
+                    EffectiveAppAccess.BlockedByParent
                 activeSchedules.isNotEmpty() && activeSchedules.all { schedule ->
                     SafetyGate.isUserAllowedPackage(packageName, schedule.allowedPackageNames)
                 } -> EffectiveAppAccess.ScheduleAllowed
@@ -2355,6 +2598,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             }
             val timeCandidates = if (
                 access == EffectiveAppAccess.AllRestrictionsExempt ||
+                access == EffectiveAppAccess.BlockedByParent ||
                 access == EffectiveAppAccess.BlockedBySchedule ||
                 access == EffectiveAppAccess.BlockedByAllowOnly
             ) {
@@ -2390,7 +2634,8 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             val limiting = timeCandidates.minByOrNull { (_, remaining) -> remaining }
             val status = when {
                 access == EffectiveAppAccess.BlockedBySchedule ||
-                    access == EffectiveAppAccess.BlockedByAllowOnly -> LimitStatus.Exceeded
+                    access == EffectiveAppAccess.BlockedByAllowOnly ||
+                    access == EffectiveAppAccess.BlockedByParent -> LimitStatus.Exceeded
                 limiting == null -> LimitStatus.Normal
                 limiting.second <= 0 -> LimitStatus.Exceeded
                 else -> {
@@ -2508,6 +2753,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             temporarilyAllowedPackages +
                 SafetyGate.expandedUserAllowedPackages(allRestrictionsExemptPackages)
         return settings.normalizedScheduleTemplates()
+            .filter { template -> template.enabled }
             .map { template ->
                 val activeNow = template.isActiveAt(now)
                 val effectiveAllowedPackages = template.allowedPackageNames + transientAndExemptPackages
@@ -2726,11 +2972,13 @@ private fun BlockDecision.isWouldBlock(): Boolean {
     return this == BlockDecision.WouldBlockTotalLimit ||
         this == BlockDecision.WouldBlockSchedule ||
         this == BlockDecision.WouldBlockAllowOnly ||
+        this == BlockDecision.WouldBlockImmediate ||
         this == BlockDecision.WouldBlockGroupLimit ||
         this == BlockDecision.WouldBlockAppLimit
 }
 
 private fun ScheduleTemplatePolicy.isActiveAt(now: LocalDateTime): Boolean {
+    if (!enabled) return false
     val startMinutes = startMinutes.coerceIn(0, 24 * 60 - 1)
     val endMinutes = endMinutes.coerceIn(0, 24 * 60 - 1)
     if (startMinutes == endMinutes) {
@@ -2880,6 +3128,7 @@ fun UsagePolicySettings.normalizedForDraft(): UsagePolicySettings {
         scheduleEndMinutes = scheduleEndMinutes.coerceIn(0, POLICY_MAX_SCHEDULE_MINUTES),
         scheduleDays = scheduleDaySet().toScheduleDaysEncoded(),
         scheduleTemplates = cleanScheduleTemplates.toScheduleTemplatesEncoded(),
+        scheduleBlockingEnabled = cleanScheduleTemplates.any { template -> template.enabled },
         activeScheduleTemplateId = cleanActiveScheduleTemplateId,
     )
 }
@@ -3012,6 +3261,7 @@ private data class PersistedState(
     val systemHealthStatus: SystemHealthStatus = SystemHealthStatus(),
     val permissionSetupCompletedOnce: Boolean = false,
     val monitoringDisclosureAccepted: Boolean = false,
+    val childTopAppsSharingEnabled: Boolean = false,
     val securityPinsConfigured: Boolean = false,
     val policySectionExpansionSettings: PolicySectionExpansionSettings = PolicySectionExpansionSettings(),
 )
@@ -3019,6 +3269,7 @@ private data class PersistedState(
 private data class ReleaseComplianceState(
     val permissionSetupCompletedOnce: Boolean = false,
     val monitoringDisclosureAccepted: Boolean = false,
+    val childTopAppsSharingEnabled: Boolean = false,
     val securityPinsConfigured: Boolean = false,
 )
 

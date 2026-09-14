@@ -51,6 +51,8 @@ class UsagePolicyCheckWorker(
             return Result.success()
         }
         UsagePolicyAlertRunner.evaluate(applicationContext, sendNotifications = true)
+        runCatching { ChildUsageSnapshotPublisher.respondToRefreshIfPending(applicationContext) }
+        runCatching { ChildUsageSnapshotPublisher.publishIfDue(applicationContext) }
         return Result.success()
     }
 
@@ -256,6 +258,11 @@ class RemoteParentSyncWorker(
             context = appContext,
             repository = settingsRepository,
         ).synchronizeAndNotify()
+        if (before.deviceRole == com.manisykh.screenrest.data.ParentDeviceRole.Child &&
+            !settingsRepository.syncImmediateBlock()
+        ) {
+            return Result.retry()
+        }
         return if (syncResult.retryable) Result.retry() else Result.success()
     }
 
@@ -440,12 +447,19 @@ object UsagePolicyAlertRunner {
         }
         val safeModeEnabled = settingsRepository.safeModeEnabled.first()
         val policyEnforcementEnabled = settingsRepository.policyEnforcementEnabled.first()
-        if (safeModeEnabled || !policyEnforcementEnabled || !usageRepository.hasUsageAccess()) {
+        val usageAccessReady = usageRepository.hasUsageAccess()
+        val settings = settingsRepository.usagePolicySettings.first()
+        usageRepository.rememberTodayDailyGoal(
+            goalMinutes = settings.todayLimitMinutesOrNull().takeIf {
+                !safeModeEnabled && policyEnforcementEnabled && usageAccessReady
+            },
+            forceWrite = true,
+        )
+        if (safeModeEnabled || !policyEnforcementEnabled || !usageAccessReady) {
             return
         }
         val warningNotificationsEnabled = settingsRepository.warningNotificationsEnabled.first()
         val limitNotificationsEnabled = settingsRepository.limitNotificationsEnabled.first()
-        val settings = settingsRepository.usagePolicySettings.first()
         val temporaryUnlockState = settingsRepository.temporaryUnlockState.first().forToday()
         val allRestrictionsExemptPackages =
             settingsRepository.allRestrictionsExemptPackages.first()

@@ -1,0 +1,92 @@
+<style>
+  #screenrest-rules-preview { display: flex; justify-content: center; padding: 8px 0 20px; font-family: Arial, "Noto Sans KR", sans-serif; color: light-dark(#172b49, #eef3ff); }
+  #screenrest-rules-preview * { box-sizing: border-box; }
+  #screenrest-rules-preview [hidden] { display: none !important; }
+  #screenrest-rules-preview .sr-phone { width: min(100%, 390px); background: light-dark(#fffcf8, #101827); border: 1px solid light-dark(#dfe6f2, #374256); border-radius: 26px; overflow: hidden; }
+  #screenrest-rules-preview .sr-main { padding: 24px 18px 12px; }
+  #screenrest-rules-preview .sr-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; }
+  #screenrest-rules-preview .sr-title { margin: 0; font-size: 23px; font-weight: 700; letter-spacing: -.5px; }
+  #screenrest-rules-preview .sr-profile { display: flex; align-items: center; gap: 5px; border: 1px solid light-dark(#cfddff, #3b5280); border-radius: 999px; padding: 6px 9px; background: light-dark(#edf3ff, #233555); color: light-dark(#2162dd, #92b5ff); font-size: 12px; font-weight: 700; }
+  #screenrest-rules-preview .sr-profile svg { width: 13px; height: 13px; }
+  #screenrest-rules-preview .sr-summary { display: flex; align-items: center; gap: 12px; border: 1px solid light-dark(#cde7e6, #316761); background: light-dark(#effaf8, #173b39); border-radius: 19px; padding: 13px 14px; margin-bottom: 18px; }
+  #screenrest-rules-preview .sr-summary-icon { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 50%; background: light-dark(#e2f7f4, #245953); color: light-dark(#149d91, #6ed8cb); flex: none; }
+  #screenrest-rules-preview .sr-summary-icon svg { width: 18px; height: 18px; }
+  #screenrest-rules-preview .sr-summary-kicker { color: light-dark(#63748a, #b2c1d6); font-size: 11px; font-weight: 700; }
+  #screenrest-rules-preview .sr-summary-strong { color: light-dark(#0c9389, #7ce1d0); font-size: 17px; font-weight: 700; margin: 2px 0; }
+  #screenrest-rules-preview .sr-summary-note { color: light-dark(#67788e, #b2c1d6); font-size: 11px; }
+  #screenrest-rules-preview .sr-section-title { margin: 17px 4px 9px; font-size: 15px; font-weight: 700; }
+  #screenrest-rules-preview .sr-mode-card { border: 1px solid light-dark(#d8e1ee, #33425b); background: light-dark(#ffffff, #1b2638); border-radius: 19px; padding: 9px 11px; margin-bottom: 9px; }
+  #screenrest-rules-preview .sr-mode-top { display: flex; align-items: center; gap: 6px; min-height: 39px; }
+  #screenrest-rules-preview .sr-mode-icon { display: grid; place-items: center; width: 31px; height: 31px; flex: none; border-radius: 50%; background: light-dark(#eef4ff, #293e66); color: light-dark(#276bea, #8db6ff); }
+  #screenrest-rules-preview .sr-mode-icon svg { width: 16px; height: 16px; }
+  #screenrest-rules-preview .sr-mode-name { flex: 1; min-width: 0; font-size: 15px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #screenrest-rules-preview .sr-help { display: grid; place-items: center; flex: none; width: 28px; height: 28px; border: 1px solid light-dark(#cbdcff, #45639d); border-radius: 50%; background: light-dark(#f3f7ff, #283d60); color: light-dark(#2c70e9, #9cc1ff); font-size: 16px; font-weight: 700; padding: 0; }
+  #screenrest-rules-preview .sr-mode-state { flex: none; color: light-dark(#159c91, #76d8cb); font-size: 11px; font-weight: 700; white-space: nowrap; }
+  #screenrest-rules-preview .sr-mode-state.sr-off { color: light-dark(#748397, #a6b8cf); }
+  #screenrest-rules-preview .sr-open { flex: none; min-height: 34px; padding: 3px 8px; border: 1px solid light-dark(#dce4f2, #46546b); border-radius: 999px; background: light-dark(#f8fbff, #273347); color: light-dark(#2867db, #9abaff); font-size: 11px; font-weight: 700; }
+  #screenrest-rules-preview .sr-mode-description { padding: 0 0 3px 37px; color: light-dark(#66768d, #b3c0d3); font-size: 11px; line-height: 1.35; }
+  #screenrest-rules-preview .sr-mode-panel { border-top: 1px solid light-dark(#e5ebf3, #38465b); margin-top: 7px; padding-top: 10px; }
+  #screenrest-rules-preview .sr-day-row { display: flex; gap: 5px; margin-bottom: 9px; }
+  #screenrest-rules-preview .sr-day { flex: 1; text-align: center; border-radius: 10px; padding: 7px 2px; background: light-dark(#f3f6fc, #2a3548); color: light-dark(#687a90, #bdc9d9); font-size: 10px; }
+  #screenrest-rules-preview .sr-day strong { display: block; margin-top: 3px; color: light-dark(#263b5b, #e3edfc); font-size: 11px; }
+  #screenrest-rules-preview .sr-day.sr-selected { background: light-dark(#2867e8, #4a7de5); color: #fff; }
+  #screenrest-rules-preview .sr-day.sr-selected strong { color: #fff; }
+  #screenrest-rules-preview .sr-budget { display: flex; justify-content: space-between; align-items: center; border-radius: 11px; padding: 10px 12px; background: light-dark(#f4f7fd, #29364b); color: light-dark(#63758b, #b2bfd0); font-size: 11px; }
+  #screenrest-rules-preview .sr-budget strong { color: light-dark(#2869e8, #9dc0ff); font-size: 14px; }
+  #screenrest-rules-preview .sr-preset-row { display: flex; gap: 7px; margin-top: 9px; }
+  #screenrest-rules-preview .sr-preset { flex: 1; text-align: center; padding: 8px 2px; border-radius: 999px; background: light-dark(#edf3ff, #263b61); color: light-dark(#2c6ee5, #9bbfff); font-size: 11px; font-weight: 700; }
+  #screenrest-rules-preview .sr-empty { display: flex; justify-content: space-between; align-items: center; gap: 8px; border-radius: 12px; padding: 10px; background: light-dark(#f5f8fd, #28364a); }
+  #screenrest-rules-preview .sr-empty span { font-size: 11px; color: light-dark(#65778f, #b5c3d7); }
+  #screenrest-rules-preview .sr-empty button { border: 0; border-radius: 999px; padding: 7px 9px; background: light-dark(#eaf1ff, #2d4777); color: light-dark(#2768de, #afc9ff); font-size: 11px; font-weight: 700; }
+  #screenrest-rules-preview .sr-switch { display: flex; justify-content: flex-start; align-items: center; width: 42px; height: 24px; padding: 2px; border: 2px solid light-dark(#c5d1e1, #63738b); border-radius: 999px; background: light-dark(#e7e0e9, #424253); flex: none; }
+  #screenrest-rules-preview .sr-switch::before { content: ""; display: block; width: 15px; height: 15px; border-radius: 50%; background: light-dark(#cbd7e8, #a9b7c9); }
+  #screenrest-rules-preview .sr-switch[aria-checked="true"] { justify-content: flex-end; background: light-dark(#2469e6, #4a7fe9); border-color: light-dark(#2469e6, #4a7fe9); }
+  #screenrest-rules-preview .sr-switch[aria-checked="true"]::before { background: #fff; }
+  #screenrest-rules-preview .sr-nav { display: flex; justify-content: space-around; border-top: 1px solid light-dark(#dce4ef, #38465a); padding: 10px 4px 13px; background: light-dark(#fff, #1a2637); }
+  #screenrest-rules-preview .sr-nav-item { display: flex; flex-direction: column; align-items: center; gap: 4px; color: light-dark(#60708a, #b0bfd2); font-size: 10px; font-weight: 700; }
+  #screenrest-rules-preview .sr-nav-item svg { width: 17px; height: 17px; }
+  #screenrest-rules-preview .sr-nav-item.sr-active { color: light-dark(#2769e5, #9abfff); }
+</style>
+<div id="screenrest-rules-preview">
+  <div class="sr-phone" aria-label="폰 쉼 규칙 탭 예상 화면">
+    <div class="sr-main">
+      <div class="sr-top"><h2 class="sr-title">사용 규칙</h2><div class="sr-profile"><i data-lucide="user-round" aria-hidden="true"></i>아빠</div></div>
+      <div class="sr-summary"><div class="sr-summary-icon"><i data-lucide="clock-3" aria-hidden="true"></i></div><div><div class="sr-summary-kicker">현재 적용 결과</div><div class="sr-summary-strong">일반 사용</div><div class="sr-summary-note">적용 중인 시간 제한 없음</div></div></div>
+      <div class="sr-section-title">시간 제한</div>
+      <section class="sr-mode-card" data-mode="daily">
+        <div class="sr-mode-top"><div class="sr-mode-icon"><i data-lucide="calendar-days" aria-hidden="true"></i></div><div class="sr-mode-name">요일별 제한</div><button class="sr-help" type="button" aria-label="요일별 제한 도움말">?</button><span class="sr-mode-state sr-off">꺼짐</span><button class="sr-switch" type="button" role="switch" aria-label="요일별 제한 활성화" aria-checked="false" hidden></button><button class="sr-open" type="button" aria-expanded="false">열기</button></div>
+        <div class="sr-mode-description">요일마다 전체 사용 시간을 정합니다</div>
+        <div class="sr-mode-panel" hidden><div class="sr-day-row"><div class="sr-day">월<strong>2h</strong></div><div class="sr-day">화<strong>2h</strong></div><div class="sr-day">수<strong>2h</strong></div><div class="sr-day">목<strong>2h</strong></div><div class="sr-day">금<strong>2h</strong></div><div class="sr-day">토<strong>4h</strong></div><div class="sr-day sr-selected">일<strong>4h</strong></div></div><div class="sr-budget"><span>일요일 제한</span><strong>4h</strong></div><div class="sr-preset-row"><div class="sr-preset">평일에 적용</div><div class="sr-preset">주말에 적용</div></div></div>
+      </section>
+      <section class="sr-mode-card" data-mode="groups"><div class="sr-mode-top"><div class="sr-mode-icon"><i data-lucide="network" aria-hidden="true"></i></div><div class="sr-mode-name">앱 그룹</div><button class="sr-help" type="button" aria-label="앱 그룹 도움말">?</button><span class="sr-mode-state sr-off">활성 0/1</span><button class="sr-open" type="button" aria-expanded="false">열기</button></div><div class="sr-mode-description">여러 앱이 하나의 시간을 함께 사용합니다</div><div class="sr-mode-panel" hidden><div class="sr-empty"><span>SNS · 1시간 · 매일</span><button class="sr-switch" type="button" role="switch" aria-label="SNS 그룹 활성화" aria-checked="false"></button></div></div></section>
+      <section class="sr-mode-card" data-mode="apps"><div class="sr-mode-top"><div class="sr-mode-icon"><i data-lucide="grid-2x2" aria-hidden="true"></i></div><div class="sr-mode-name">앱별 제한</div><button class="sr-help" type="button" aria-label="앱별 제한 도움말">?</button><span class="sr-mode-state sr-off">제한 0개</span><button class="sr-open" type="button" aria-expanded="false">열기</button></div><div class="sr-mode-description">앱마다 사용할 시간을 정합니다</div><div class="sr-mode-panel" hidden><div class="sr-empty"><span>앱 검색 · 전체 / 제한 / 미설정</span></div></div></section>
+      <div class="sr-section-title">실행 범위</div>
+      <section class="sr-mode-card" data-mode="schedule"><div class="sr-mode-top"><div class="sr-mode-icon"><i data-lucide="clock-3" aria-hidden="true"></i></div><div class="sr-mode-name">스케줄 차단</div><button class="sr-help" type="button" aria-label="스케줄 차단 도움말">?</button><span class="sr-mode-state sr-off">활성 0/0</span><button class="sr-open" type="button" aria-expanded="false">열기</button></div><div class="sr-mode-description">정해진 시간에는 선택한 앱만 허용합니다</div><div class="sr-mode-panel" hidden><div class="sr-empty"><span>아직 스케줄이 없습니다</span><button type="button">+ 스케줄 만들기</button></div></div></section>
+      <section class="sr-mode-card" data-mode="allow"><div class="sr-mode-top"><div class="sr-mode-icon"><i data-lucide="shield-check" aria-hidden="true"></i></div><div class="sr-mode-name">허용 앱만</div><button class="sr-help" type="button" aria-label="허용 앱만 도움말">?</button><span class="sr-mode-state sr-off">꺼짐</span><button class="sr-switch" type="button" role="switch" aria-label="허용 앱만 활성화" aria-checked="false" hidden></button><button class="sr-open" type="button" aria-expanded="false">열기</button></div><div class="sr-mode-description">선택한 앱만 실행할 수 있습니다</div><div class="sr-mode-panel" hidden><div class="sr-empty"><span>허용 앱을 선택한 뒤 활성화합니다</span></div></div></section>
+      <section class="sr-mode-card"><div class="sr-mode-top"><div class="sr-mode-name">제한 없는 앱</div><span class="sr-mode-state">제한 없음 0</span><button class="sr-open" type="button" aria-label="제한 없는 앱 열기">열기</button></div></section>
+    </div>
+    <div class="sr-nav" aria-label="하단 탭"><div class="sr-nav-item"><i data-lucide="house" aria-hidden="true"></i>오늘</div><div class="sr-nav-item sr-active"><i data-lucide="shield-check" aria-hidden="true"></i>규칙</div><div class="sr-nav-item"><i data-lucide="chart-no-axes-column" aria-hidden="true"></i>통계</div><div class="sr-nav-item"><i data-lucide="users-round" aria-hidden="true"></i>가족</div><div class="sr-nav-item"><i data-lucide="ellipsis" aria-hidden="true"></i>더보기</div></div>
+  </div>
+</div>
+<script>
+  const rulesPreview = document.getElementById("screenrest-rules-preview");
+  rulesPreview.querySelectorAll(".sr-mode-card[data-mode]").forEach((mode) => {
+    const open = mode.querySelector(".sr-open");
+    const panel = mode.querySelector(".sr-mode-panel");
+    const status = mode.querySelector(".sr-mode-state");
+    const switchButton = mode.querySelector(".sr-mode-top .sr-switch");
+    open.addEventListener("click", () => {
+      const expanded = open.getAttribute("aria-expanded") !== "true";
+      open.setAttribute("aria-expanded", String(expanded));
+      open.textContent = expanded ? "접기" : "열기";
+      panel.hidden = !expanded;
+      if (switchButton) switchButton.hidden = !expanded;
+      if (status) status.hidden = expanded && Boolean(switchButton);
+    });
+  });
+  rulesPreview.querySelectorAll(".sr-switch").forEach((control) => {
+    control.addEventListener("click", () => {
+      control.setAttribute("aria-checked", control.getAttribute("aria-checked") === "true" ? "false" : "true");
+    });
+  });
+</script>
