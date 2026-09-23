@@ -94,7 +94,7 @@ class SafetyGateTest {
     }
 
     @Test
-    fun allowOnlyMode_blocksUnrelatedPackageButAllowsPhoneFamily() {
+    fun allowOnlyMode_blocksUnrelatedPackageButAllowsPhoneFamilyUnderActivePolicy() {
         val settings = UsagePolicySettings(allowOnlyModeEnabled = true)
 
         val phoneDecision = BlockDecisionEngine.evaluate(
@@ -120,7 +120,7 @@ class SafetyGateTest {
             allowOnlyAllowedPackages = setOf("com.samsung.android.dialer"),
         )
 
-        assertEquals(BlockDecision.AllowedNoLimit, phoneDecision.decision)
+        assertEquals(BlockDecision.AllowedUnderLimit, phoneDecision.decision)
         assertEquals(BlockDecision.WouldBlockAllowOnly, gameDecision.decision)
     }
 

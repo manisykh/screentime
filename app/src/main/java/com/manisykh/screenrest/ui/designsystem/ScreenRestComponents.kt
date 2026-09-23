@@ -68,7 +68,7 @@ fun ScreenRestPageHeader(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(vertical = ScreenRestTheme.spacing.sm),
+            .padding(bottom = ScreenRestTheme.spacing.sm),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         leading?.let {
@@ -81,7 +81,8 @@ fun ScreenRestPageHeader(
         ) {
             Text(
                 text = title,
-                style = MaterialTheme.typography.headlineLarge,
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onBackground,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
