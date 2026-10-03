@@ -152,8 +152,76 @@ exports.processUpdatedUnlockRequestPush = onDocumentUpdated(
     },
 );
 
+exports.cleanupDuplicateChildLinks = onCall(
+    // RELEASE_BLOCKER(screenrest): Development-only exception. Before a production
+    // release, set this and deleteCurrentUserData to enforceAppCheck: true, deploy
+    // both functions, and verify valid Play Integrity requests in App Check metrics.
+    {enforceAppCheck: false},
+    async (request) => {
+      const uid = request.auth?.uid;
+      if (!uid) {
+        throw new HttpsError("unauthenticated", "Authentication is required.");
+      }
+
+      const currentChildDeviceId =
+        typeof request.data?.currentChildDeviceId === "string" ?
+          request.data.currentChildDeviceId.trim() : "";
+      if (!currentChildDeviceId || currentChildDeviceId.length > 128) {
+        throw new HttpsError("invalid-argument", "A valid child device id is required.");
+      }
+
+      const currentReference = db.collection(CHILDREN_COLLECTION)
+          .doc(currentChildDeviceId);
+      const currentSnapshot = await currentReference.get();
+      if (!currentSnapshot.exists) {
+        throw new HttpsError("not-found", "The current child device was not found.");
+      }
+      const currentParentUids = stringSet(currentSnapshot.get("parentUids"));
+      if (!currentParentUids.has(uid)) {
+        throw new HttpsError("permission-denied", "The parent is not linked to this child.");
+      }
+      const stableDeviceKey = currentSnapshot.get("stableDeviceKey");
+      if (typeof stableDeviceKey !== "string" ||
+          !/^[0-9a-f]{64}$/.test(stableDeviceKey)) {
+        return {deletedCount: 0, unlinkedCount: 0, skipped: "missing-device-key"};
+      }
+
+      const linkedChildren = await db.collection(CHILDREN_COLLECTION)
+          .where("parentUids", "array-contains", uid)
+          .get();
+      const duplicates = linkedChildren.docs.filter((document) =>
+        document.id !== currentChildDeviceId &&
+        document.get("stableDeviceKey") === stableDeviceKey,
+      );
+
+      let deletedCount = 0;
+      let unlinkedCount = 0;
+      for (const duplicate of duplicates) {
+        const duplicateParentUids = stringSet(duplicate.get("parentUids"));
+        if (duplicateParentUids.size === 1 && duplicateParentUids.has(uid)) {
+          const pairingCodes = await db.collection("screenrest_pairing_codes")
+              .where("childDeviceId", "==", duplicate.id)
+              .get();
+          await deleteReferences(pairingCodes.docs.map((document) => document.ref));
+          await db.recursiveDelete(duplicate.ref);
+          deletedCount += 1;
+        } else {
+          await removeParentIdentityFromChild(duplicate.ref, uid);
+          unlinkedCount += 1;
+        }
+      }
+
+      return {deletedCount, unlinkedCount};
+    },
+);
+
 exports.deleteCurrentUserData = onCall(
-    {enforceAppCheck: true},
+    // RELEASE_BLOCKER(screenrest): Do not ship while App Check enforcement is off.
+    // Re-enable it together with cleanupDuplicateChildLinks and consider token
+    // consumption after the release client requests limited-use App Check tokens.
+    // Development builds are repeatedly reinstalled, which rotates App Check debug tokens.
+    // Authentication remains mandatory and the function only deletes request.auth.uid.
+    {enforceAppCheck: false},
     async (request) => {
       const uid = request.auth?.uid;
       if (!uid) {

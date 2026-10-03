@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 import java.security.MessageDigest
@@ -52,6 +53,8 @@ private fun String.toImmediateBlockState(): ImmediateBlockState {
 }
 private const val MAX_PARENT_NOTIFICATION_EVENT_TOKENS = 240
 private const val MAX_PARENT_NOTIFICATION_ERROR_LENGTH = 180
+private const val PARENT_ACCOUNT_RECOVERY_ATTEMPTS = 3
+private const val PARENT_ACCOUNT_RECOVERY_RETRY_MILLIS = 750L
 private const val HARDSHIP_CONFIGURATION_REFLECTION_PREFIX = "Config:"
 
 fun hardshipConfigurationWaitMillis(level: HardshipLevel): Long = when (level) {
@@ -671,6 +674,28 @@ enum class ParentDeviceRole {
     Parent,
 }
 
+enum class AccountDeletionResult {
+    Deleted,
+    InvalidAdminPin,
+    NetworkUnavailable,
+    AppVerificationFailed,
+    AuthenticationRequired,
+    FunctionUnavailable,
+    Failed,
+}
+
+enum class OnboardingMode {
+    LocalDevice,
+    ChildDevice,
+    ParentOnly,
+}
+
+data class OnboardingProgress(
+    val mode: OnboardingMode? = null,
+    val setupPrepared: Boolean = false,
+    val completed: Boolean = false,
+)
+
 private const val PARENT_DEVICE_ROLE_CHILD = "Child"
 private const val PARENT_DEVICE_ROLE_PARENT = "Parent"
 
@@ -1078,6 +1103,20 @@ class SettingsRepository(
             preferences[PERMISSION_SETUP_COMPLETED_ONCE] ?: false
         }
 
+    val onboardingProgress: Flow<OnboardingProgress> = preferences
+        .map { preferences ->
+            val legacySetupCompleted = preferences[PERMISSION_SETUP_COMPLETED_ONCE] ?: false
+            OnboardingProgress(
+                mode = preferences[ONBOARDING_MODE]
+                    ?.let { stored ->
+                        OnboardingMode.entries.firstOrNull { mode -> mode.name == stored }
+                    },
+                setupPrepared = preferences[ONBOARDING_SETUP_PREPARED] ?: legacySetupCompleted,
+                completed = (preferences[ONBOARDING_COMPLETED_VERSION] ?: 0) >=
+                    ONBOARDING_CURRENT_VERSION || legacySetupCompleted,
+            )
+        }
+
     val monitoringDisclosureAccepted: Flow<Boolean> = preferences
         .map { preferences ->
             (preferences[MONITORING_DISCLOSURE_ACCEPTED_VERSION] ?: 0) >=
@@ -1280,6 +1319,31 @@ class SettingsRepository(
     suspend fun setPermissionSetupCompletedOnce(completed: Boolean) {
         dataStore.edit { preferences ->
             preferences[PERMISSION_SETUP_COMPLETED_ONCE] = completed
+        }
+    }
+
+    suspend fun setOnboardingMode(mode: OnboardingMode) {
+        dataStore.edit { preferences ->
+            preferences[ONBOARDING_MODE] = mode.name
+        }
+    }
+
+    suspend fun setOnboardingSetupPrepared(prepared: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[ONBOARDING_SETUP_PREPARED] = prepared
+        }
+    }
+
+    suspend fun completeOnboarding() {
+        dataStore.edit { preferences ->
+            preferences[ONBOARDING_COMPLETED_VERSION] = ONBOARDING_CURRENT_VERSION
+            // Keep the legacy flag in sync so the old automatic permission dialog stays retired.
+            preferences[PERMISSION_SETUP_COMPLETED_ONCE] = true
+            appendEvent(
+                preferences = preferences,
+                type = EventLogType.Info,
+                message = "First-run onboarding completed",
+            )
         }
     }
 
@@ -1546,13 +1610,28 @@ class SettingsRepository(
         if (cleanUid.isBlank()) {
             return false
         }
-        val recoveredChildren = parentRemoteSyncDataSource
-            .fetchLinkedChildDevicesForCurrentParent()
+        var recoverySnapshot = ParentAccountRecoverySnapshot()
+        for (attempt in 0 until PARENT_ACCOUNT_RECOVERY_ATTEMPTS) {
+            recoverySnapshot = parentRemoteSyncDataSource.fetchParentAccountRecovery()
+            if (parentRemoteSyncDataSource.syncState.value.connected) {
+                break
+            }
+            if (attempt < PARENT_ACCOUNT_RECOVERY_ATTEMPTS - 1) {
+                delay(PARENT_ACCOUNT_RECOVERY_RETRY_MILLIS * (attempt + 1L))
+            }
+        }
         if (!parentRemoteSyncDataSource.syncState.value.connected) {
-            addEvent(EventLogType.Warning, "Parent account recovery failed: cloud unavailable")
+            val reason = parentRemoteSyncDataSource.syncState.value.lastError
+                .trim()
+                .ifBlank { "cloud unavailable" }
+            addEvent(EventLogType.Warning, "Parent account recovery failed: $reason")
             return false
         }
-        val cleanDisplayName = parentDisplayName.trim().ifBlank { "Parent device" }
+        val recoveredChildren = recoverySnapshot.childDevices
+        val cleanDisplayName = recoverySnapshot.parentDisplayName
+            .trim()
+            .ifBlank { parentDisplayName.trim() }
+            .ifBlank { "Parent device" }
         dataStore.edit { preferences ->
             val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
             val primaryChild = recoveredChildren.firstOrNull()
@@ -1582,7 +1661,7 @@ class SettingsRepository(
         return true
     }
 
-    suspend fun deleteCurrentAccountAndCloudData(adminPin: String): Boolean {
+    suspend fun deleteCurrentAccountAndCloudData(adminPin: String): AccountDeletionResult {
         var pinValid = false
         dataStore.edit { preferences ->
             if (!isAdminPinValid(preferences, adminPin.trim())) {
@@ -1596,12 +1675,21 @@ class SettingsRepository(
             pinValid = true
         }
         if (!pinValid) {
-            return false
+            return AccountDeletionResult.InvalidAdminPin
         }
         val result = parentRemoteSyncDataSource.deleteCurrentUserCloudData()
         recordParentRemoteSyncResult("delete account and cloud data", result)
+        if (result is ParentRemoteSyncResult.Failed) {
+            return when (result.kind) {
+                ParentRemoteFailureKind.Network -> AccountDeletionResult.NetworkUnavailable
+                ParentRemoteFailureKind.PermissionDenied -> AccountDeletionResult.AppVerificationFailed
+                ParentRemoteFailureKind.Authentication -> AccountDeletionResult.AuthenticationRequired
+                ParentRemoteFailureKind.NotFound -> AccountDeletionResult.FunctionUnavailable
+                ParentRemoteFailureKind.Unknown -> AccountDeletionResult.Failed
+            }
+        }
         if (result != ParentRemoteSyncResult.Success) {
-            return false
+            return AccountDeletionResult.FunctionUnavailable
         }
         dataStore.edit { preferences ->
             val current = preferences[PARENT_MANAGEMENT_STATE].orEmpty().toParentManagementState()
@@ -1620,7 +1708,7 @@ class SettingsRepository(
                 .toParentNotificationStateEncoded()
             appendEvent(preferences, EventLogType.Safety, "Account and cloud data deleted")
         }
-        return true
+        return AccountDeletionResult.Deleted
     }
 
     suspend fun setParentProfileName(profileName: String): Boolean {
@@ -4737,6 +4825,7 @@ class SettingsRepository(
 
     companion object {
         private const val MONITORING_DISCLOSURE_CURRENT_VERSION = 1
+        private const val ONBOARDING_CURRENT_VERSION = 1
         private const val PIN_CREDENTIAL_VERSION = "v1"
         private const val PIN_HASH_ITERATIONS = 210_000
         private const val PIN_HASH_BITS = 256
@@ -4749,6 +4838,9 @@ class SettingsRepository(
         private val WARNING_NOTIFICATIONS_ENABLED = booleanPreferencesKey("warning_notifications_enabled")
         private val LIMIT_NOTIFICATIONS_ENABLED = booleanPreferencesKey("limit_notifications_enabled")
         private val PERMISSION_SETUP_COMPLETED_ONCE = booleanPreferencesKey("permission_setup_completed_once")
+        private val ONBOARDING_MODE = stringPreferencesKey("onboarding_mode_v1")
+        private val ONBOARDING_SETUP_PREPARED = booleanPreferencesKey("onboarding_setup_prepared_v1")
+        private val ONBOARDING_COMPLETED_VERSION = intPreferencesKey("onboarding_completed_version")
         private val MONITORING_DISCLOSURE_ACCEPTED_VERSION =
             intPreferencesKey("monitoring_disclosure_accepted_version")
         private val CHILD_TOP_APPS_SHARING_ENABLED = booleanPreferencesKey("child_top_apps_sharing_enabled")

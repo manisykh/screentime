@@ -46,6 +46,11 @@ service cloud.firestore {
         data.get("linkedParents", []).size() <= 10;
     }
 
+    function validStableDeviceKey(data) {
+      let key = data.get("stableDeviceKey", "");
+      return key is string && (key == "" || key.matches("^[0-9a-f]{64}$"));
+    }
+
     function isAtomicPairingParent(childDeviceId) {
       let pairingAfter = getAfter(
         /databases/$(database)/documents/screenrest_pairing_codes/$(activePairingCode(childDeviceId))
@@ -96,7 +101,7 @@ service cloud.firestore {
       return request.resource.data.keys().hasOnly([
           "pairingCode", "childDeviceId", "childDeviceName", "childUid",
           "createdAtMillis", "expiresAtMillis", "expiresAt", "status", "used",
-          "updatedAtMillis"
+          "updatedAtMillis", "stableDeviceKey"
         ]) &&
         request.resource.data.pairingCode == pairingCode &&
         request.resource.data.childDeviceId is string &&
@@ -110,7 +115,8 @@ service cloud.firestore {
         request.resource.data.expiresAt > request.time &&
         request.resource.data.expiresAt <= request.time + duration.value(11, 'm') &&
         request.resource.data.status == "active" &&
-        request.resource.data.used == false;
+        request.resource.data.used == false &&
+        validStableDeviceKey(request.resource.data);
     }
 
     function validPairingClaim() {
@@ -140,14 +146,16 @@ service cloud.firestore {
     function validChildCreate(childDeviceId) {
       return request.resource.data.keys().hasOnly([
           "childDeviceId", "childDeviceName", "childUid", "activePairingCode",
-          "status", "updatedAtMillis", "parentUids", "linkedParents"
+          "status", "updatedAtMillis", "parentUids", "linkedParents",
+          "stableDeviceKey"
         ]) &&
         request.resource.data.childDeviceId == childDeviceId &&
         request.resource.data.childUid == request.auth.uid &&
         request.resource.data.childDeviceName is string &&
         request.resource.data.childDeviceName.size() <= 100 &&
         request.resource.data.status in ["active", "unlinked"] &&
-        validRelationLists(request.resource.data);
+        validRelationLists(request.resource.data) &&
+        validStableDeviceKey(request.resource.data);
     }
 
     function validChildOwnerUpdate(childDeviceId) {
@@ -157,10 +165,11 @@ service cloud.firestore {
         request.resource.data.childUid == request.auth.uid &&
         request.resource.data.status in ["active", "unlinked"] &&
         validRelationLists(request.resource.data) &&
+        validStableDeviceKey(request.resource.data) &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           "childDeviceName", "activePairingCode", "status", "updatedAtMillis",
           "parentUids", "linkedParents", "lastUnlinkedParentUid",
-          "remainingParentCount", "unlinkedAtMillis"
+          "remainingParentCount", "unlinkedAtMillis", "stableDeviceKey"
         ]);
     }
 
@@ -416,8 +425,15 @@ service cloud.firestore {
 
     match /screenrest_children/{childDeviceId} {
       allow create: if signedIn() && validChildCreate(childDeviceId);
-      allow read: if isChildOwner(childDeviceId) ||
+      allow get: if isChildOwner(childDeviceId) ||
         isLinkedParent(childDeviceId) || canReadForActivePairing(childDeviceId);
+      // Parent recovery after reinstall queries by `parentUids array-contains uid`.
+      // A removed relationship also removes the UID from this array, so requiring
+      // a second status predicate would only make the collection query impossible
+      // for Firestore Rules to prove and would not add authorization protection.
+      allow list: if signedIn() &&
+        request.query.limit <= 100 &&
+        resource.data.parentUids.hasAny([request.auth.uid]);
       allow update: if
         (isChildOwner(childDeviceId) && validChildOwnerUpdate(childDeviceId)) ||
         (isLinkedParent(childDeviceId) && (isParentProfileUpdate() || isParentSelfUnlink())) ||

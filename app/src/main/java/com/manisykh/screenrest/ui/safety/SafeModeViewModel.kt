@@ -11,6 +11,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.manisykh.screenrest.blocking.UsageMonitorForegroundService
 import com.manisykh.screenrest.data.AppLanguage
+import com.manisykh.screenrest.data.AccountDeletionResult
 import com.manisykh.screenrest.data.CachedTodayUsageEntry
 import com.manisykh.screenrest.data.ChildUsageSnapshot
 import com.manisykh.screenrest.data.ChildUsageRefreshRequest
@@ -31,6 +32,8 @@ import com.manisykh.screenrest.data.ParentAccountAuthCoordinatorFactory
 import com.manisykh.screenrest.data.ParentAccountAuthFailure
 import com.manisykh.screenrest.data.ParentAccountAuthState
 import com.manisykh.screenrest.data.ParentDeviceRole
+import com.manisykh.screenrest.data.OnboardingMode
+import com.manisykh.screenrest.data.OnboardingProgress
 import com.manisykh.screenrest.data.ParentNotificationState
 import com.manisykh.screenrest.data.PairingOperationFailure
 import com.manisykh.screenrest.data.PairingOperationResult
@@ -167,6 +170,7 @@ data class SafeModeUiState(
     val usageMonitorStatus: UsageMonitorStatus = UsageMonitorStatus(),
     val systemHealthStatus: SystemHealthStatus = SystemHealthStatus(),
     val permissionSetupCompletedOnce: Boolean = false,
+    val onboardingProgress: OnboardingProgress = OnboardingProgress(),
     val blockingReadiness: BlockingReadiness = BlockingReadiness(),
     val blockDecisionResults: List<BlockDecisionResult> = emptyList(),
     val dailyPolicyExpanded: Boolean = false,
@@ -624,12 +628,14 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
         repository.monitoringDisclosureAccepted,
         repository.securityPinsConfigured,
         repository.childTopAppsSharingEnabled,
-    ) { permissionSetupCompletedOnce, monitoringDisclosureAccepted, securityPinsConfigured, childTopAppsSharingEnabled ->
+        repository.onboardingProgress,
+    ) { permissionSetupCompletedOnce, monitoringDisclosureAccepted, securityPinsConfigured, childTopAppsSharingEnabled, onboardingProgress ->
         ReleaseComplianceState(
             permissionSetupCompletedOnce = permissionSetupCompletedOnce,
             monitoringDisclosureAccepted = monitoringDisclosureAccepted,
             securityPinsConfigured = securityPinsConfigured,
             childTopAppsSharingEnabled = childTopAppsSharingEnabled,
+            onboardingProgress = onboardingProgress,
         )
     }
 
@@ -652,6 +658,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             monitoringDisclosureAccepted = releaseCompliance.monitoringDisclosureAccepted,
             securityPinsConfigured = releaseCompliance.securityPinsConfigured,
             childTopAppsSharingEnabled = releaseCompliance.childTopAppsSharingEnabled,
+            onboardingProgress = releaseCompliance.onboardingProgress,
         )
     }
 
@@ -788,6 +795,7 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             usageMonitorStatus = persistedState.usageMonitorStatus,
             systemHealthStatus = persistedState.systemHealthStatus,
             permissionSetupCompletedOnce = persistedState.permissionSetupCompletedOnce,
+            onboardingProgress = persistedState.onboardingProgress,
             blockingReadiness = buildBlockingReadiness(
                 safeModeEnabled = persistedState.safeModeEnabled,
                 policyEnforcementEnabled = persistedState.policyEnforcementEnabled,
@@ -848,6 +856,25 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             }
         }
         viewModelScope.launch {
+            val parentAuthState = parentAccountAuthState.value
+            val parentState = repository.parentManagementState.first()
+            if (
+                parentAuthState.recoverable &&
+                parentState.deviceRole == ParentDeviceRole.Parent
+            ) {
+                val linksRecovered = repository.recoverParentAccountLinks(
+                    parentUid = parentAuthState.uid,
+                    parentDisplayName = parentAuthState.displayName
+                        .ifBlank { parentAuthState.email.substringBefore('@') }
+                        .ifBlank { "Parent device" },
+                )
+                if (linksRecovered) {
+                    parentNotificationCoordinator.synchronizeAndNotify()
+                    PushTokenRegistrationWorker.schedule(getApplication<Application>())
+                }
+            }
+        }
+        viewModelScope.launch {
             runDailyRolloverLoop()
         }
         observeScheduleHardshipBoundaries()
@@ -856,10 +883,12 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
             combine(
                 usageState,
                 repository.permissionSetupCompletedOnce,
-            ) { usageState, completedOnce ->
-                usageState to completedOnce
-            }.collect { (usageState, completedOnce) ->
+                repository.onboardingProgress,
+            ) { usageState, completedOnce, onboardingProgress ->
+                Triple(usageState, completedOnce, onboardingProgress)
+            }.collect { (usageState, completedOnce, onboardingProgress) ->
                 if (
+                    onboardingProgress.completed &&
                     !completedOnce &&
                     usageState.hasUsageAccess &&
                     usageState.overlayPermissionReady &&
@@ -1537,8 +1566,36 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun savePolicyDraft(adminPin: String) {
+        savePolicyDraftInternal(adminPin = adminPin, markOnboardingPrepared = false)
+    }
+
+    fun prepareFirstOnboardingRule(
+        settings: UsagePolicySettings,
+        adminPin: String,
+        mode: OnboardingMode,
+    ) {
+        policyDraftSettings.value = settings.normalizedForDraft()
+        savePolicyDraftInternal(
+            adminPin = adminPin,
+            markOnboardingPrepared = true,
+            onboardingMode = mode,
+        )
+    }
+
+    private fun savePolicyDraftInternal(
+        adminPin: String,
+        markOnboardingPrepared: Boolean,
+        onboardingMode: OnboardingMode? = null,
+    ) {
         viewModelScope.launch {
             policySaveStatus.value = PolicySaveStatus.Saving
+            if (markOnboardingPrepared && !repository.securityPinsConfigured.first()) {
+                val configured = repository.configureInitialAdminPin(adminPin)
+                if (!configured) {
+                    policySaveStatus.value = PolicySaveStatus.InvalidAdminPin
+                    return@launch
+                }
+            }
             val rawDraftSettings = (policyDraftSettings.value ?: uiState.value.usagePolicySettings)
                 .normalizedForDraft()
             val draftExemptPackages = policyDraftAllRestrictionsExemptPackages.value
@@ -1581,6 +1638,10 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
                 adminPin = adminPin,
             )
             policySaveStatus.value = if (saveResult == PolicyConfigurationSaveResult.Saved) {
+                if (markOnboardingPrepared) {
+                    onboardingMode?.let { mode -> repository.setOnboardingMode(mode) }
+                    repository.setOnboardingSetupPrepared(true)
+                }
                 policyDraftSettings.value = draftSettings
                 policyDraftAllowedAppPackages.value = draftAllowedPackages
                 policyDraftAllRestrictionsExemptPackages.value = draftExemptPackages
@@ -1805,23 +1866,42 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
 
     fun deleteCurrentAccountAndCloudData(adminPin: String) {
         viewModelScope.launch {
-            val deleted = repository.deleteCurrentAccountAndCloudData(adminPin)
+            val result = repository.deleteCurrentAccountAndCloudData(adminPin)
+            val deleted = result == AccountDeletionResult.Deleted
             val korean = repository.appLanguage.first() == AppLanguage.Korean
             if (deleted) {
                 parentAccountAuthCoordinator.switchToChildAnonymousIdentity()
                 PushTokenRegistrationWorker.schedule(getApplication<Application>())
             }
+            val message = when {
+                deleted && korean -> "계정과 클라우드 연결 데이터가 삭제되었습니다."
+                deleted -> "Account and cloud connection data deleted."
+                result == AccountDeletionResult.InvalidAdminPin && korean ->
+                    "관리 PIN이 올바르지 않습니다. 다시 확인해 주세요."
+                result == AccountDeletionResult.InvalidAdminPin ->
+                    "The admin PIN is incorrect. Please try again."
+                result == AccountDeletionResult.NetworkUnavailable && korean ->
+                    "서버에 연결하지 못했습니다. 네트워크를 확인한 뒤 다시 시도해 주세요."
+                result == AccountDeletionResult.NetworkUnavailable ->
+                    "Could not reach the server. Check the network and try again."
+                result == AccountDeletionResult.AppVerificationFailed && korean ->
+                    "앱 보안 확인에 실패했습니다. 디버그 토큰 또는 Play Integrity 설정을 확인해 주세요."
+                result == AccountDeletionResult.AppVerificationFailed ->
+                    "App verification failed. Check the debug token or Play Integrity setup."
+                result == AccountDeletionResult.AuthenticationRequired && korean ->
+                    "로그인 세션을 확인하지 못했습니다. Google 계정으로 다시 로그인해 주세요."
+                result == AccountDeletionResult.AuthenticationRequired ->
+                    "The sign-in session could not be verified. Sign in with Google again."
+                result == AccountDeletionResult.FunctionUnavailable && korean ->
+                    "계정 삭제 서버 기능을 사용할 수 없습니다. Cloud Functions 배포를 확인해 주세요."
+                result == AccountDeletionResult.FunctionUnavailable ->
+                    "The account deletion service is unavailable. Check the Cloud Functions deployment."
+                korean -> "계정 데이터를 삭제하지 못했습니다. 잠시 후 다시 시도해 주세요."
+                else -> "Account data could not be deleted. Please try again shortly."
+            }
             Toast.makeText(
                 getApplication<Application>(),
-                if (deleted && korean) {
-                    "계정과 클라우드 연결 데이터가 삭제되었습니다."
-                } else if (deleted) {
-                    "Account and cloud connection data deleted."
-                } else if (korean) {
-                    "삭제하지 못했습니다. 관리 PIN, 네트워크와 App Check 설정을 확인해 주세요."
-                } else {
-                    "Deletion failed. Check the admin PIN, network, and App Check setup."
-                },
+                message,
                 Toast.LENGTH_LONG,
             ).show()
         }
@@ -2256,6 +2336,71 @@ class SafeModeViewModel(application: Application) : AndroidViewModel(application
     fun configureInitialAdminPin(adminPin: String) {
         viewModelScope.launch {
             repository.configureInitialAdminPin(adminPin)
+        }
+    }
+
+    fun setOnboardingMode(mode: OnboardingMode) {
+        viewModelScope.launch {
+            repository.setOnboardingMode(mode)
+        }
+    }
+
+    fun prepareParentOnboarding(adminPin: String) {
+        viewModelScope.launch {
+            policySaveStatus.value = PolicySaveStatus.Saving
+            val configured = repository.configureInitialAdminPin(adminPin) ||
+                repository.securityPinsConfigured.first()
+            val roleUpdated = configured && repository.setParentDeviceRole(
+                role = ParentDeviceRole.Parent,
+                adminPin = adminPin,
+            )
+            if (roleUpdated) {
+                repository.setOnboardingMode(OnboardingMode.ParentOnly)
+                repository.setOnboardingSetupPrepared(true)
+                policySaveStatus.value = PolicySaveStatus.Saved
+            } else {
+                policySaveStatus.value = PolicySaveStatus.InvalidAdminPin
+            }
+        }
+    }
+
+    fun activateOnboardingProtection() {
+        viewModelScope.launch {
+            val permissionState = usageState.value
+            if (
+                !permissionState.hasUsageAccess ||
+                !permissionState.overlayPermissionReady ||
+                !permissionState.notificationPermissionReady
+            ) {
+                return@launch
+            }
+            repository.setSafeModeEnabled(false)
+            repository.setPolicyEnforcementEnabled(true)
+            val application = getApplication<Application>()
+            if (!UsageMonitorForegroundService.start(application)) {
+                repository.setPolicyEnforcementEnabled(false)
+                repository.setSafeModeEnabled(true)
+                repository.addEvent(
+                    EventLogType.Warning,
+                    "Onboarding activation failed: usage monitor service could not start",
+                )
+                val korean = repository.appLanguage.first() == AppLanguage.Korean
+                Toast.makeText(
+                    application,
+                    if (korean) {
+                        "보호를 시작하지 못했어요. 잠시 후 다시 시도해 주세요."
+                    } else {
+                        "Protection could not start. Please try again shortly."
+                    },
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    fun completeOnboarding() {
+        viewModelScope.launch {
+            repository.completeOnboarding()
         }
     }
 
@@ -3088,6 +3233,7 @@ private data class PersistedState(
     val usageMonitorStatus: UsageMonitorStatus = UsageMonitorStatus(),
     val systemHealthStatus: SystemHealthStatus = SystemHealthStatus(),
     val permissionSetupCompletedOnce: Boolean = false,
+    val onboardingProgress: OnboardingProgress = OnboardingProgress(),
     val monitoringDisclosureAccepted: Boolean = false,
     val childTopAppsSharingEnabled: Boolean = false,
     val securityPinsConfigured: Boolean = false,
@@ -3099,6 +3245,7 @@ private data class ReleaseComplianceState(
     val monitoringDisclosureAccepted: Boolean = false,
     val childTopAppsSharingEnabled: Boolean = false,
     val securityPinsConfigured: Boolean = false,
+    val onboardingProgress: OnboardingProgress = OnboardingProgress(),
 )
 
 private data class NotificationSettingsState(

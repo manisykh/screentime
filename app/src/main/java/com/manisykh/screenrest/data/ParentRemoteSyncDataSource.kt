@@ -163,6 +163,11 @@ data class RemotePushTokenTarget(
     val role: RemotePushTokenRole,
 )
 
+data class ParentAccountRecoverySnapshot(
+    val childDevices: List<LinkedChildDevice> = emptyList(),
+    val parentDisplayName: String = "",
+)
+
 interface ParentRemoteSyncDataSource {
     val syncState: StateFlow<ParentRemoteSyncState>
 
@@ -256,6 +261,11 @@ interface ParentRemoteSyncDataSource {
     suspend fun fetchLinkedChildDevices(childDeviceIds: List<String>): List<LinkedChildDevice>
 
     suspend fun fetchLinkedChildDevicesForCurrentParent(): List<LinkedChildDevice>
+
+    suspend fun fetchParentAccountRecovery(): ParentAccountRecoverySnapshot =
+        ParentAccountRecoverySnapshot(
+            childDevices = fetchLinkedChildDevicesForCurrentParent(),
+        )
 
     suspend fun updateChildProfile(
         childDeviceId: String,

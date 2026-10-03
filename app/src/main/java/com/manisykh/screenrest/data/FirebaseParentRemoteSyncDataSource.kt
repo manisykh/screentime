@@ -1,6 +1,8 @@
 package com.manisykh.screenrest.data
 
 import android.content.Context
+import android.provider.Settings
+import android.util.Log
 import com.google.android.gms.tasks.Task
 import com.google.firebase.Timestamp
 import com.google.firebase.FirebaseApp
@@ -15,6 +17,7 @@ import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.firestore.Source
 import com.google.firebase.functions.FirebaseFunctions
+import com.google.firebase.functions.FirebaseFunctionsException
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -44,6 +47,13 @@ object ParentRemoteSyncDataSourceFactory {
                 auth = FirebaseAuth.getInstance(app),
                 firestore = FirebaseFirestore.getInstance(app),
                 functions = FirebaseFunctions.getInstance(app, "asia-northeast3"),
+                stableChildDeviceKey = stableChildDeviceKey(
+                    androidId = Settings.Secure.getString(
+                        context.contentResolver,
+                        Settings.Secure.ANDROID_ID,
+                    ).orEmpty(),
+                    applicationId = context.packageName,
+                ),
             )
         } catch (_: Throwable) {
             LocalOnlyParentRemoteSyncDataSource
@@ -55,6 +65,7 @@ class FirebaseParentRemoteSyncDataSource(
     private val auth: FirebaseAuth,
     private val firestore: FirebaseFirestore,
     private val functions: FirebaseFunctions,
+    private val stableChildDeviceKey: String = "",
 ) : ParentRemoteSyncDataSource {
     private val mutableSyncState = MutableStateFlow(
         ParentRemoteSyncState(
@@ -228,6 +239,10 @@ class FirebaseParentRemoteSyncDataSource(
             val childUid = currentUid()
             val childRef = childrenCollection().document(childDeviceId)
             val pairingRef = pairingCodesCollection().document(cleanCode)
+            val stableDeviceFields = stableChildDeviceKey
+                .takeIf { key -> key.matches(STABLE_CHILD_DEVICE_KEY_PATTERN) }
+                ?.let { key -> mapOf("stableDeviceKey" to key) }
+                .orEmpty()
             childRef.set(
                 mapOf(
                     "childDeviceId" to childDeviceId,
@@ -236,7 +251,7 @@ class FirebaseParentRemoteSyncDataSource(
                     "activePairingCode" to cleanCode,
                     "status" to "active",
                     "updatedAtMillis" to now,
-                ),
+                ) + stableDeviceFields,
                 SetOptions.merge(),
             ).awaitResult()
 
@@ -268,7 +283,7 @@ class FirebaseParentRemoteSyncDataSource(
                     "status" to "active",
                     "used" to false,
                     "updatedAtMillis" to now,
-                ),
+                ) + stableDeviceFields,
                 SetOptions.merge(),
             ).awaitResult()
 
@@ -378,6 +393,21 @@ class FirebaseParentRemoteSyncDataSource(
                 )
                 ParentRemotePairingResolution.Success(pairingRecord)
             }.awaitResult()
+            if (record is ParentRemotePairingResolution.Success) {
+                runCatching {
+                    functions.getHttpsCallable("cleanupDuplicateChildLinks")
+                        .call(
+                            mapOf(
+                                "currentChildDeviceId" to record.record.childDeviceId,
+                            ),
+                        )
+                        .awaitResult()
+                }.onFailure { error ->
+                    // Pairing is already committed. Duplicate cleanup is best-effort and can be
+                    // retried by registering the same child again after a transient failure.
+                    Log.w("STM-ParentSync", "Duplicate child link cleanup failed", error)
+                }
+            }
             updateConnected()
             record
         } catch (error: Throwable) {
@@ -439,36 +469,62 @@ class FirebaseParentRemoteSyncDataSource(
     }
 
     override suspend fun fetchLinkedChildDevicesForCurrentParent(): List<LinkedChildDevice> {
+        return fetchParentAccountRecovery().childDevices
+    }
+
+    override suspend fun fetchParentAccountRecovery(): ParentAccountRecoverySnapshot {
         return try {
             ensureSignedIn()
             val uid = currentUid()
             if (uid.isBlank() || auth.currentUser?.isAnonymous != false) {
-                return emptyList()
+                return ParentAccountRecoverySnapshot()
             }
             val snapshot = childrenCollection()
                 .whereArrayContains("parentUids", uid)
                 .limit(RECOVERED_CHILD_DOCUMENT_LIMIT)
                 .get()
                 .awaitResult()
-            val children = snapshot.documents.mapNotNull { document ->
-                if (!document.exists()) {
-                    null
-                } else {
-                    LinkedChildDevice(
-                        childDeviceId = document.id,
-                        childDeviceName = document.getString("childDeviceName")
-                            .orEmpty()
-                            .ifBlank { "Child device" },
-                        pairingCode = "",
-                        linkedAtMillis = document.getLong("linkedAtMillis") ?: 0L,
-                    )
-                }
+            val activeDocuments = snapshot.documents.filter { document ->
+                document.exists() &&
+                    document.getString("status") != "unlinked" &&
+                    uid in document.parentUids()
             }
+            val children = activeDocuments.map { document ->
+                LinkedChildDevice(
+                    childDeviceId = document.id,
+                    childDeviceName = document.getString("childDeviceName")
+                        .orEmpty()
+                        .ifBlank { "Child device" },
+                    pairingCode = "",
+                    linkedAtMillis = document.getLong("linkedAtMillis") ?: 0L,
+                )
+            }.distinctBy { child -> child.childDeviceId }
+                .sortedByDescending { child -> child.linkedAtMillis }
+            val parentDisplayName = activeDocuments
+                .mapNotNull { document ->
+                    document.linkedParents()
+                        .firstOrNull { parent -> parent.parentUid == uid }
+                        ?.let { parent ->
+                            parent.parentDisplayName.trim() to
+                                (document.getLong("updatedAtMillis") ?: parent.linkedAtMillis)
+                        }
+                }
+                .filter { (name, _) -> name.isNotBlank() && name != DEFAULT_PARENT_DISPLAY_NAME }
+                .groupBy { (name, _) -> name }
+                .maxWithOrNull(
+                    compareBy<Map.Entry<String, List<Pair<String, Long>>>> { entry -> entry.value.size }
+                        .thenBy { entry -> entry.value.maxOfOrNull { (_, updatedAt) -> updatedAt } ?: 0L },
+                )
+                ?.key
+                .orEmpty()
             updateConnected()
-            children
+            ParentAccountRecoverySnapshot(
+                childDevices = children,
+                parentDisplayName = parentDisplayName,
+            )
         } catch (error: Throwable) {
             updateFailed(error)
-            emptyList()
+            ParentAccountRecoverySnapshot()
         }
     }
 
@@ -1162,12 +1218,37 @@ private fun pushTokenDocumentId(uid: String, registrationId: String): String {
     return bytes.joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
 }
 
+internal fun stableChildDeviceKey(androidId: String, applicationId: String): String {
+    val cleanAndroidId = androidId.trim()
+    val cleanApplicationId = applicationId.trim()
+    if (cleanAndroidId.isBlank() || cleanApplicationId.isBlank()) {
+        return ""
+    }
+    val bytes = MessageDigest.getInstance("SHA-256")
+        .digest("screenrest-child-v1:$cleanApplicationId:$cleanAndroidId".toByteArray(Charsets.UTF_8))
+    return bytes.joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
+}
+
 private fun Throwable.remoteFailureKind(): ParentRemoteFailureKind {
     return when (this) {
         is FirebaseNetworkException,
         is IOException -> ParentRemoteFailureKind.Network
 
         is FirebaseAuthException -> ParentRemoteFailureKind.Authentication
+
+        is FirebaseFunctionsException -> when (code) {
+            FirebaseFunctionsException.Code.UNAUTHENTICATED,
+            FirebaseFunctionsException.Code.PERMISSION_DENIED,
+            FirebaseFunctionsException.Code.FAILED_PRECONDITION ->
+                ParentRemoteFailureKind.PermissionDenied
+            FirebaseFunctionsException.Code.NOT_FOUND -> ParentRemoteFailureKind.NotFound
+            FirebaseFunctionsException.Code.ABORTED,
+            FirebaseFunctionsException.Code.CANCELLED,
+            FirebaseFunctionsException.Code.DEADLINE_EXCEEDED,
+            FirebaseFunctionsException.Code.RESOURCE_EXHAUSTED,
+            FirebaseFunctionsException.Code.UNAVAILABLE -> ParentRemoteFailureKind.Network
+            else -> ParentRemoteFailureKind.Unknown
+        }
 
         is FirebaseFirestoreException -> when (code) {
             FirebaseFirestoreException.Code.PERMISSION_DENIED -> ParentRemoteFailureKind.PermissionDenied
@@ -1194,6 +1275,14 @@ private fun Throwable.isRetryableRemoteFailure(): Boolean {
     return when (this) {
         is FirebaseNetworkException,
         is IOException -> true
+
+        is FirebaseFunctionsException -> code in setOf(
+            FirebaseFunctionsException.Code.ABORTED,
+            FirebaseFunctionsException.Code.CANCELLED,
+            FirebaseFunctionsException.Code.DEADLINE_EXCEEDED,
+            FirebaseFunctionsException.Code.RESOURCE_EXHAUSTED,
+            FirebaseFunctionsException.Code.UNAVAILABLE,
+        )
 
         is FirebaseFirestoreException -> code in setOf(
             FirebaseFirestoreException.Code.ABORTED,
@@ -1545,3 +1634,5 @@ private const val REMOTE_LISTENER_DOCUMENT_LIMIT = 30L
 private const val REMOTE_QUERY_DOCUMENT_LIMIT = 30L
 private const val REMOTE_CLEANUP_DOCUMENT_LIMIT = 20L
 private const val RECOVERED_CHILD_DOCUMENT_LIMIT = 100L
+private const val DEFAULT_PARENT_DISPLAY_NAME = "Parent device"
+private val STABLE_CHILD_DEVICE_KEY_PATTERN = Regex("^[0-9a-f]{64}$")

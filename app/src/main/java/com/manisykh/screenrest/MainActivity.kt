@@ -290,21 +290,38 @@ class MainActivity : ComponentActivity() {
         setContent {
             ScreenRestDesignTheme {
                 val uiState by safeModeViewModel.uiState.collectAsStateWithLifecycle()
+                val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestPermission(),
+                    onResult = {
+                        safeModeViewModel.refreshForForeground(force = true)
+                    },
+                )
                 if (!uiState.monitoringDisclosureLoaded) {
                     Surface(
                         color = MaterialTheme.colorScheme.background,
                         modifier = Modifier.fillMaxSize(),
                     ) {}
-                } else if (!uiState.monitoringDisclosureAccepted) {
-                    MonitoringDisclosureScreen(
-                        appLanguage = uiState.appLanguage,
-                        onAccept = safeModeViewModel::acceptMonitoringDisclosure,
-                        onExit = ::finishAffinity,
-                    )
-                } else if (!uiState.securityPinsConfigured) {
-                    InitialPinSetupScreen(
-                        appLanguage = uiState.appLanguage,
-                        onConfigure = safeModeViewModel::configureInitialAdminPin,
+                } else if (!uiState.onboardingProgress.completed) {
+                    FirstRunOnboarding(
+                        uiState = uiState,
+                        onSelectMode = safeModeViewModel::setOnboardingMode,
+                        onAcceptDisclosure = safeModeViewModel::acceptMonitoringDisclosure,
+                        onPrepareRule = safeModeViewModel::prepareFirstOnboardingRule,
+                        onPrepareParent = safeModeViewModel::prepareParentOnboarding,
+                        onOpenUsageAccessSettings = ::openUsageAccessSettings,
+                        onOpenOverlaySettings = ::openOverlaySettings,
+                        onRequestNotificationPermission = {
+                            if (
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                openNotificationSettings()
+                            }
+                        },
+                        onActivateProtection = safeModeViewModel::activateOnboardingProtection,
+                        onComplete = safeModeViewModel::completeOnboarding,
                         onExit = ::finishAffinity,
                     )
                 } else {
@@ -328,13 +345,6 @@ class MainActivity : ComponentActivity() {
                             UsageMonitorForegroundService.managerVisible(this@MainActivity)
                         }
                     }
-                    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-                        contract = ActivityResultContracts.RequestPermission(),
-                        onResult = {
-                            safeModeViewModel.refreshForForeground(force = true)
-                        },
-                    )
-
                     Box(modifier = Modifier.fillMaxSize()) {
                         Scaffold(
                             containerColor = MaterialTheme.colorScheme.background,
